@@ -1,59 +1,69 @@
-# Phase 0 架构与边界
+# Phase 1/2 架构与关键决定
 
-## 范围决定
+当前为 `0.2.0`：完成静态实现与离线验证，等待真实设备及原生多指注入验收。Phase 0 的历史实测保持独立，不作为本次多指实现已经通过的证据。
 
-依据 `PadBridge.md` 第 14、17 节：本阶段只验证核心链路。多指原始采集属于可行性证据；同步多指注入、手势、完整 UI、配置文件、目标窗口选择、快捷键体系、托盘与安装包不在本次范围。
+## 模块与线程
 
-源文件职责：
-
-| 文件 | 职责 |
+| 模块 | 职责 |
 |---|---|
-| `main.rs` | 最小命令行参数：probe / capture / self-test |
-| `hid.rs` | Raw Input 设备发现、对齐缓冲区、HidP 字段发现和数据提取、RAWHID 边界检查 |
-| `decode.rs` | 不依赖 Windows API 的字段解释、混合报告组帧、Contact ID/Tip/Confidence/坐标、绝对映射 |
-| `injection.rs` | 单触点注入、稳定 ID 0、成功坐标缓存、重试、保活和释放 |
-| `experiment.rs` | 隐藏输入窗口线程、最小测试接收窗口、诊断计数、合成 API 对照实验 |
-| `logging.rs` | 独立写日志线程、有界队列、溢出计数 |
+| `main.rs` | 命令行参数校验、离线日志校验入口 |
+| `hid.rs` | Raw Input 枚举、HidP 能力字段/数据提取、RAWHID 对齐及边界检查 |
+| `decode.rs` | 无 Windows API 的字段解释、混合报告组帧与绝对映射 |
+| `touch.rs` | 无 Windows API 的事务式触点规划、稳定槽位、完整帧、提交/重试/取消 |
+| `injection.rs` | Win32 transport：命中检查、POINTER_TOUCH_INFO 数组、一次 InjectTouchInput 提交 |
+| `scenarios.rs` | 合成逻辑场景；单独生成数据不调用原生注入，供离线测试与手动 self-test 共用 |
+| `experiment.rs` | 输入工作线程、最小 PT_TOUCH 接收窗口、退出协作、彩色轨迹及两指缩放演示 |
+| `verify.rs` | 离线日志生命周期、整帧及坐标校验，不调用触摸 API |
+| `logging.rs` | 有界日志队列、独立写线程、丢失计数，拒绝覆盖既有运行日志 |
 
-## 输入路径
+Raw Input 和注入在同一个工作线程内按顺序执行，避免排队期间丢掉 Down/Up。接收窗口独立处理消息。绘制只复制短时显示快照，释放统计锁后再调用 GDI，避免持锁绘图阻塞输入。日志队列容量 16,384，满队列会计数；日志缺失不能视作验收通过。
 
-`GetRawInputDeviceList / GetRawInputDeviceInfoW` 筛选 Digitizers / Touch Pad (`0D:05`)。缓存所选设备的 `RIDI_PREPARSEDDATA`，由 `HidP_GetCaps / GetValueCaps / GetButtonCaps` 枚举真实字段，再用 `HidP_GetData` 提取报告中的数据索引。
+## 输入及报告组装
 
-没有硬编码本机报告的位偏移或坐标范围。Report ID、按钮字段与 LinkCollection 均来自 HID parser。`decode.rs` 接收普通 `Field` 和索引值数组，与 Windows API 分离。当前仅支持同一 LinkCollection 中包含 ID/Tip/X/Y、带 Contact Count 的 PTP 布局；不支持的数组/布局明确报错。
+Raw Input 枚举只选择 Digitizers / Touch Pad (`0D:05`)。缓存所选设备的 `RIDI_PREPARSEDDATA`，由 HidP 导出 Report ID、数据索引、LinkCollection、按钮与坐标范围，没有硬编码本机位偏移。原始缓冲区按 `dwSizeHid * dwCount` 遍历，检查对齐、长度及溢出。前台 `WM_INPUT` 交给 DefWindowProc 清理。
 
-本机 14 字节报告每条只带一个 Contact Record；首条 Contact Count 为 N，后续同一 Scan Time 的 N-1 条为 0。`Assembler` 集齐所有记录后才提交完整帧。Tip=false 的显式抬起记录仍计入 Contact Count。新帧抢先到达、重复 ID、Scan Time 改变或超时均不能被悄悄当成完整数据。
+每个完整帧使用 Contact Count 指定的记录数，包括 Tip=false 的释放记录。混合帧必须通过同一 Scan Time 组装；不完整新帧、重复 ID、孤立的活动 Count=0 续报、没有 Scan Time 的分片或超过 100 ms 的组帧等待均报错并取消。Count=0 且没有活动 Tip 的空闲记录可以有旧坐标。当前不支持的值数组/复杂 LinkCollection 布局明确报错。
 
-`WM_INPUT` 按 `dwSizeHid * dwCount` 遍历所有报告，使用对齐存储并检查可变尾部范围。所选设备通过原始设备句柄区分；前台 `WM_INPUT` 继续经过 `DefWindowProcW` 清理。
+输入超过 500 ms 没有报告时取消活动注入，要求重新观察到空帧；这可能影响停止发送静止报告的设备，必须通过长按实测确认。没有自动读取/修改触控板 Feature Report。
 
-## 注入与接收
+## 事务式触点规划
 
-Raw Input 和注入在同一工作线程内串行执行，UI 接收窗口在独立线程上。没有跨线程积压触摸帧，也没有逐指鼠标模拟。日志由容量 16,384 的队列交给写线程；溢出会计数，不能据有日志丢失的实验宣称完整证据。最多保留 100,000 个耗时样本和 5,000 个显示点，适用于短时实验。
+`touch::Planner` 将原始 Contact ID 映射到注入槽位 `0..capacity-1`，容量为 1..5。它生成整帧及候选成功状态；`Engine` 只有在 transport 成功后才提交该状态。失败不会把未成功注入的位置或新手指写成活动状态。
 
-Per-Monitor DPI Awareness V2 在窗口创建前启用。固定映射矩形由接收窗口创建时的物理客户区坐标计算一次；使用白皮书中的 `(length - 1)` 公式、四舍五入和限幅。窗口移动后停止实验，不实现动态目标映射。
+- 容量 1：保留同一原始 ID；被选手指抬起后先结束，再等所有物理 Tip 抬起，避免另一根手指跳入轨迹。
+- 容量 2..5：跟踪所有可信活动触点。原始记录顺序或 ID 数值大小变化不会改变已有槽位。超过容量报错取消，不静默丢手指。
+- 每个提交帧包含所有先前活动槽位。某指 UP 时，其他手指仍有 UPDATE。
+- 有空闲槽位时，同一输入帧中的 UP、UPDATE、DOWN 合并提交。旧槽位在携带 UP 的帧中仍然占用；当替换会超容量时，先提交释放帧，再复用已成功释放的槽位。该必要拆分不能宣称为单次原子替换。
+- 没有额外旋转、平滑或校准；按描述符范围映射至固定物理像素矩形，使用 `(length - 1)`、取整和限幅。
 
-`InitializeTouchInjection(1, TOUCH_FEEDBACK_NONE)`；注入唯一 ID 为 0。原始多指中只选择一个稳定 Contact ID，后续继续追踪同一 ID。被选中手指离开后，先释放，再等所有手指抬起才开始新序列，避免切换手指导致跳跃。Confidence=false 的触点不注入。首次开始也等待一次空触点帧。
+按 Microsoft Touch Injection 约束：Down 为 `INRANGE|INCONTACT|DOWN`，移动为 `INRANGE|INCONTACT|UPDATE`，Up 使用独立 `UP` 结束，取消使用 `CANCELED|UP`。不会使用会留下 hover 的 `INRANGE|UP`。UP 使用最后成功位置；若刚 Down 尚无 UPDATE，会先补 UPDATE。清理先补完整 UPDATE，再提交所有取消 UP。
 
-DOWN 使用 `INRANGE|INCONTACT|DOWN`，移动/保活使用 `INRANGE|INCONTACT|UPDATE`。UP 使用最后成功注入位置，先补最后一帧 UPDATE，再以单独 `UP` 结束。这里没有照抄白皮书表格中的 `INRANGE|UP`：官方文档说明这种组合会进入 hover，`UP` 才结束触摸序列。未指定压力、方向和接触面积，使用默认值。
+## 注入、重试及失败状态
 
-`ERROR_NOT_READY` 以 1 ms 间隔重试同一帧，最多 20 次；不会跳过 Down/Up。未自定义时间戳。约 16 ms 定时检查保活；超过 500 ms 没有原始报告时取消活动注入并要求重新观察到空帧。无法证明异常退出/强制杀进程的释放可靠性，见限制。
+`InitializeTouchInjection(capacity, TOUCH_FEEDBACK_NONE)`，指针 ID 使用容量范围内的槽位。未自定义时间戳、压力、方向和接触面积。
 
-每个注入位置先 `WindowFromPoint` 检查是否命中本测试窗口。没有向任意第三方窗口发送输入的实现。`WM_POINTERDOWN / UPDATE / UP` 回调中再次调用 `GetPointerInfo`，只统计 `PT_TOUCH`，并调用 `GetPointerTouchInfo` 验证触摸类型。绿色轨迹只使用这些真正收到的屏幕坐标；不会依据原始输入或成功 API 次数伪造接收轨迹。
+`ERROR_NOT_READY (21)` 以 1 ms 间隔重试同一整帧，最多 20 次。成功前不推进状态，也不会跳到下一个输入帧。`ERROR_INVALID_PARAMETER (87)` 按文档视作系统已取消活动注入，清除该状态并等待空帧。其他失败先尝试取消，仍失败时保留已知触点及 `cleanup_pending`，阻止新的 Down；之后只尝试清理并重新等待空帧。
 
-## 验证证据
+大约 16 ms 检查一次保活；保活也是完整活动触点帧。每个正常 Down/Update 都通过 WindowFromPoint 校验命中专用接收窗口；清理不因遮挡而被该检查拦住，以便结束已有序列。窗口移动、最小化、设备移除、显示变化触发停止/取消，没有后续阶段的重新连接或动态目标管理。
 
-合成 `--self-test` 与物理 `--capture` 明确标注来源。`Analyze-Run.ps1` 检查：注入序列合法性、UP 坐标、系统接收 Down/Up 配对、活动触点残留，以及接收事件是否是成功注入事件的有序坐标子序列。Windows 可能合并 UPDATE，因此不要求 UPDATE 消息数量与注入数量完全一致。
+## 接收窗口及退出
 
-`tests/fixtures` 在本机保存真实五指报告和 Windows 预解析数据；录制文件不上传到 Git。两项可选离线回归在运行时读取这些本地文件，默认忽略；通用测试和正常构建不依赖它们。录制回归不代替物理测试，也不是通用 HID 描述符语料库。
+UI 只统计 GetPointerInfo 确认为 `PT_TOUCH` 的消息，并调用 GetPointerTouchInfo。各系统 pointer ID 单独保存轨迹，活动触点分配不同颜色并显示 ID；两指距离比来自收到的实际坐标，演示方框按此缩放。它验证接收数据，没有证明所有第三方应用都识别缩放手势。
 
-## 参考与许可证边界
+Esc、WM_CLOSE、Ctrl+C 或计时结束设置停止标志；工作线程先完成清理，再发布完成标志。窗口继续泵消息至少约 300 ms 后关闭，尽量接收最后 UP。汇总记录两端剩余触点、清理失败与日志丢失；残留状态不能被报告为成功。强杀进程、崩溃、锁屏及系统拒绝清理仍可能越过此协作流程。
 
-先阅读了 Tapview 的 Windows 采集及发现实现，以核对 Raw Input / HID API 路线。当前查看的仓库没有可确认的源码复用许可，因此本项目独立实现，没有复制其源码，也没有使用其触控板 Feature Report 写入功能。
+## 离线日志校验
 
-- [Tapview Windows backend](https://github.com/JohnAZoidberg/tapview/blob/main/src/input/windows_backend.rs)
-- [Tapview Windows discovery](https://github.com/JohnAZoidberg/tapview/blob/main/src/discovery/windows_discovery.rs)
-- [Raw Input device metadata](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getrawinputdeviceinfow)
-- [Windows Precision Touchpad Collection](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection)
-- [InjectTouchInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-injecttouchinput)
-- [Microsoft touch injection sample](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/InjectTouchPointerInput/cpp/InjectTouch.cpp)
+格式 2 将一次 API 成功记录为 `INJECT_BATCH`，随后记录所有槽位的 `INJECT_OK`。校验器检查每批计数、完整活动集合、槽位唯一性、容量和 UP 坐标。Windows 返回的 ID 不等于注入槽位，也可能交错投递不同手指消息并合并 UPDATE，因此按完整生命周期及有序坐标子序列匹配，并用一对一匹配避免把相同坐标的两个手指重复归到同一序列。
 
-PadBridge 原创代码及随附文档采用 MIT 许可证，版权人为 mouse233；白皮书内容保留原样。依赖为 windows-rs 项目的 `windows-sys`、`windows-link`（许可证为 MIT OR Apache-2.0，以各自 crate 元数据/许可证为准）；保留 Cargo.lock，第三方权利及通知见 `docs/third-party-notices.md`。
+缺少接收事件、Down/Up 不完整、错误坐标、原始 ID 中途改变、日志丢失或未完成关机记录都不能判为通过。验收结果仍需人工确认真实硬件操作，不能由合成场景自动替代。
+
+## 范围及参考
+
+Phase 3–5 的任意目标、完整 GUI、快捷键配置、托盘与发布机制没有加入。未复用 Tapview 未确认许可的源码；MIT 与第三方通知见根目录 LICENSE 和 `third-party-notices.md`。
+
+- [Touchpad collection](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection)
+- [InjectTouchInput 状态、完整帧与错误约束](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-injecttouchinput)
+- [InitializeTouchInjection](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-initializetouchinjection)
+- [GetPointerFrameInfo 及消息合并说明](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpointerframeinfo)
+- [Tapview Windows backend，仅参考](https://github.com/JohnAZoidberg/tapview/blob/main/src/input/windows_backend.rs)

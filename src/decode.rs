@@ -141,8 +141,15 @@ impl Assembler {
             self.expected = r.count;
             self.scan = r.scan;
         } else if self.expected == 0 {
-            // An idle count=0 record may retain stale contact fields.
+            if r.contacts.iter().any(|c| c.tip) {
+                return Err("orphan hybrid continuation with active tip".into());
+            }
+            // Idle count=0 may retain stale coordinates, never an active tip.
             return Ok(Some(Vec::new()));
+        }
+        if r.scan.is_none() && self.expected > r.contacts.len() {
+            self.reset();
+            return Err("fragmented frame requires Scan Time".into());
         }
         if self.scan != r.scan {
             self.reset();
@@ -243,11 +250,21 @@ mod tests {
     }
     #[test]
     fn idle_ignores_stale_record() {
-        assert!(Assembler::default()
-            .push(r(0, &[1]))
-            .unwrap()
-            .unwrap()
-            .is_empty());
+        let mut idle = r(0, &[1]);
+        idle.contacts[0].tip = false;
+        assert!(Assembler::default().push(idle).unwrap().unwrap().is_empty());
+    }
+    #[test]
+    fn orphan_active_continuation_is_not_an_empty_frame() {
+        assert!(Assembler::default().push(r(0, &[1])).is_err());
+    }
+    #[test]
+    fn fragmented_reports_without_scan_time_fail() {
+        let mut a = Assembler::default();
+        let mut frame = r(2, &[1]);
+        frame.scan = None;
+        assert!(a.push(frame).is_err());
+        assert!(!a.is_pending());
     }
     #[test]
     fn mapping_corners_clamp_and_negative_origin() {

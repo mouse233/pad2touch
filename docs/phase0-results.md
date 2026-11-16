@@ -2,6 +2,8 @@
 
 测试日期：2026-11-16，Asia/Shanghai。
 
+本报告保留 Phase 0 / v0.1.0 的历史验收结果及当时测试数量。当前 Phase 1/2 实现、测试数量和未完成的真实验收见 `phase12-results.md`；以下数字不代表新版本已重新完成硬件实测。
+
 **结论：本机 Phase 0 验收通过。** 本机 Precision Touchpad 的原始多指坐标可经 Windows Raw Input 获取；真实触控板的单指移动已在固定矩形中转换成由 Windows 投递的 PT_TOUCH Down / Update / Up，并显示接收轨迹。尚未实现或验证多指同步注入。
 
 ## 环境

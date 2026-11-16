@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{BufWriter, Write},
     path::Path,
     sync::{
@@ -18,7 +18,13 @@ pub struct Log {
 impl Log {
     pub fn open(dir: &Path) -> Result<(Self, std::thread::JoinHandle<Result<(), String>>), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let file = File::create(dir.join("events.log")).map_err(|e| e.to_string())?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join("events.log"))
+            .map_err(|e| {
+                format!("cannot create new events.log (choose an unused --out directory): {e}")
+            })?;
         let (tx, rx) = mpsc::sync_channel::<String>(16384);
         let handle = std::thread::spawn(move || {
             let mut out = BufWriter::new(file);

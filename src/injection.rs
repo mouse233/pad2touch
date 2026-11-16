@@ -1,7 +1,9 @@
+//! Thin Win32 transport. Lifecycle/slot allocation is tested without Windows injection.
 use crate::{
-    decode::{map_axis, Contact},
+    decode::Contact,
     hid::winerr,
     logging::Log,
+    touch::{Action, Engine, Failure, Frame, Rectangle, Transport},
 };
 use std::{
     thread,
@@ -12,171 +14,186 @@ use windows_sys::Win32::{
     UI::{Input::Pointer::*, WindowsAndMessaging::*},
 };
 
-pub struct Injector {
+pub fn flags(action: Action) -> u32 {
+    match action {
+        Action::Down => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
+        Action::Update => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
+        Action::Up => POINTER_FLAG_UP,
+        Action::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
+    }
+}
+struct WindowsTransport {
     target: usize,
-    rect: RECT,
-    active: Option<(u32, POINT)>,
-    armed: bool,
-    pub successes: u64,
-    pub failures: u64,
-    pub retries: u64,
-    pub durations: Vec<u128>,
     log: Log,
+    batch: u64,
+}
+impl Transport for WindowsTransport {
+    fn inject(&mut self, frame: &Frame) -> Result<(), Failure> {
+        if !frame.cleanup {
+            for p in &frame.pointers {
+                if matches!(p.action, Action::Down | Action::Update)
+                    && unsafe {
+                        WindowFromPoint(POINT {
+                            x: p.point.x,
+                            y: p.point.y,
+                        })
+                    } as usize
+                        != self.target
+                {
+                    self.log
+                        .event("INJECT_BLOCKED fixed target unavailable or occluded");
+                    return Err(Failure::TargetUnavailable);
+                }
+            }
+        }
+        let contacts: Vec<_> = frame
+            .pointers
+            .iter()
+            .map(|p| {
+                let mut info = POINTER_TOUCH_INFO::default();
+                info.pointerInfo.pointerType = PT_TOUCH;
+                info.pointerInfo.pointerId = p.slot;
+                info.pointerInfo.pointerFlags = flags(p.action);
+                info.pointerInfo.ptPixelLocation = POINT {
+                    x: p.point.x,
+                    y: p.point.y,
+                };
+                info
+            })
+            .collect();
+        let start = Instant::now();
+        if unsafe { InjectTouchInput(contacts.len() as u32, contacts.as_ptr()) } == 0 {
+            let code = unsafe { GetLastError() };
+            self.log.event(format!(
+                "INJECT_ERROR count={} code={code} cleanup={}",
+                contacts.len(),
+                frame.cleanup
+            ));
+            return Err(Failure::Win32(code));
+        }
+        self.batch += 1;
+        let us = start.elapsed().as_micros();
+        self.log.event(format!(
+            "INJECT_BATCH batch={} count={} cleanup={} api_us={us}",
+            self.batch,
+            contacts.len(),
+            frame.cleanup
+        ));
+        for p in &frame.pointers {
+            self.log.event(format!(
+                "INJECT_OK flags=0x{:X} x={} y={} api_us={us} batch={} slot={} raw_id={}",
+                flags(p.action),
+                p.point.x,
+                p.point.y,
+                self.batch,
+                p.slot,
+                p.raw_id
+            ));
+        }
+        Ok(())
+    }
+    fn retry_delay(&mut self) {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+pub struct Injector {
+    engine: Engine<WindowsTransport>,
     last_sent: Instant,
+    log: Log,
 }
 impl Injector {
-    pub fn new(target: usize, rect: RECT, log: Log) -> Result<Self, String> {
-        if unsafe { InitializeTouchInjection(1, TOUCH_FEEDBACK_NONE) } == 0 {
+    pub fn new(target: usize, rect: RECT, capacity: usize, log: Log) -> Result<Self, String> {
+        let transport = WindowsTransport {
+            target,
+            log: log.clone(),
+            batch: 0,
+        };
+        let engine = Engine::new(
+            capacity,
+            Rectangle {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            transport,
+        )?;
+        if unsafe { InitializeTouchInjection(capacity as u32, TOUCH_FEEDBACK_NONE) } == 0 {
             return Err(winerr("InitializeTouchInjection"));
         }
-        log.event("INITIALIZE_TOUCH_INJECTION success max_contacts=1");
+        log.event(format!(
+            "INITIALIZE_TOUCH_INJECTION success max_contacts={capacity}"
+        ));
         Ok(Self {
-            target,
-            rect,
-            active: None,
-            armed: false,
-            successes: 0,
-            failures: 0,
-            retries: 0,
-            durations: Vec::new(),
-            log,
+            engine,
             last_sent: Instant::now(),
+            log,
         })
     }
-    fn send(&mut self, point: POINT, flags: u32) -> Result<(), String> {
-        let mut info = POINTER_TOUCH_INFO::default();
-        // Keep the sole injected contact in slot 0. On this machine slot 1
-        // with InitializeTouchInjection(1, ...) fails with error 87.
-        info.pointerInfo.pointerType = PT_TOUCH;
-        info.pointerInfo.pointerId = 0;
-        info.pointerInfo.ptPixelLocation = point;
-        info.pointerInfo.pointerFlags = flags;
-        // No custom timestamps: ERROR_NOT_READY requires retrying this SAME frame.
-        let start = Instant::now();
-        for attempt in 0..20 {
-            if unsafe { InjectTouchInput(1, &info) } != 0 {
-                self.successes += 1;
-                self.last_sent = Instant::now();
-                if self.durations.len() < 100_000 {
-                    self.durations.push(start.elapsed().as_micros());
-                }
-                self.log.event(format!(
-                    "INJECT_OK flags=0x{flags:X} x={} y={} api_us={}",
-                    point.x,
-                    point.y,
-                    start.elapsed().as_micros()
-                ));
-                return Ok(());
-            }
-            let e = unsafe { GetLastError() };
-            if e == ERROR_NOT_READY && attempt < 19 {
-                self.retries += 1;
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            self.failures += 1;
-            self.log
-                .event(format!("INJECT_ERROR flags=0x{flags:X} code={e}"));
-            return Err(format!("InjectTouchInput: Win32 error {e}"));
+    pub fn frame(&mut self, input: &[Contact]) -> Result<(), String> {
+        let before = self.engine.successes;
+        let result = self.engine.apply(input);
+        if self.engine.successes != before {
+            self.last_sent = Instant::now();
         }
-        unreachable!()
+        result
     }
-    pub fn release(&mut self, cancel: bool) -> Result<(), String> {
-        self.armed = false;
-        if let Some((_, p)) = self.active {
-            // Always establish a final UPDATE at the cached successful point.
-            // UP alone terminates touch; INRANGE|UP would leave hover active.
-            let update = self.send(
-                p,
-                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
-            );
-            let up = self.send(
-                p,
-                POINTER_FLAG_UP | if cancel { POINTER_FLAG_CANCELED } else { 0 },
-            );
-            if up.is_ok() {
-                self.active = None;
-            }
-            return update.and(up);
-        }
-        Ok(())
-    }
-    pub fn frame(&mut self, contacts: &[Contact]) -> Result<(), String> {
-        let live: Vec<_> = contacts.iter().filter(|c| c.tip && c.confidence).collect();
-        if live.is_empty() {
-            self.release(false)?;
-            self.armed = true;
-            return Ok(());
-        }
-        if !self.armed {
-            return Ok(());
-        }
-        let c = if let Some((id, _)) = self.active {
-            if let Some(c) = live.iter().find(|c| c.id == id) {
-                *c
-            } else {
-                self.release(false)?;
-                return Ok(());
-            }
-        } else {
-            *live.iter().min_by_key(|c| c.id).unwrap()
-        };
-        let p = POINT {
-            x: map_axis(
-                c.x,
-                c.xmin,
-                c.xmax,
-                self.rect.left,
-                self.rect.right - self.rect.left,
-            )?,
-            y: map_axis(
-                c.y,
-                c.ymin,
-                c.ymax,
-                self.rect.top,
-                self.rect.bottom - self.rect.top,
-            )?,
-        };
-        let hit = unsafe { WindowFromPoint(p) } as usize;
-        if hit != self.target {
-            self.release(true)?;
-            return Err(format!("fixed rectangle hit-test mismatch: hit=0x{hit:X} target=0x{:X} x={} y={}; paused until empty frame",self.target,p.x,p.y));
-        }
-        let flag = if self.active.is_some() {
-            POINTER_FLAG_UPDATE
-        } else {
-            POINTER_FLAG_DOWN
-        };
-        if let Err(e) = self.send(p, POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | flag) {
-            let _ = self.release(true);
-            return Err(e);
-        }
-        self.active = Some((c.id, p));
-        Ok(())
+    pub fn release(&mut self, _cancel: bool) -> Result<(), String> {
+        self.engine.cancel()
     }
     pub fn keepalive(&mut self) -> Result<(), String> {
-        if let Some((_, p)) = self.active {
-            if self.last_sent.elapsed() > Duration::from_millis(16) {
-                if unsafe { WindowFromPoint(p) } as usize != self.target {
-                    self.release(true)?;
-                    return Err("test rectangle occluded during hold".into());
-                }
-                self.send(
-                    p,
-                    POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
-                )?;
+        if self.last_sent.elapsed() >= Duration::from_millis(16) {
+            let before = self.engine.successes;
+            let result = self.engine.keepalive();
+            if self.engine.successes != before {
+                self.last_sent = Instant::now();
             }
+            result
+        } else {
+            Ok(())
         }
-        Ok(())
     }
     pub fn has_active(&self) -> bool {
-        self.active.is_some()
+        self.engine.active_count() > 0
+    }
+    pub fn active_count(&self) -> usize {
+        self.engine.active_count()
+    }
+    pub fn is_armed(&self) -> bool {
+        self.engine.is_armed()
+    }
+    pub fn cleanup_pending(&self) -> bool {
+        self.engine.cleanup_pending
+    }
+    pub fn successes(&self) -> u64 {
+        self.engine.successes
+    }
+    pub fn failures(&self) -> u64 {
+        self.engine.failures
+    }
+    pub fn retries(&self) -> u64 {
+        self.engine.retries
+    }
+    pub fn durations(&self) -> &[u128] {
+        &self.engine.durations
     }
 }
 impl Drop for Injector {
     fn drop(&mut self) {
-        if let Err(e) = self.release(true) {
+        if let Err(e) = self.engine.cancel() {
             self.log.event(format!("RELEASE_ERROR {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_flags_end_without_hover() {
+        assert_eq!(flags(Action::Down), 0x10006);
+        assert_eq!(flags(Action::Update), 0x20006);
+        assert_eq!(flags(Action::Up), 0x40000);
+        assert_eq!(flags(Action::Cancel), 0x48000);
     }
 }

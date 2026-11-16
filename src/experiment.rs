@@ -6,7 +6,7 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     mem::size_of,
     path::PathBuf,
     ptr::{null, null_mut},
@@ -35,6 +35,15 @@ pub struct Options {
     pub out: PathBuf,
     pub device: usize,
     pub inject: bool,
+    pub contacts: usize,
+}
+#[derive(Clone, Copy)]
+pub struct TracePoint {
+    id: u32,
+    x: i32,
+    y: i32,
+    down: bool,
+    color: usize,
 }
 #[derive(Default)]
 pub struct Stats {
@@ -55,7 +64,17 @@ pub struct Stats {
     pub retries: u64,
     pub last: String,
     pub error: String,
-    pub points: VecDeque<(i32, i32, bool)>,
+    pub points: VecDeque<TracePoint>,
+    pub received_active: BTreeMap<u32, (i32, i32)>,
+    pub received_colors: BTreeMap<u32, usize>,
+    pub received_peak: usize,
+    pub receive_errors: u64,
+    pub injected_active: usize,
+    pub capacity: usize,
+    pub armed: bool,
+    pub cleanup_pending: bool,
+    pub pinch_pair: Option<(u32, u32, f64)>,
+    pub pinch_ratio: f64,
     pub api_us: Vec<u128>,
     pub capture_us: Vec<u128>,
     pub scans: Vec<u32>,
@@ -68,6 +87,14 @@ struct Ui {
     start: Instant,
     seconds: u64,
     rect: RECT,
+    worker_done: Arc<AtomicBool>,
+    drain_started: Option<Instant>,
+}
+struct WorkerFinished(Arc<AtomicBool>);
+impl Drop for WorkerFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 thread_local! {static UI:RefCell<Option<Ui>>=const{RefCell::new(None)};static INPUT:RefCell<Option<Worker>>=const{RefCell::new(None)};}
 pub fn wide(s: &str) -> Vec<u16> {
@@ -128,7 +155,7 @@ pub fn run(opt: Options) -> Result<(), String> {
     EXIT.store(false, Ordering::Relaxed);
     let (log, writer) = Log::open(&opt.out)?;
     log.event(format!(
-        "RUN mode={} inject={} seconds={} source={}",
+        "RUN format=2 mode={} inject={} seconds={} source={} capacity={}",
         opt.mode,
         opt.inject || opt.mode == "self-test",
         opt.seconds,
@@ -136,7 +163,8 @@ pub fn run(opt: Options) -> Result<(), String> {
             "SYNTHETIC_API_TEST_NOT_HARDWARE"
         } else {
             "PHYSICAL_RAW_INPUT"
-        }
+        },
+        opt.contacts
     ));
     unsafe {
         let mut token = null_mut();
@@ -168,9 +196,12 @@ pub fn run(opt: Options) -> Result<(), String> {
     }
     let shared: Shared = Arc::new(Mutex::new(Stats {
         mode: opt.mode.clone(),
+        capacity: opt.contacts,
+        pinch_ratio: 1.0,
         ..Default::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));
+    let worker_done = Arc::new(AtomicBool::new(false));
     let mut devices = hid::discover()?;
     for (i, d) in devices.iter().enumerate() {
         log.event(format!("DEVICE index={i} {}", d.summary()));
@@ -212,8 +243,8 @@ pub fn run(opt: Options) -> Result<(), String> {
             return Err(winerr("SetConsoleCtrlHandler"));
         }
         let hwnd = make_window(
-            "PadBridgePhase0Receiver",
-            &format!("PadBridge Phase 0 - {} - real PT_TOUCH receiver", opt.mode),
+            "PadBridgeReceiver",
+            &format!("PadBridge Phase 1+2 - {} - PT_TOUCH receiver", opt.mode),
             Some(ui_proc),
             true,
         )?;
@@ -243,6 +274,8 @@ pub fn run(opt: Options) -> Result<(), String> {
                 start: Instant::now(),
                 seconds: opt.seconds,
                 rect,
+                worker_done: worker_done.clone(),
+                drain_started: None,
             })
         });
         // A second call also handles a launcher specifying SW_HIDE for the
@@ -262,11 +295,12 @@ pub fn run(opt: Options) -> Result<(), String> {
         let target = hwnd as usize;
         let mode = opt.mode.clone();
         let inject = opt.inject || mode == "self-test";
+        let capacity = opt.contacts;
         let worker = std::thread::spawn(move || {
+            let _finished = WorkerFinished(worker_done);
             let result = worker_loop(
                 device,
-                mode,
-                inject,
+                (mode, inject, capacity),
                 (target, rect),
                 worker_shared.clone(),
                 worker_log.clone(),
@@ -279,10 +313,13 @@ pub fn run(opt: Options) -> Result<(), String> {
             result
         });
         let mut msg = MSG::default();
+        let mut receiver_result = Ok(());
         loop {
             let status = GetMessageW(&mut msg, null_mut(), 0, 0);
             if status == -1 {
-                log.event(winerr("GetMessageW(receiver)"));
+                let error = winerr("GetMessageW(receiver)");
+                log.event(&error);
+                receiver_result = Err(error);
                 break;
             }
             if status == 0 {
@@ -292,7 +329,10 @@ pub fn run(opt: Options) -> Result<(), String> {
             DispatchMessageW(&msg);
         }
         stop.store(true, Ordering::Relaxed);
-        let result = worker.join().map_err(|_| "Raw Input worker panicked")?;
+        let result = worker
+            .join()
+            .map_err(|_| "Raw Input worker panicked")?
+            .and(receiver_result);
         if let Err(e) = &result {
             log.event(format!("WORKER_ERROR {e}"));
             shared.lock().unwrap().error = e.clone();
@@ -305,6 +345,20 @@ pub fn run(opt: Options) -> Result<(), String> {
         }
         let s = shared.lock().unwrap();
         let dropped = log.dropped.load(Ordering::Relaxed);
+        let result = result.and(
+            if dropped > 0
+                || s.cleanup_pending
+                || s.injected_active > 0
+                || !s.received_active.is_empty()
+            {
+                Err(
+                    "experiment ended with log loss or unresolved touch contacts; inspect summary"
+                        .into(),
+                )
+            } else {
+                Ok(())
+            },
+        );
         let summary = format!(
             "{}actual_duration_ms={}\n",
             summary(&s, dropped, opt.seconds),
@@ -329,7 +383,7 @@ fn percentile(v: &[u128], p: usize) -> u128 {
     }
 }
 fn summary(s: &Stats, dropped: u64, seconds: u64) -> String {
-    format!("mode={}\nsource={}\nrequested_duration_s={seconds}\ndevice={}\nraw_reports={}\ncomplete_frames={}\npeak_active_contacts={}\nparse_errors={}\nincomplete_frames={}\ninjected_frames={}\ninjection_errors={}\nnot_ready_retries={}\nreceiver_PT_TOUCH_down={}\nreceiver_PT_TOUCH_update={}\nreceiver_PT_TOUCH_up={}\nreceiver_GetPointerTouchInfo_ok={}\nlog_dropped={}\ninject_api_p95_us={}\nraw_to_inject_call_p95_us={}\nlatency_note=host software only; excludes firmware, OS delivery and physical input latency\nlast_error={}\nhardware_verdict=MANUAL_REVIEW_REQUIRED; synthetic tests never establish hardware compatibility\n",s.mode,if s.mode=="self-test"{"SYNTHETIC_API_TEST_NOT_HARDWARE"}else{"PHYSICAL_RAW_INPUT"},s.device,s.raw,s.frames,s.peak,s.parse_errors,s.incomplete,s.injected,s.inject_errors,s.retries,s.down,s.update,s.up,s.touch_info,dropped,percentile(&s.api_us,95),percentile(&s.capture_us,95),s.error)
+    format!("phase=1+2\nvalidation_status=PENDING_MANUAL_HARDWARE_TEST\nmode={}\nsource={}\nrequested_duration_s={seconds}\ndevice={}\ncapacity={}\nraw_reports={}\ncomplete_frames={}\npeak_active_contacts={}\nparse_errors={}\nincomplete_frames={}\ninjected_frames={}\ninjection_errors={}\nnot_ready_retries={}\ninjected_contacts_remaining={}\ncleanup_pending={}\nreceiver_PT_TOUCH_down={}\nreceiver_PT_TOUCH_update={}\nreceiver_PT_TOUCH_up={}\nreceiver_GetPointerTouchInfo_ok={}\nreceiver_peak_contacts={}\nreceiver_contacts_remaining={}\nreceiver_lifecycle_errors={}\nlog_dropped={}\ninject_api_p95_us={}\nraw_to_inject_call_p95_us={}\nlatency_note=host software only; excludes firmware, OS delivery and physical input latency\nlast_error={}\n",s.mode,if s.mode=="self-test"{"SYNTHETIC_API_TEST_NOT_HARDWARE"}else{"PHYSICAL_RAW_INPUT"},s.device,s.capacity,s.raw,s.frames,s.peak,s.parse_errors,s.incomplete,s.injected,s.inject_errors,s.retries,s.injected_active,s.cleanup_pending,s.down,s.update,s.up,s.touch_info,s.received_peak,s.received_active.len(),s.receive_errors,dropped,percentile(&s.api_us,95),percentile(&s.capture_us,95),s.error)
 }
 unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
@@ -343,15 +397,37 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 u.log.event(format!("RECEIVE_PT_TOUCH {kind} id={id} frame={} x={} y={} flags=0x{:X} touch_info={touch_ok}",info.frameId,info.ptPixelLocation.x,info.ptPixelLocation.y,info.pointerFlags));
                 let mut s=u.shared.lock().unwrap();match msg{WM_POINTERDOWN=>s.down+=1,WM_POINTERUP=>s.up+=1,_=>s.update+=1};if touch_ok{s.touch_info+=1;}
                 let mut p=info.ptPixelLocation;ScreenToClient(hwnd,&mut p);
-                s.points.push_back((p.x,p.y,msg==WM_POINTERDOWN));if s.points.len()>5000{s.points.pop_front();}
+                if msg==WM_POINTERDOWN {let color=(0..5).find(|c|!s.received_colors.values().any(|v|v==c)).unwrap_or(id as usize%5);s.received_colors.insert(id,color);if s.received_active.insert(id,(p.x,p.y)).is_some(){s.receive_errors+=1;}}
+                else if msg==WM_POINTERUP {if s.received_active.remove(&id).is_none(){s.receive_errors+=1;}}
+                else if let Some(point)=s.received_active.get_mut(&id){*point=(p.x,p.y);}else{s.receive_errors+=1;}
+                s.received_peak=s.received_peak.max(s.received_active.len());
+                if s.received_active.len()==2 {
+                    let pair:Vec<_>=s.received_active.iter().collect();let (&a,&(ax,ay))=pair[0];let (&b,&(bx,by))=pair[1];
+                    let distance=((ax as f64-bx as f64).powi(2)+(ay as f64-by as f64).powi(2)).sqrt();
+                    if let Some((old_a,old_b,baseline))=s.pinch_pair {if old_a==a&&old_b==b&&baseline>0.0{s.pinch_ratio=distance/baseline;}else{s.pinch_pair=Some((a,b,distance));}}
+                    else{s.pinch_pair=Some((a,b,distance));s.pinch_ratio=1.0;}
+                }else{s.pinch_pair=None;}
+                let color=s.received_colors.get(&id).copied().unwrap_or(0);
+                s.points.push_back(TracePoint{id,x:p.x,y:p.y,down:msg==WM_POINTERDOWN,color});if s.points.len()>5000{s.points.pop_front();}
+                if msg==WM_POINTERUP{s.received_colors.remove(&id);}
             }});
             return 0;
         }
         WM_TIMER => {
             let close = UI.with(|u| {
-                u.borrow().as_ref().is_some_and(|u| {
-                    u.start.elapsed().as_secs() >= u.seconds || EXIT.load(Ordering::Relaxed)
-                })
+                let mut ui = u.borrow_mut();
+                let Some(u) = ui.as_mut() else {
+                    return false;
+                };
+                if u.start.elapsed().as_secs() >= u.seconds || EXIT.load(Ordering::Relaxed) {
+                    u.stop.store(true, Ordering::Relaxed);
+                }
+                if u.stop.load(Ordering::Relaxed) && u.worker_done.load(Ordering::Acquire) {
+                    let since = u.drain_started.get_or_insert_with(Instant::now);
+                    since.elapsed() >= Duration::from_millis(300)
+                } else {
+                    false
+                }
             });
             if close {
                 DestroyWindow(hwnd);
@@ -361,7 +437,11 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             return 0;
         }
         WM_KEYDOWN if w == 27 => {
-            DestroyWindow(hwnd);
+            UI.with(|u| {
+                if let Some(u) = u.borrow().as_ref() {
+                    u.stop.store(true, Ordering::Relaxed);
+                }
+            });
             return 0;
         }
         WM_DISPLAYCHANGE => {
@@ -373,7 +453,11 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             });
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            UI.with(|u| {
+                if let Some(u) = u.borrow().as_ref() {
+                    u.stop.store(true, Ordering::Relaxed);
+                }
+            });
             return 0;
         }
         WM_DESTROY => {
@@ -399,16 +483,28 @@ unsafe fn paint(hwnd: HWND) {
     let mut rc = RECT::default();
     GetClientRect(hwnd, &mut rc);
     FillRect(dc, &rc, (COLOR_WINDOW + 1) as HBRUSH);
-    UI.with(|u|{if let Some(u)=u.borrow().as_ref(){let s=u.shared.lock().unwrap();
-        let text=format!("PadBridge PHASE 0 | {}\n{}\nRaw reports {} | Frames {} | Peak fingers {} | Parse errors {}\nInject OK {} | Errors {} | Retry {} | SINGLE CONTACT ONLY\nReceived PT_TOUCH: DOWN {} / UPDATE {} / UP {} | TouchInfo {}\n{}\nESC: stop | Raw multi-finger capture; one injected touch | Native mouse remains active",if s.mode=="self-test"{"SYNTHETIC API TEST - NOT HARDWARE"}else{"PHYSICAL TOUCHPAD"},s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.down,s.update,s.up,s.touch_info,if s.error.is_empty(){&s.last}else{&s.error});
+    UI.with(|u|{if let Some(u)=u.borrow().as_ref(){
+        let (text,points,active,active_colors,pinch_ratio)={let s=u.shared.lock().unwrap();
+        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger distance ratio: {:.2} | Lifecycle errors {} | {}\nESC: release and stop | Native touchpad mouse remains active",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,s.receive_errors,s.error);
+        (text,s.points.clone(),s.received_active.clone(),s.received_colors.clone(),s.pinch_ratio)};
+        // Release the statistics lock before GDI painting.
         let face=wide("Segoe UI");let font=CreateFontW(-20,0,0,0,FW_NORMAL as i32,0,0,0,DEFAULT_CHARSET as u32,0,0,CLEARTYPE_QUALITY as u32,0,face.as_ptr());
         let old_font=if !font.is_null(){SelectObject(dc,font)}else{null_mut()};
         let mut tr=RECT{left:20,top:12,right:rc.right-20,bottom:215};let t=wide(&text);SetBkMode(dc,TRANSPARENT as i32);DrawTextW(dc,t.as_ptr(),-1,&mut tr,DT_LEFT|DT_WORDBREAK|DT_NOPREFIX);
         let mut org=POINT{x:0,y:0};ClientToScreen(hwnd,&mut org);
         let boxrect=RECT{left:u.rect.left-org.x,top:u.rect.top-org.y,right:u.rect.right-org.x,bottom:u.rect.bottom-org.y};FrameRect(dc,&boxrect,GetStockObject(GRAY_BRUSH) as HBRUSH);
-        let pen=CreatePen(PS_SOLID,3,0x00709010);let old=SelectObject(dc,pen);
-        let mut first=true;for &(x,y,down) in &s.points {if first||down{MoveToEx(dc,x,y,null_mut());first=false;}else{LineTo(dc,x,y);}}
-        SelectObject(dc,old);DeleteObject(pen);
+        let colors=[0x00709010,0x002070D0,0x00C06050,0x009040A0,0x0020A0A0];
+        let pens:Vec<_>=colors.iter().map(|&color|CreatePen(PS_SOLID,3,color)).collect();
+        let old_pen=SelectObject(dc,pens[0]);
+        let old_brush=SelectObject(dc,GetStockObject(HOLLOW_BRUSH));
+        let mut previous=BTreeMap::new();
+        for p in &points {SelectObject(dc,pens[p.color%pens.len()]);
+            if !p.down {if let Some(&(x,y))=previous.get(&p.id){MoveToEx(dc,x,y,null_mut());LineTo(dc,p.x,p.y);}}
+            previous.insert(p.id,(p.x,p.y));
+        }
+        for (&id,&(x,y)) in &active {SelectObject(dc,pens[active_colors.get(&id).copied().unwrap_or(0)%pens.len()]);Ellipse(dc,x-10,y-10,x+10,y+10);let label=wide(&format!("{id}"));TextOutW(dc,x+12,y-12,label.as_ptr(),(label.len()-1) as i32);}
+        if active.len()==2 {let cx=(boxrect.left+boxrect.right)/2;let cy=(boxrect.top+boxrect.bottom)/2;let scale=pinch_ratio.clamp(0.25,2.0);let half_w=(80.0*scale) as i32;let half_h=(50.0*scale) as i32;Rectangle(dc,cx-half_w,cy-half_h,cx+half_w,cy+half_h);}
+        SelectObject(dc,old_pen);SelectObject(dc,old_brush);for pen in pens{DeleteObject(pen);}
         if !font.is_null(){SelectObject(dc,old_font);DeleteObject(font);}
     }});
     EndPaint(hwnd, &ps);
@@ -428,24 +524,27 @@ struct Worker {
     target: usize,
     rect: RECT,
     synthetic_step: u32,
+    capacity: usize,
+    pending_since: Option<Instant>,
+    scenarios: Vec<crate::scenarios::Step>,
 }
 fn worker_loop(
     device: Option<Device>,
-    mode: String,
-    inject: bool,
+    settings: (String, bool, usize),
     fixed_target: (usize, RECT),
     shared: Shared,
     log: Log,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (target, rect) = fixed_target;
+    let (mode, inject, capacity) = settings;
     let fields = device
         .as_ref()
         .map(|d| d.fields())
         .transpose()?
         .unwrap_or_default();
     let injector = if inject {
-        Some(Injector::new(target, rect, log.clone())?)
+        Some(Injector::new(target, rect, capacity, log.clone())?)
     } else {
         None
     };
@@ -463,6 +562,9 @@ fn worker_loop(
         target,
         rect,
         synthetic_step: 0,
+        capacity,
+        pending_since: None,
+        scenarios: crate::scenarios::steps(capacity),
     };
     unsafe {
         let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
@@ -474,21 +576,25 @@ fn worker_loop(
             hwndTarget: hwnd,
         };
         if RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+            let error = winerr("RegisterRawInputDevices");
             INPUT.with(|i| {
                 i.borrow_mut().take();
             });
             DestroyWindow(hwnd);
-            return Err(winerr("RegisterRawInputDevices"));
+            return Err(error);
         }
         log.event("REGISTER_RAW_INPUT success usage=0D:05 INPUTSINK DEVNOTIFY");
-        if SetTimer(hwnd, 1, 16, None) == 0 {
-            return Err(winerr("SetTimer(raw)"));
-        }
+        let mut result = if SetTimer(hwnd, 1, 16, None) == 0 {
+            Err(winerr("SetTimer(raw)"))
+        } else {
+            Ok(())
+        };
         let mut msg = MSG::default();
-        loop {
+        while result.is_ok() {
             let n = GetMessageW(&mut msg, null_mut(), 0, 0);
             if n == -1 {
-                return Err(winerr("GetMessageW(raw)"));
+                result = Err(winerr("GetMessageW(raw)"));
+                break;
             }
             if n == 0 {
                 break;
@@ -496,11 +602,14 @@ fn worker_loop(
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        INPUT.with(|i| {
+        let cleanup = INPUT.with(|i| {
             if let Some(mut worker) = i.borrow_mut().take() {
-                worker.finish();
+                worker.finish()
+            } else {
+                Ok(())
             }
         });
+        result = result.and(cleanup);
         let remove = RAWINPUTDEVICE {
             dwFlags: RIDEV_REMOVE,
             hwndTarget: null_mut(),
@@ -510,8 +619,8 @@ fn worker_loop(
             log.event(winerr("UnregisterRawInputDevices"));
         }
         DestroyWindow(hwnd);
+        result
     }
-    Ok(())
 }
 impl Worker {
     fn error(&mut self, e: String) {
@@ -523,6 +632,7 @@ impl Worker {
             }
         }
         self.assembler.reset();
+        self.pending_since = None;
     }
     fn accept(&mut self, contacts: Vec<Contact>, start: Instant) {
         let live = contacts.iter().filter(|c| c.tip && c.confidence).count();
@@ -546,12 +656,16 @@ impl Worker {
                 .join("; ");
         }
         if let Some(i) = &mut self.injector {
-            let before = i.successes;
+            let before = i.successes();
             if let Err(e) = i.frame(&contacts) {
                 self.error(e);
             }
             let elapsed = start.elapsed().as_micros();
-            if self.injector.as_ref().is_some_and(|i| i.successes > before) {
+            if self
+                .injector
+                .as_ref()
+                .is_some_and(|i| i.successes() > before)
+            {
                 let mut s = self.shared.lock().unwrap();
                 if s.capture_us.len() < 100000 {
                     s.capture_us.push(elapsed);
@@ -563,9 +677,12 @@ impl Worker {
     fn sync_stats(&self) {
         if let Some(i) = &self.injector {
             let mut s = self.shared.lock().unwrap();
-            s.injected = i.successes;
-            s.inject_errors = i.failures;
-            s.retries = i.retries;
+            s.injected = i.successes();
+            s.inject_errors = i.failures();
+            s.retries = i.retries();
+            s.injected_active = i.active_count();
+            s.armed = i.is_armed();
+            s.cleanup_pending = i.cleanup_pending();
         }
     }
     fn raw(&mut self, raw: HRAWINPUT) {
@@ -599,8 +716,13 @@ impl Worker {
                         }
                     }
                     match self.assembler.push(r) {
-                        Ok(Some(frame)) => self.accept(frame, start),
-                        Ok(None) => {}
+                        Ok(Some(frame)) => {
+                            self.pending_since = None;
+                            self.accept(frame, start)
+                        }
+                        Ok(None) => {
+                            self.pending_since.get_or_insert_with(Instant::now);
+                        }
                         Err(e) => {
                             self.shared.lock().unwrap().parse_errors += 1;
                             self.error(e);
@@ -639,38 +761,24 @@ impl Worker {
                 }
             }
         }
+        if self
+            .pending_since
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(100))
+        {
+            self.shared.lock().unwrap().incomplete += 1;
+            self.error("hybrid assembly timeout >100ms".into());
+        }
         if self.mode == "self-test" {
             let elapsed = self.start.elapsed().as_millis();
-            // Three independent synthetic sequences: drag, 2s hold, rapid taps.
-            // Runs through InjectTouchInput, never sends WM_POINTER directly.
-            if elapsed >= 1200 && self.synthetic_step < 360 {
-                let n = self.synthetic_step;
+            if elapsed >= 1200 && (self.synthetic_step as usize) < self.scenarios.len() {
+                let step = &self.scenarios[self.synthetic_step as usize];
+                let contacts = step.contacts.clone();
+                self.log.event(format!(
+                    "SCENARIO {} capacity={}",
+                    step.label, self.capacity
+                ));
                 self.synthetic_step += 1;
-                let active = match n {
-                    0 | 121 | 242 | 359 => false,
-                    1..=120 => true,
-                    122..=241 => true,
-                    _ => n % 4 < 2,
-                };
-                let x = if n <= 120 {
-                    100 + (n as i32) * 6
-                } else if n < 242 {
-                    600
-                } else {
-                    800
-                };
-                let c = Contact {
-                    id: 1,
-                    tip: true,
-                    confidence: true,
-                    x: x.clamp(0, 1000),
-                    y: if n <= 120 { 200 + (n as i32) * 4 } else { 700 },
-                    xmin: 0,
-                    xmax: 1000,
-                    ymin: 0,
-                    ymax: 1000,
-                };
-                self.accept(if active { vec![c] } else { vec![] }, Instant::now());
+                self.accept(contacts, Instant::now());
             }
         } else if self.last_raw.elapsed() > Duration::from_millis(500) {
             if self.assembler.is_pending() {
@@ -680,7 +788,7 @@ impl Worker {
             if let Some(i) = &mut self.injector {
                 if i.has_active() {
                     if let Err(e) = i.release(true) {
-                        self.log.event(e);
+                        self.error(e);
                     }
                 }
             }
@@ -692,18 +800,25 @@ impl Worker {
         }
         self.sync_stats();
     }
-    fn finish(&mut self) {
+    fn finish(&mut self) -> Result<(), String> {
+        let mut result = Ok(());
         if self.assembler.is_pending() {
             self.shared.lock().unwrap().incomplete += 1;
         }
         if let Some(i) = &mut self.injector {
             if let Err(e) = i.release(true) {
                 self.log.event(format!("RELEASE_ERROR {e}"));
+                result = Err(e);
             }
-            self.shared.lock().unwrap().api_us = i.durations.clone();
+            self.shared.lock().unwrap().api_us = i.durations().to_vec();
         }
         self.sync_stats();
-        self.log.event("WORKER_STOP released active touch");
+        self.log.event(format!(
+            "WORKER_STOP active_contacts={} cleanup_pending={}",
+            self.injector.as_ref().map_or(0, |i| i.active_count()),
+            self.injector.as_ref().is_some_and(|i| i.cleanup_pending())
+        ));
+        result
     }
 }
 unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {

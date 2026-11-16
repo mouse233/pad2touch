@@ -1,73 +1,79 @@
-# PadBridge — Phase 0 技术可行性验证
+# PadBridge — Phase 1 + Phase 2 MVP
 
-本仓库目前只实现白皮书第 14 节的 Phase 0：本机 Precision Touchpad 的原始报告采集、固定屏幕矩形映射、**单指** Windows Touch Injection，以及一个直接接收 `WM_POINTER` 的简单测试窗口。没有完整 GUI，也没有提前实现 Phase 1–5。
+将 Windows Precision Touchpad 的原始接触坐标映射到固定测试矩形，再使用 Windows 原生 Touch Injection 生成触摸事件。使用 Rust / windows-rs (`windows-sys`)，保留命令行和简单 Win32 触摸测试窗口。
 
-**2026-11-16 本机结论：Raw Input 可读取最多五个同时活动触点的 ID/Tip Switch/Confidence/X/Y；实际触控板坐标可转换成真实的 PT_TOUCH Down/Update/Up。** 这是短时本机实验结论，不是所有设备或长期稳定性的保证。原始五指采集与多指同步注入是两项不同能力；本版本只注入一个触点。
+**当前版本：0.2.0，Phase 1/2 静态实现完成，等待统一实测。** 本轮没有启动触摸注入、要求用户操作触控板或生成新的运行截图。编译和离线测试通过，不代表新的多指链路已通过硬件验收。
 
-详细证据、失败实验、数字和限制见 [Phase 0 测试报告](docs/phase0-results.md)，设计说明见 [architecture.md](docs/architecture.md)。
+Phase 0 曾在本机验证五指原始采集及单指真实触摸注入，历史证据见 [Phase 0 报告](docs/phase0-results.md)。当前实现与待测项见 [Phase 1/2 静态验证报告](docs/phase12-results.md)，稍后按 [统一实测清单](docs/phase12-manual-test.md) 验收。
 
-## 构建
+## 本阶段功能
 
-需要 Windows x64、Rust MSVC 工具链及 Windows SDK。实际验证工具链为 Rust/Cargo 1.98.1。绑定使用 windows-rs 项目的 `windows-sys 0.61.2`，没有其他运行时依赖。
+- 发现 Raw Input `0D:05` 触控板集合，按 HID 描述数据解析 Contact ID、Tip Switch、Confidence 和 X/Y。
+- 根据 Contact Count / Scan Time 组装并行或混合报告；拒绝缺失片段、孤立活动续报和重复 ID。
+- `--contacts 1`：单指 MVP，持续跟踪同一手指，避免另一根手指接管时坐标跳变。
+- `--contacts 2..5`：同步多指模式，每个 API 帧包含该帧所有已有触点，支持部分抬起、同时变化和稳定 ID。
+- 五个可复用的注入槽位 `0..4`；只在 UP 成功后复用。容量不足的触点替换会先释放旧槽位，再提交新触点。
+- 仅在提交成功后推进状态；NOT_READY 重试同一完整帧，失败时取消并等待全部手指抬起，清理失败时保留未解决状态。
+- 测试窗口分别显示各触点的彩色轨迹、接收 ID 和活动数量；两指距离变化会缩放测试矩形中的演示方框。
+- 退出时先释放触点，接收窗口继续处理消息，之后再关闭；提供离线日志校验。
+
+尚未实现 Phase 3 的任意目标窗口/动态区域映射、Phase 4 的完整 GUI/配置/快捷键体系或 Phase 5 的全面恢复与发布机制。程序不独占触控板，原生鼠标和系统手势会继续工作。
+
+## 构建与离线测试
+
+需要 Windows x64、Rust MSVC 工具链及 Windows SDK。本机工具链为 Rust/Cargo 1.98.1。
 
 ```powershell
 cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
+cargo fmt -- --check
 ```
 
-本机依赖已缓存，也可以加 `--offline`。源码和 `Cargo.lock` 一起交付。
+当前默认测试为 **43 项通过、2 项本机录制测试忽略**。正常克隆不需要真实触控板或私有录制数据。保留本机录制材料时可运行 `cargo test --locked -- --include-ignored`，本机共 **45 项通过**。这些测试不调用 InitializeTouchInjection / InjectTouchInput，不打开测试窗口；录制测试只离线调用 Windows HID parser。
 
-默认测试不需要真实触控板录制数据：8 项通用测试运行，2 项本机录制回归测试默认忽略。真实输入样本未上传到仓库；本机保留样本时可以运行 `cargo test --locked -- --include-ignored` 完成全部 10 项测试。详见 [可选录制测试说明](tests/fixtures/README.md)。
+可执行文件暂沿用原 Cargo 包名：`target\release\padbridge-phase0.exe`，功能已更新为 Phase 1/2。
 
-## 运行
+## 稍后统一实测
 
-在项目目录的普通 PowerShell 中运行，**不用以管理员身份运行**。自动化受限执行环境的错误不代表普通桌面兼容性，见测试报告。
+本机普通 PowerShell 中运行，无需管理员身份。完整步骤及预期现象见 [统一实测清单](docs/phase12-manual-test.md)。
 
 ```powershell
-# 只枚举 Raw Input 0D:05 集合和 HID 字段，不注入
-.\target\release\padbridge-phase0.exe --probe
+# 仅枚举设备
+.\scripts\Run-PadBridge.ps1 -Mode probe
 
-# 只采集物理触控板数据，不注入
-.\target\release\padbridge-phase0.exe --capture --seconds 90 --out artifacts\my-raw-test
+# Phase 1：真实触控板单指测试，2 分钟
+.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 1 -Seconds 120
 
-# 物理触控板 -> 固定矩形 -> 单指真实触摸事件
-.\target\release\padbridge-phase0.exe --capture --inject --seconds 90 --out artifacts\my-touch-test
+# Phase 2：真实触控板多指测试，3 分钟
+.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 180
 
-# 独立 API 对照实验：使用合成坐标，不证明硬件兼容
-.\target\release\padbridge-phase0.exe --self-test --seconds 20 --out artifacts\my-api-test
-
-# 检查真实事件的生命周期与坐标是否能匹配成功注入序列
-.\scripts\Analyze-Run.ps1 -RunDirectory artifacts\my-touch-test
+# 可选：独立原生 API 合成对照，包含单指、两指捏合/展开、部分释放和五指
+# 会产生真实触摸注入；仅在准备好时手动运行
+.\scripts\Run-PadBridge.ps1 -Mode self-test -Contacts 5 -Seconds 40
 ```
 
-也可以用 `scripts\Run-Phase0.ps1 -Mode capture -Inject -Seconds 90` 自动生成时间戳目录并分析日志。
+程序启动后先等待一次所有手指抬起的完整帧：接触一下再全部抬起，窗口从 `WAIT ALL FINGERS UP` 进入 `ARMED` 后开始测试。每次测试保存到新的本地时间戳目录，运行结束后自动校验日志。
 
-有多个触控板时先运行 `--probe`，再用 `--device N` 选择本次采集对象。设备编号仅对本次枚举有效。
+Esc、关闭窗口、Ctrl+C 或计时结束会请求释放并停止。保持固定测试窗口可见且不移动；遮挡、最小化或显示变化会暂停/停止注入。测试窗口中的轨迹、活动点及缩放演示均来自实际收到的 `PT_TOUCH`，不是根据 API 成功数直接绘制。
 
-## 操作方法
+## 直接命令行
 
-1. 测试窗口出现后，先单指接触并全部抬起一次，让程序观察到空触点帧，再开始新一轮触摸。
-2. 单指画圈、拖动、长按、快速轻点。绿色轨迹来自测试窗口实际收到的 `PT_TOUCH` 消息。
-3. 依次放上两指到五指。`Peak fingers` 和日志应记录真实原始多指数据；本阶段窗口中始终只有一条注入触摸轨迹。额外手指不会触发捏合缩放。
-4. 最后全部抬起，观察 Down/Up 是否配对。按窗口内 Esc、关闭窗口或等待时间结束停止；控制台 Ctrl+C 也会请求停止。
+```powershell
+.\target\release\padbridge-phase0.exe --capture --inject --contacts 5 --device 0 --seconds 180
+.\target\release\padbridge-phase0.exe --verify-log artifacts\YOUR_RUN\events.log
+```
 
-测试窗口固定在桌面左上附近，临时置顶以保持注入区域可见。移动、最小化、遮挡、设备拔出或显示配置变化会中止/暂停注入；没有目标窗口选择或动态映射。Raw Input 不独占触控板，系统鼠标与手势行为仍会继续。
+`--capture` 不加 `--inject` 时只记录原始输入。默认容量为 5，支持 `--contacts 1..5`；多设备用 `--probe` 查看后指定 `--device N`。未指定 `--out` 时自动创建唯一目录；手动指定的目录中已有 `events.log` 时拒绝覆盖。
 
-## 输出
+## 日志及验收边界
 
-每次使用独立的 `--out` 目录；重复指定同一目录会覆盖该目录中的本次实验文件。
+本地输出包括原始报告、完整触点帧、每次成功注入的 `INJECT_BATCH` 与各槽位状态、收到的 `PT_TOUCH`、`summary.txt` 及 `analysis.json`。格式 2 日志校验按完整触点生命周期匹配系统 ID 与注入槽位，容许不同手指消息交错及 Windows 合并 Update；缺少 Down/Up、坐标不匹配、丢日志或残留触点都会报错。
 
-- `events.log`：单调时间戳、原始报告十六进制、组装触点帧、每次注入结果、Windows 实际收到的 PT_TOUCH 事件。
-- `summary.txt`：报告/帧/触点数、API 错误和重试、接收事件计数及软件侧耗时。
-- `descriptor-fields.txt`：HID parser 从本机描述数据导出的字段索引、Report ID、逻辑范围。
-- `preparsed-data.bin`：Windows 不透明的预解析数据快照，**不是原始 HID 报告描述符**。
-- `analysis.json`：运行分析脚本后生成的生命周期及顺序坐标匹配结果。
+`analysis.json` 的通过只表示日志一致，不自动宣布硬件验收通过。真实五指同时注入、捏合效果、长按连续性、退出释放和 Windows 参数兼容性仍需实测。故障清理可能被系统拒绝，程序会报告未解决触点并阻止新的 DOWN；不能保证强杀进程/崩溃时执行清理。
 
-本机交付目录保留运行截图、已验证的 Release 可执行文件及 ZIP。这些文件及原始输入日志不纳入 Git；克隆仓库后请按上面的命令构建和生成自己的测试输出。输入数据仅保存到用户指定的本地目录，程序没有网络上传、键盘正文记录或遥测。
+## 许可证与隐私
 
-## 许可证与仓库隐私
+原创代码及随附文档采用 [MIT](LICENSE)，第三方权利及通知见 [third-party-notices.md](docs/third-party-notices.md)。Tapview 仅作技术参考，没有复用其未确认许可的源码。
 
-PadBridge 原创源码及随附文档采用 [MIT 许可证](LICENSE)，版权声明为 `Copyright (c) 2026 mouse233`。第三方依赖保留各自许可证，见 [第三方声明](docs/third-party-notices.md)。
-
-仓库不包含本地账户目录、凭据、环境配置、运行日志、截图、二进制文件或真实触控板输入样本。硬件测试报告保留汇总结果和非唯一的型号参数；可选本地录制文件由 `.gitignore` 排除。
+运行日志、截图、真实录制夹具、二进制文件、打包文件、凭据及本机配置均由 `.gitignore` 排除。程序没有网络上传、普通键盘正文记录、遥测、鼠标模拟触摸、固件/Feature Report 写入或全局鼠标拦截。

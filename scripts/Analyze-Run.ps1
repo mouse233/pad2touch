@@ -2,6 +2,16 @@ param([Parameter(Mandatory=$true)][string]$RunDirectory)
 $ErrorActionPreference = 'Stop'
 $runPath = (Resolve-Path -LiteralPath $RunDirectory).Path
 $lines = Get-Content -LiteralPath (Join-Path $runPath 'events.log')
+if($lines | Select-String -Pattern ' RUN format=2 ' -Quiet){
+    $exePath=Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\padbridge-phase0.exe'
+    if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
+    $analysis=& $exePath --verify-log (Join-Path $runPath 'events.log')
+    $code=$LASTEXITCODE
+    $analysis | Set-Content -LiteralPath (Join-Path $runPath 'analysis.json') -Encoding utf8
+    $analysis
+    if($code -ne 0){throw 'Touch log verification failed; inspect analysis.json and events.log'}
+    return
+}
 $injected = [System.Collections.Generic.List[object]]::new()
 $received = [System.Collections.Generic.List[object]]::new()
 $rawCount = 0
