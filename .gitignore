@@ -1,0 +1,44 @@
+# Build outputs, diagnostics and local delivery packages
+/target/
+/artifacts/
+/dist/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.log
+
+# Physical-device recordings stay local. Optional tests load these at runtime.
+/tests/fixtures/*.bin
+/tests/fixtures/*.hex
+
+# Credentials, environment overrides and private machine configuration
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+.azure/
+.config/gcloud/
+.cargo/credentials
+.cargo/credentials.toml
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*.local
+*.local.*
+
+# Machine-specific editor, agent and OS files
+/.agents/
+/.codex/
+/.idea/
+/.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*.swo
+*~
