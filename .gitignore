@@ -2,6 +2,13 @@
 /target/
 /artifacts/
 /dist/
+
+# Machine-specific test reports must never be published with project docs.
+/local-reports/
+/test-results/
+/docs/*-results.md
+/docs/*-report.md
+/docs/*-reports.md
 *.exe
 *.dll
 *.pdb
