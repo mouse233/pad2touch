@@ -25,6 +25,21 @@ Optional private recording tests are documented in [the fixture directory](../te
 
 Some hardware reserves special regions for vendor controls. Record such coverage exceptions separately from confirmed mapping defects. A device-specific exception does not establish compatibility for another touchpad.
 
+## System-gesture conflicts and rendering
+
+To temporarily claim three-/four-finger touchpad gestures while the PadBridge receiver is foreground:
+
+```powershell
+.\target\release\padbridge-phase0.exe --gesture-support
+.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
+```
+
+Check that the receiver shows `3/4-finger guard: FOREGROUND ONLY`. Repeat three-/four-finger swipes and taps, confirm independent contact trails, and observe whether task switching or desktop actions occur. End capture, then verify ordinary Windows touchpad gestures work again in another foreground application. Gesture-controller activation/readback alone does not establish that physical gesture interception worked.
+
+The option does not modify Windows preferences. If unavailable, the requested run fails before capture. Do not report suppression as working simply because capture without the option succeeds. If conflicts persist, distinguish physical touchpad shell gestures from Windows' separate three-/four-finger touchscreen gestures; see the [Microsoft explanation](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works).
+
+The receiver uses double buffering. Observe it during idle updates, active trails, uncovering, and stop/drain: it should present complete frames rather than repeatedly flashing a cleared background. A single screenshot cannot establish absence of flicker over time. Rendering allocation/presentation failures appear as RENDER_ERROR in local logs.
+
 ## Single-contact procedure
 
 ```powershell

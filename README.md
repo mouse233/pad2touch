@@ -16,9 +16,11 @@ The current implementation is an experimental single-touch and multitouch MVP. I
 - Preserve contact identity across report reordering, partial lifts, and finger replacement.
 - Commit contact state only after successful injection, retry `ERROR_NOT_READY`, and cancel contacts when capture stops or encounters an error.
 - Display received `PT_TOUCH` contacts as separate colored trails, with a two-finger distance/scale demonstration.
+- Optionally claim three- and four-finger touchpad gestures while PadBridge is the foreground process, using the official gesture controller API.
+- Render the diagnostic window through a reusable back buffer to avoid background-erasure flicker.
 - Check recorded event lifecycles and coordinates with an offline log verifier.
 
-PadBridge produces touch events rather than mouse-click substitutes. Native touchpad pointer movement, clicks, scrolling, and system gestures remain active during capture.
+PadBridge produces touch events rather than mouse-click substitutes. Native touchpad pointer movement, clicks, and scrolling remain active. System gestures also remain active unless foreground gesture ownership is explicitly requested on a supported system.
 
 ## Build
 
@@ -51,6 +53,9 @@ Run from the repository directory in a normal PowerShell session. Basic operatio
 
 # Synchronized multitouch mode.
 .\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 180
+
+# Claim three-/four-finger touchpad gestures while PadBridge is foreground.
+.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
 ```
 
 Use `-Device N` when more than one collection is available. The contact capacity can be set from 1 to 5; actual input remains limited by the device.
@@ -58,6 +63,14 @@ Use `-Device N` when more than one collection is available. The contact capacity
 At startup, touch the pad and lift all fingers once. Injection waits for a complete clear frame before entering `ARMED`. Keep the receiver window visible and stationary. Press Esc, close the window, use Ctrl+C, or wait for the timer to request cancellation and shutdown.
 
 Each run writes to a new timestamped directory under `artifacts/`. An explicit `--out` directory containing an existing `events.log` is rejected to avoid overwriting an earlier run.
+
+### Temporary system-gesture ownership
+
+`-SuppressSystemGestures` uses `Windows.UI.Input.TouchpadGesturesController` to claim three- and four-finger touchpad swipes, taps, and presses for the foreground PadBridge process. The current receiver acts as the gesture destination while Raw Input continues supplying contact coordinates. The controller is disabled and released when capture ends. No registry values, persistent gesture preferences, mouse hooks, or device firmware are changed.
+
+The API is experimental and requires runtime support. Check availability with `padbridge-phase0.exe --gesture-support`; `--gesture-check` briefly exercises activation, readback, and release without injecting touch. If the API is unavailable or activation fails, a run requesting suppression fails with a diagnostic rather than claiming gestures were disabled.
+
+Ownership only applies while PadBridge is foreground. Switching to another process returns gesture handling to Windows. This does not suppress native mouse movement or Windows' separate touchscreen gestures, and it does not provide background ownership for future third-party target windows.
 
 ## Development and testing
 
@@ -86,7 +99,7 @@ See the [testing guide](docs/testing.md) for procedures and interpretation. Mach
 ## Current limitations
 
 - Injection targets the receiver's fixed rectangle. Arbitrary target windows, dynamic rectangle tracking, and a full GUI are not implemented.
-- Raw Input does not provide exclusive touchpad capture. Native mouse behavior and system gestures can interfere with testing.
+- Raw Input does not provide exclusive touchpad capture. Native mouse behavior remains active; optional foreground gesture ownership has the scope and availability limits described above.
 - Moving, minimizing, or covering the receiver may pause or cancel output. Display changes and device removal stop the experiment rather than automatically reconnecting.
 - A gap of more than 500 ms in raw reports cancels active injection. Devices that stop reporting stationary contacts require particular attention during hold tests.
 - Unsupported HID layouts are rejected. Windows preparsed data is opaque and is not a portable HID report descriptor.

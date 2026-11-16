@@ -11,12 +11,24 @@ PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | `decode.rs` | Interpret fields, assemble complete reports, and map absolute coordinates without Windows API dependencies. |
 | `touch.rs` | Plan complete contact frames, assign stable slots, commit successful state, retry, and cancel through an abstract transport. |
 | `injection.rs` | Implement the Win32 transport using hit testing, POINTER_TOUCH_INFO arrays, and InjectTouchInput. |
+| `gestures.rs` | Optionally own three-/four-finger gestures through the published WinRT controller ABI, with capability checks and scoped disable/release. |
+| `render.rs` | Own a reusable compatible DC and bitmap, and present complete frames with one BitBlt. |
 | `scenarios.rs` | Generate deterministic logical scenarios for offline tests and the explicitly requested native API exercise. |
 | `experiment.rs` | Own the input worker, receiver window, diagnostics, contact trails, and coordinated shutdown. |
 | `verify.rs` | Audit batch completeness, contact lifecycles, and received coordinates without injecting input. |
 | `logging.rs` | Write diagnostics through a bounded queue and count dropped records. |
 
-Raw Input processing and injection run serially on one worker thread. The receiver processes pointer messages on a separate thread. Painting copies a bounded display snapshot and releases the statistics lock before GDI calls. Log writing runs on its own thread; queue overflow is reported rather than treated as complete evidence.
+Raw Input processing and injection run serially on one worker thread. The receiver processes pointer messages on a separate thread. Painting copies a bounded display snapshot and releases the statistics lock before GDI calls. A cached memory DC/bitmap receives background, text, trails, and active contacts; one BitBlt then presents the completed frame. WM_ERASEBKGND is handled without erasure, and the window class has no background brush. Buffer resources are replaced on size changes and released on shutdown. Log writing runs on its own thread; queue overflow is reported rather than treated as complete evidence.
+
+## Optional foreground gesture ownership
+
+`--suppress-system-gestures` is valid only for physical capture with injection enabled. It creates a TouchpadGesturesController on the input worker, which has the message pump required by the API. The enabled controller declares ThreeFingerManipulations, FourFingerManipulations, ThreeFingerActions, and FourFingerActions (mask `0x1B`). It deliberately does not claim unrelated mouse input or five-finger actions.
+
+The API routes these gestures to an eligible foreground controller instead of the shell. The controller acts as the destination; the bridge still consumes raw HID coordinates for touch injection. Its Enabled and SupportedGestures properties are read back after activation. Failed activation/readback triggers disabling and reports an error. Normal shutdown disables and verifies the controller before releasing it and uninitializing its WinRT apartment.
+
+No user settings are saved or changed, so there is no registry snapshot or persistent preference to restore after termination. Ownership is process-foreground scoped: background controllers are ignored. The implementation uses the published UniversalApiContract v19 interface prefix from the Windows SDK and checks IsSupported at runtime because the API is experimental. It does not extend support to older systems by undocumented registry writes.
+
+Touchpad gesture ownership is distinct from Windows' touchscreen gesture handling, including handling of injected PT_TOUCH input. Remaining conflicts must be diagnosed at the appropriate layer rather than attributing all lost receiver lifetimes to the physical touchpad.
 
 ## Input discovery and parsing
 
@@ -95,4 +107,6 @@ Tapview was used only as a technical reference. Its unconfirmed source license w
 - [InjectTouchInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-injecttouchinput)
 - [InitializeTouchInjection](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-initializetouchinjection)
 - [GetPointerFrameInfo and message coalescing](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpointerframeinfo)
+- [TouchpadGesturesController](https://learn.microsoft.com/en-us/windows/win32/input-precisiontouchpad/touchpadgesturescontroller)
+- [Three-/four-finger touchscreen interactions](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works)
 - [Tapview Windows backend, reference only](https://github.com/JohnAZoidberg/tapview/blob/main/src/input/windows_backend.rs)

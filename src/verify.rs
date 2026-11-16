@@ -185,6 +185,8 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
         } else if line.contains(" ERROR ")
             || line.contains("RELEASE_ERROR")
             || line.contains("WORKER_ERROR")
+            || line.contains("GESTURE_GUARD_DISABLE_ERROR")
+            || line.contains("RENDER_ERROR")
         {
             audit
                 .errors

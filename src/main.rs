@@ -1,8 +1,10 @@
 mod decode;
 mod experiment;
+mod gestures;
 mod hid;
 mod injection;
 mod logging;
+mod render;
 mod scenarios;
 mod touch;
 mod verify;
@@ -14,6 +16,16 @@ fn main() {
 }
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--gesture-support"] {
+        println!(
+            "foreground_touchpad_gesture_api_supported={}",
+            gestures::probe()?
+        );
+        return Ok(());
+    }
+    if args == ["--gesture-check"] {
+        return gestures::check_native_controller();
+    }
     if args.first().is_some_and(|s| s == "--verify-log") {
         if args.len() != 2 {
             return Err("usage: --verify-log PATH_TO_EVENTS_LOG".into());
@@ -28,7 +40,7 @@ fn run() -> Result<(), String> {
         };
     }
     if args.is_empty() || args == ["--help"] {
-        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --capture [--inject] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
+        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\nGesture suppression requires capture+inject and a supported foreground-process API.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
         return Ok(());
     }
     if args == ["--probe"] {
@@ -45,6 +57,7 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
         mode: String::new(),
         inject: false,
         contacts: 5,
+        suppress_gestures: false,
         device: 0,
         seconds: 60,
         out: format!("artifacts/run-{stamp}").into(),
@@ -59,6 +72,7 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
                 opt.mode = args[i].trim_start_matches("--").into();
             }
             "--inject" => opt.inject = true,
+            "--suppress-system-gestures" => opt.suppress_gestures = true,
             "--device" | "--seconds" | "--out" | "--contacts" => {
                 let key = &args[i];
                 i += 1;
@@ -89,6 +103,9 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
             "--inject is only used with --capture; --self-test injects automatically".into(),
         );
     }
+    if opt.suppress_gestures && (!opt.inject || opt.mode != "capture") {
+        return Err("--suppress-system-gestures requires --capture --inject".into());
+    }
     Ok(opt)
 }
 
@@ -107,6 +124,8 @@ mod cli_tests {
             vec!["--capture", "--seconds", "0"],
             vec!["--capture", "--device"],
             vec!["--self-test", "--inject"],
+            vec!["--capture", "--suppress-system-gestures"],
+            vec!["--self-test", "--suppress-system-gestures"],
         ] {
             assert!(parse_options(&args(&a)).is_err());
         }
@@ -127,5 +146,17 @@ mod cli_tests {
             assert!(o.inject);
             assert_eq!(o.seconds, 120);
         }
+    }
+    #[test]
+    fn gesture_guard_is_explicit_and_capture_only() {
+        let o = parse_options(&args(&[
+            "--capture",
+            "--inject",
+            "--suppress-system-gestures",
+        ]))
+        .unwrap();
+        assert!(o.suppress_gestures);
+        let o = parse_options(&args(&["--capture", "--inject"])).unwrap();
+        assert!(!o.suppress_gestures);
     }
 }

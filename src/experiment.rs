@@ -36,6 +36,7 @@ pub struct Options {
     pub device: usize,
     pub inject: bool,
     pub contacts: usize,
+    pub suppress_gestures: bool,
 }
 #[derive(Clone, Copy)]
 pub struct TracePoint {
@@ -78,6 +79,7 @@ pub struct Stats {
     pub api_us: Vec<u128>,
     pub capture_us: Vec<u128>,
     pub scans: Vec<u32>,
+    pub gesture_guard: bool,
 }
 type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -89,6 +91,7 @@ struct Ui {
     rect: RECT,
     worker_done: Arc<AtomicBool>,
     drain_started: Option<Instant>,
+    back_buffer: Option<crate::render::BackBuffer>,
 }
 struct WorkerFinished(Arc<AtomicBool>);
 impl Drop for WorkerFinished {
@@ -121,7 +124,7 @@ unsafe fn make_window(
         hInstance: module,
         lpszClassName: name.as_ptr(),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        hbrBackground: null_mut(),
         ..Default::default()
     };
     if RegisterClassW(&wc) == 0 {
@@ -155,7 +158,7 @@ pub fn run(opt: Options) -> Result<(), String> {
     EXIT.store(false, Ordering::Relaxed);
     let (log, writer) = Log::open(&opt.out)?;
     log.event(format!(
-        "RUN format=2 mode={} inject={} seconds={} source={} capacity={}",
+        "RUN format=2 mode={} inject={} seconds={} source={} capacity={} gesture_guard_requested={}",
         opt.mode,
         opt.inject || opt.mode == "self-test",
         opt.seconds,
@@ -164,7 +167,7 @@ pub fn run(opt: Options) -> Result<(), String> {
         } else {
             "PHYSICAL_RAW_INPUT"
         },
-        opt.contacts
+        opt.contacts,opt.suppress_gestures
     ));
     unsafe {
         let mut token = null_mut();
@@ -276,6 +279,7 @@ pub fn run(opt: Options) -> Result<(), String> {
                 rect,
                 worker_done: worker_done.clone(),
                 drain_started: None,
+                back_buffer: None,
             })
         });
         // A second call also handles a launcher specifying SW_HIDE for the
@@ -296,11 +300,12 @@ pub fn run(opt: Options) -> Result<(), String> {
         let mode = opt.mode.clone();
         let inject = opt.inject || mode == "self-test";
         let capacity = opt.contacts;
+        let suppress_gestures = opt.suppress_gestures;
         let worker = std::thread::spawn(move || {
             let _finished = WorkerFinished(worker_done);
             let result = worker_loop(
                 device,
-                (mode, inject, capacity),
+                (mode, inject, capacity, suppress_gestures),
                 (target, rect),
                 worker_shared.clone(),
                 worker_log.clone(),
@@ -360,9 +365,10 @@ pub fn run(opt: Options) -> Result<(), String> {
             },
         );
         let summary = format!(
-            "{}actual_duration_ms={}\n",
+            "{}actual_duration_ms={}\nforeground_gesture_guard_used={}\n",
             summary(&s, dropped, opt.seconds),
-            experiment_start.elapsed().as_millis()
+            experiment_start.elapsed().as_millis(),
+            s.gesture_guard
         );
         println!("{summary}");
         log.event(format!("SUMMARY {}", summary.replace('\n', " | ")));
@@ -473,41 +479,150 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             paint(hwnd);
             return 0;
         }
+        WM_ERASEBKGND => return 1,
         _ => {}
     }
     DefWindowProcW(hwnd, msg, w, l)
 }
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
-    let dc = BeginPaint(hwnd, &mut ps);
+    let screen = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
-    GetClientRect(hwnd, &mut rc);
-    FillRect(dc, &rc, (COLOR_WINDOW + 1) as HBRUSH);
-    UI.with(|u|{if let Some(u)=u.borrow().as_ref(){
-        let (text,points,active,active_colors,pinch_ratio)={let s=u.shared.lock().unwrap();
-        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger distance ratio: {:.2} | Lifecycle errors {} | {}\nESC: release and stop | Native touchpad mouse remains active",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,s.receive_errors,s.error);
-        (text,s.points.clone(),s.received_active.clone(),s.received_colors.clone(),s.pinch_ratio)};
-        // Release the statistics lock before GDI painting.
-        let face=wide("Segoe UI");let font=CreateFontW(-20,0,0,0,FW_NORMAL as i32,0,0,0,DEFAULT_CHARSET as u32,0,0,CLEARTYPE_QUALITY as u32,0,face.as_ptr());
-        let old_font=if !font.is_null(){SelectObject(dc,font)}else{null_mut()};
-        let mut tr=RECT{left:20,top:12,right:rc.right-20,bottom:215};let t=wide(&text);SetBkMode(dc,TRANSPARENT as i32);DrawTextW(dc,t.as_ptr(),-1,&mut tr,DT_LEFT|DT_WORDBREAK|DT_NOPREFIX);
-        let mut org=POINT{x:0,y:0};ClientToScreen(hwnd,&mut org);
-        let boxrect=RECT{left:u.rect.left-org.x,top:u.rect.top-org.y,right:u.rect.right-org.x,bottom:u.rect.bottom-org.y};FrameRect(dc,&boxrect,GetStockObject(GRAY_BRUSH) as HBRUSH);
-        let colors=[0x00709010,0x002070D0,0x00C06050,0x009040A0,0x0020A0A0];
-        let pens:Vec<_>=colors.iter().map(|&color|CreatePen(PS_SOLID,3,color)).collect();
-        let old_pen=SelectObject(dc,pens[0]);
-        let old_brush=SelectObject(dc,GetStockObject(HOLLOW_BRUSH));
-        let mut previous=BTreeMap::new();
-        for p in &points {SelectObject(dc,pens[p.color%pens.len()]);
-            if !p.down {if let Some(&(x,y))=previous.get(&p.id){MoveToEx(dc,x,y,null_mut());LineTo(dc,p.x,p.y);}}
-            previous.insert(p.id,(p.x,p.y));
+    if GetClientRect(hwnd, &mut rc) == 0 || screen.is_null() || rc.right <= 0 || rc.bottom <= 0 {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+    UI.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let Some(ui) = state.as_mut() else {
+            return;
+        };
+        if ui
+            .back_buffer
+            .as_ref()
+            .is_none_or(|b| b.width != rc.right || b.height != rc.bottom)
+        {
+            match crate::render::BackBuffer::new(screen, rc.right, rc.bottom) {
+                Ok(buffer) => ui.back_buffer = Some(buffer),
+                Err(error) => {
+                    ui.log.event(format!("RENDER_ERROR {error}"));
+                    FillRect(screen, &rc, (COLOR_WINDOW + 1) as HBRUSH);
+                    return;
+                }
+            }
         }
-        for (&id,&(x,y)) in &active {SelectObject(dc,pens[active_colors.get(&id).copied().unwrap_or(0)%pens.len()]);Ellipse(dc,x-10,y-10,x+10,y+10);let label=wide(&format!("{id}"));TextOutW(dc,x+12,y-12,label.as_ptr(),(label.len()-1) as i32);}
-        if active.len()==2 {let cx=(boxrect.left+boxrect.right)/2;let cy=(boxrect.top+boxrect.bottom)/2;let scale=pinch_ratio.clamp(0.25,2.0);let half_w=(80.0*scale) as i32;let half_h=(50.0*scale) as i32;Rectangle(dc,cx-half_w,cy-half_h,cx+half_w,cy+half_h);}
-        SelectObject(dc,old_pen);SelectObject(dc,old_brush);for pen in pens{DeleteObject(pen);}
-        if !font.is_null(){SelectObject(dc,old_font);DeleteObject(font);}
-    }});
+        let buffer = ui.back_buffer.as_ref().unwrap();
+        paint_contents(hwnd, buffer.dc, &rc, ui);
+        if let Err(error) = buffer.present(screen) {
+            ui.log.event(format!("RENDER_ERROR {error}"));
+        }
+    });
     EndPaint(hwnd, &ps);
+}
+unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
+    FillRect(dc, rc, (COLOR_WINDOW + 1) as HBRUSH);
+    let (text, points, active, active_colors, pinch_ratio) = {
+        let s = u.shared.lock().unwrap();
+        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} | {}\nESC: release and stop | Native mouse remains active",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if s.gesture_guard{"FOREGROUND ONLY"}else{"OFF"},s.error);
+        (
+            text,
+            s.points.clone(),
+            s.received_active.clone(),
+            s.received_colors.clone(),
+            s.pinch_ratio,
+        )
+    };
+    // Release the statistics lock before GDI painting.
+    let face = wide("Segoe UI");
+    let font = CreateFontW(
+        -20,
+        0,
+        0,
+        0,
+        FW_NORMAL as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        0,
+        0,
+        CLEARTYPE_QUALITY as u32,
+        0,
+        face.as_ptr(),
+    );
+    let old_font = if !font.is_null() {
+        SelectObject(dc, font)
+    } else {
+        null_mut()
+    };
+    let mut tr = RECT {
+        left: 20,
+        top: 12,
+        right: rc.right - 20,
+        bottom: 215,
+    };
+    let t = wide(&text);
+    SetBkMode(dc, TRANSPARENT as i32);
+    DrawTextW(
+        dc,
+        t.as_ptr(),
+        -1,
+        &mut tr,
+        DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
+    );
+    let mut org = POINT { x: 0, y: 0 };
+    ClientToScreen(hwnd, &mut org);
+    let boxrect = RECT {
+        left: u.rect.left - org.x,
+        top: u.rect.top - org.y,
+        right: u.rect.right - org.x,
+        bottom: u.rect.bottom - org.y,
+    };
+    FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
+    let colors = [0x00709010, 0x002070D0, 0x00C06050, 0x009040A0, 0x0020A0A0];
+    let pens: Vec<_> = colors
+        .iter()
+        .map(|&color| CreatePen(PS_SOLID, 3, color))
+        .collect();
+    let old_pen = SelectObject(dc, pens[0]);
+    let old_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+    let mut previous = BTreeMap::new();
+    for p in &points {
+        SelectObject(dc, pens[p.color % pens.len()]);
+        if !p.down {
+            if let Some(&(x, y)) = previous.get(&p.id) {
+                MoveToEx(dc, x, y, null_mut());
+                LineTo(dc, p.x, p.y);
+            }
+        }
+        previous.insert(p.id, (p.x, p.y));
+    }
+    for (&id, &(x, y)) in &active {
+        SelectObject(
+            dc,
+            pens[active_colors.get(&id).copied().unwrap_or(0) % pens.len()],
+        );
+        Ellipse(dc, x - 10, y - 10, x + 10, y + 10);
+        let label = wide(&format!("{id}"));
+        TextOutW(dc, x + 12, y - 12, label.as_ptr(), (label.len() - 1) as i32);
+    }
+    if active.len() == 2 {
+        let cx = (boxrect.left + boxrect.right) / 2;
+        let cy = (boxrect.top + boxrect.bottom) / 2;
+        let scale = pinch_ratio.clamp(0.25, 2.0);
+        let half_w = (80.0 * scale) as i32;
+        let half_h = (50.0 * scale) as i32;
+        Rectangle(dc, cx - half_w, cy - half_h, cx + half_w, cy + half_h);
+    }
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    for pen in pens {
+        DeleteObject(pen);
+    }
+    if !font.is_null() {
+        SelectObject(dc, old_font);
+        DeleteObject(font);
+    }
 }
 
 struct Worker {
@@ -530,14 +645,14 @@ struct Worker {
 }
 fn worker_loop(
     device: Option<Device>,
-    settings: (String, bool, usize),
+    settings: (String, bool, usize, bool),
     fixed_target: (usize, RECT),
     shared: Shared,
     log: Log,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (target, rect) = fixed_target;
-    let (mode, inject, capacity) = settings;
+    let (mode, inject, capacity, suppress_gestures) = settings;
     let fields = device
         .as_ref()
         .map(|d| d.fields())
@@ -568,6 +683,13 @@ fn worker_loop(
     };
     unsafe {
         let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
+        let mut gesture_guard = if suppress_gestures {
+            let guard = crate::gestures::Guard::create(log.clone())?;
+            worker.shared.lock().unwrap().gesture_guard = true;
+            Some(guard)
+        } else {
+            None
+        };
         INPUT.with(|i| *i.borrow_mut() = Some(worker));
         let rid = RAWINPUTDEVICE {
             usUsagePage: 0x0D,
@@ -610,6 +732,9 @@ fn worker_loop(
             }
         });
         result = result.and(cleanup);
+        if let Some(guard) = &mut gesture_guard {
+            result = result.and(guard.disable());
+        }
         let remove = RAWINPUTDEVICE {
             dwFlags: RIDEV_REMOVE,
             hwndTarget: null_mut(),
