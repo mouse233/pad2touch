@@ -29,6 +29,33 @@ use windows_sys::Win32::{
 };
 
 pub static EXIT: AtomicBool = AtomicBool::new(false);
+/// Wakes a window when the capture worker publishes a new frame, so the live
+/// preview repaints at the touchpad's report rate instead of a UI timer's.
+/// At most one message is in flight: the window clears `pending` when it
+/// handles the message, and frames arriving before then share that repaint.
+#[derive(Clone, Copy)]
+pub struct FrameSignal {
+    hwnd: usize,
+    msg: u32,
+    pending: &'static AtomicBool,
+}
+impl FrameSignal {
+    pub fn new(hwnd: HWND, msg: u32, pending: &'static AtomicBool) -> Self {
+        Self {
+            hwnd: hwnd as usize,
+            msg,
+            pending,
+        }
+    }
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel)
+            // SAFETY: PostMessageW only queues; an invalid HWND just fails.
+            && unsafe { PostMessageW(self.hwnd as HWND, self.msg, 0, 0) } == 0
+        {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+}
 pub struct Options {
     pub mode: String,
     pub seconds: u64,
@@ -102,6 +129,8 @@ pub struct Stats {
     pub mapped_input: Option<crate::mapping::NormRect>,
     /// Live confident contacts, normalized to the touchpad's logical range.
     pub live: Vec<(f64, f64)>,
+    /// Notified after each frame updates `live`.
+    pub frame_signal: Option<FrameSignal>,
 }
 pub(crate) type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -1285,7 +1314,7 @@ impl Worker {
             scan.map(|v| v.to_string())
                 .unwrap_or_else(|| "unavailable".into())
         ));
-        {
+        let signal = {
             let mut s = self.shared.lock().unwrap();
             s.frames += 1;
             s.peak = s.peak.max(live);
@@ -1309,6 +1338,10 @@ impl Worker {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
+            s.frame_signal
+        };
+        if let Some(signal) = signal {
+            signal.notify();
         }
         let paused = self.tracker.as_ref().is_some_and(|t| t.paused());
         if let Some(i) = self.injector.as_mut().filter(|_| !paused) {
@@ -1677,4 +1710,38 @@ unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         _ => {}
     }
     DefWindowProcW(hwnd, msg, w, l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_signal_keeps_one_message_in_flight() {
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        const MSG: u32 = WM_APP + 50;
+        // A null HWND posts to this thread's own queue.
+        let signal = FrameSignal::new(null_mut(), MSG, &PENDING);
+        let drain = || {
+            let mut msg = MSG::default();
+            let mut count = 0;
+            // SAFETY: PeekMessageW only reads this thread's queue.
+            while unsafe { PeekMessageW(&mut msg, null_mut(), MSG, MSG, PM_REMOVE) } != 0 {
+                count += 1;
+            }
+            count
+        };
+        drain();
+        for _ in 0..5 {
+            signal.notify();
+        }
+        assert_eq!(drain(), 1);
+        // Still pending: nothing was handled, so frames stay coalesced.
+        signal.notify();
+        assert_eq!(drain(), 0);
+        // The receiver handled it; the next frame posts again.
+        PENDING.store(false, Ordering::Release);
+        signal.notify();
+        assert_eq!(drain(), 1);
+    }
 }

@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -48,6 +48,10 @@ const DEFAULT_CLIENT: (i32, i32) = (820, 594);
 const PREVIEW_MS: u32 = 1500;
 const PANEL_LEFT: i32 = 274;
 const PANEL_TOP: i32 = 28;
+/// Posted to the panel by the capture worker after each touchpad frame.
+const WM_PANEL_FRAME: u32 = WM_APP + 2;
+/// Set while a WM_PANEL_FRAME is queued; see `experiment::FrameSignal`.
+static PANEL_FRAME_PENDING: AtomicBool = AtomicBool::new(false);
 /// Fixed-size window: no sizing border and no maximize. The layout is designed
 /// for DEFAULT_CLIENT and only rescales with DPI. WS_CLIPCHILDREN keeps the
 /// dialog background from being painted under the controls.
@@ -1344,6 +1348,11 @@ impl Gui {
             self.selection(GUARD) == 2,
             out.clone(),
         )?;
+        session.shared.lock().unwrap().frame_signal = Some(experiment::FrameSignal::new(
+            self.panel,
+            WM_PANEL_FRAME,
+            &PANEL_FRAME_PENDING,
+        ));
         self.geometry = geometry.ok();
         self.shared = session.shared.clone();
         self.session = Some(session);
@@ -1831,6 +1840,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
 
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        // Repaint as soon as a frame arrives rather than on the next UI tick.
+        // Clearing first lets the next frame post again; WM_PAINT coalesces
+        // frames that arrive faster than the panel paints.
+        WM_PANEL_FRAME => {
+            PANEL_FRAME_PENDING.store(false, Ordering::Release);
+            InvalidateRect(hwnd, null(), 0);
+            return 0;
+        }
         WM_PRINTCLIENT => {
             GUI.with(|slot| {
                 if let Ok(mut slot) = slot.try_borrow_mut() {
@@ -1851,6 +1868,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                     }
                 }
             });
+            InvalidateRect(hwnd, null(), 0);
             return 0;
         }
         WM_ERASEBKGND => return 1,

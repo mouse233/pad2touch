@@ -117,6 +117,8 @@ The window avoids flicker by never showing a half-painted state. The main window
 
 Layout batches positions with DeferWindowPos and only moves windows whose bounds change, using Windows' normal invalidation. Unchanged controls are not repainted. Screen-coordinate changes refresh the displayed diagnostic rectangle; each running injection session retains its own immutable target and existing movement/resize stop behavior. The message font comes from system non-client metrics for the current DPI.
 
+During a session the live contact preview repaints when input arrives rather than on the GUI's 30 ms timer, which limited it to about 32 frames per second at an uneven pace. After each touchpad frame the capture worker posts one message to the panel, which invalidates it. A flag keeps at most one such message queued, and WM_PAINT coalesces frames that arrive faster than the panel paints, so the preview follows the report rate up to what the panel can paint. Touches received by the diagnostic receiver also invalidate it directly. The timer still updates status and controls.
+
 ## Physical shape and device information
 
 The diagnostic mapping rectangle uses the selected touchpad's declared physical X/Y dimensions, normalized with HID units and signed unit exponents. It fits centrally inside the available area with letterboxing and at most pixel-rounding error. Logical coordinate maxima alone are never used as a physical aspect ratio: X and Y coordinate densities can differ. Device selection, resize and movement refresh the preview; each injection session validates and retains the same physical aspect in its actual injection target. The physical-capture CLI receiver also preserves this aspect; synthetic API scenarios have no physical touchpad geometry.
