@@ -24,7 +24,7 @@ Chords are Ctrl+Alt+F8, F9, F10, or F11. Registration uses `RegisterHotKey` with
 
 Stop waits for the worker, then processes receiver messages for at least 300 ms before finalizing logs. Another session waits for that drain. Diagnostics and trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
 
-With the Diagnostic area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the PadBridge window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
+With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the PadBridge window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
 
 ## Diagnostics and system gestures
 
@@ -46,22 +46,23 @@ The option changes user-wide settings during its interval; native pointer moveme
 
 ## Mapping targets (Phase 3)
 
-The **Screen area** group selects where touches go. The list follows the familiar pen-tablet layout: presets first, then custom portions.
+The **Screen area** group selects where touches go. It is kept short, like a pen-tablet panel: whole screen, portion of screen, a window, and a test area. The whole screen is the default.
 
 | Choice | Configure | Bounds | Hit test |
 |---|---|---|---|
-| Diagnostic area (test) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
-| Full desktop | Nothing; **Show area** flashes it | The whole virtual desktop | None (whatever is on screen receives it) |
-| Monitor N · W×H | Nothing; one entry per connected display, main display first | That monitor | None |
+| Screen · W×H (one monitor) | Nothing; **Show area** flashes it | That monitor | None (whatever is on screen receives it) |
+| Full desktop (several monitors) | Nothing | The whole virtual desktop | None |
+| Monitor N · W×H (several monitors) | Nothing; one entry per display, main display first | That monitor | None |
 | Portion of screen… | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None |
-| Application window | Choose a window from the list; **Show area** flashes the mapped region | Whole client area (title bar and borders excluded) | Target window or its child windows |
-| Portion of window… | Choose a window, **Select area…**, drag inside its client area | Normalized client-relative rectangle | Target window or its child windows |
+| Application window | Choose a window from the list | Whole client area (title bar and borders excluded) | Target window or its child windows |
+| Application window, part | **Select part…**, drag inside its client area; **Whole window** resets | Normalized client-relative rectangle | Target window or its child windows |
+| Test area (inside PadBridge) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
 
-The monitor list is rebuilt when the display configuration changes. A selected monitor is matched by its display device name; if it disappears, the choice falls back to the diagnostic area. Full desktop requires a rectangular arrangement: if monitors of different sizes leave uncovered corners, it is rejected with an explanation (use a monitor or a portion instead).
+With a single monitor, the whole desktop and that monitor are the same area, so only one "Screen" entry is listed. The list is rebuilt when the display configuration changes. A selected monitor is matched by its display device name; if it disappears, the choice falls back to the first entry. Choosing another window resets a selected part. Full desktop requires a rectangular arrangement: if monitors of different sizes leave uncovered corners, it is rejected with an explanation (use a monitor or a portion instead).
 
 ### Mapping diagram
 
-For every choice except the diagnostic area, the right panel shows a mapping diagram below the diagnostic text, similar to pen-tablet control panels:
+For every choice except the test area, the right panel shows a mapping diagram below the diagnostic text, similar to pen-tablet control panels:
 
 - **Top:** each monitor drawn in its real arrangement and proportions, with a bezel, a stand under monitors on the bottom row, and a desktop thumbnail.
 - **Bottom:** the touchpad at its declared physical aspect. If the device geometry is unavailable, a 1.6 placeholder is shown and labeled as such. In fill-area mode the unused part of the touchpad is darker.
@@ -84,7 +85,7 @@ The **Touchpad** list decides what happens when the touchpad's physical shape di
 | Whole pad · stretch | All | All | Scaled independently on X and Y | No |
 | Part of pad · fill area | A centered part with the area's shape | All | Undistorted | Yes |
 
-In fill-area mode, contacts outside the used part are ignored the same way as low-confidence contacts: they are not injected, a finger sliding out is released, and they still count as physically down, so arming still needs all fingers lifted. When a window target is resized, the used part is recomputed for its new shape together with the retarget. Stretch is the only mode that can inject when the device declares no usable physical size; the others refuse with an explanation. The diagnostic area honors the same setting.
+In fill-area mode, contacts outside the used part are ignored the same way as low-confidence contacts: they are not injected, a finger sliding out is released, and they still count as physically down, so arming still needs all fingers lifted. When a window target is resized, the used part is recomputed for its new shape together with the retarget. Stretch is the only mode that can inject when the device declares no usable physical size; the others refuse with an explanation. The test area honors the same setting.
 
 The used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
 

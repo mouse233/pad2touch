@@ -699,8 +699,7 @@ fn check_foreign_window(handle: usize) -> Result<(), String> {
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid == GetCurrentProcessId() {
             return Err(
-                "PadBridge's own window cannot be an application target; use Diagnostic area."
-                    .into(),
+                "PadBridge's own window cannot be an application target; use Test area.".into(),
             );
         }
     }
