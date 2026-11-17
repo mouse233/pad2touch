@@ -386,7 +386,7 @@ pub fn run(opt: Options) -> Result<(), String> {
             let _finished = WorkerFinished(worker_done);
             let result = worker_loop(
                 device,
-                (mode, inject, capacity, suppress_gestures),
+                (mode, inject, capacity, suppress_gestures, false),
                 target,
                 worker_shared.clone(),
                 worker_log.clone(),
@@ -546,16 +546,29 @@ pub(crate) struct Session {
     started: Instant,
     explicit_stop: AtomicBool,
 }
+/// User choices for a GUI session, fixed for its lifetime.
+pub struct SessionSettings {
+    pub inject: bool,
+    pub capacity: usize,
+    pub suppress_gestures: bool,
+    pub background_guard: bool,
+    /// Draw Windows touch visuals for injected contacts.
+    pub touch_feedback: bool,
+}
 impl Session {
     pub fn start(
         device: Device,
         target: crate::mapping::ResolvedTarget,
-        inject: bool,
-        capacity: usize,
-        suppress_gestures: bool,
-        background_guard: bool,
+        settings: SessionSettings,
         out: PathBuf,
     ) -> Result<Self, String> {
+        let SessionSettings {
+            inject,
+            capacity,
+            suppress_gestures,
+            background_guard,
+            touch_feedback,
+        } = settings;
         if !(1..=5).contains(&capacity) {
             return Err("invalid GUI contact capacity".into());
         }
@@ -587,7 +600,7 @@ impl Session {
             ..Default::default()
         }));
         let (log, writer) = Log::open(&out)?;
-        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} frontend=GUI"));
+        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} touch_feedback={touch_feedback} frontend=GUI"));
         log.event(format!("DEVICE {}", device.summary()));
         let r = target.bounds;
         log.event(format!(
@@ -627,7 +640,13 @@ impl Session {
                 } else {
                     worker_loop(
                         Some(device),
-                        ("capture".into(), inject, capacity, suppress_gestures),
+                        (
+                            "capture".into(),
+                            inject,
+                            capacity,
+                            suppress_gestures,
+                            touch_feedback,
+                        ),
                         target,
                         worker_shared.clone(),
                         worker_log.clone(),
@@ -1155,7 +1174,7 @@ struct Worker {
 }
 fn worker_loop(
     device: Option<Device>,
-    settings: (String, bool, usize, bool),
+    settings: (String, bool, usize, bool, bool),
     target: crate::mapping::ResolvedTarget,
     shared: Shared,
     log: Log,
@@ -1164,7 +1183,7 @@ fn worker_loop(
     // Target resolution needs physical pixels on this thread as well.
     unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let rect = target.bounds;
-    let (mode, inject, capacity, suppress_gestures) = settings;
+    let (mode, inject, capacity, suppress_gestures, touch_feedback) = settings;
     let fields = device
         .as_ref()
         .map(|d| d.fields())
@@ -1176,6 +1195,7 @@ fn worker_loop(
             rect,
             target.input,
             capacity,
+            touch_feedback,
             log.clone(),
         )?)
     } else {

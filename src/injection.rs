@@ -144,6 +144,7 @@ impl Injector {
         rect: RECT,
         input: NormRect,
         capacity: usize,
+        feedback: bool,
         log: Log,
     ) -> Result<Self, String> {
         let transport = WindowsTransport {
@@ -155,11 +156,18 @@ impl Injector {
         let mut engine = Engine::new(capacity, rectangle(rect), transport)?;
         // Nothing is active yet, so this only sets the used touchpad region.
         engine.retarget(rectangle(rect), input)?;
-        if unsafe { InitializeTouchInjection(capacity as u32, TOUCH_FEEDBACK_NONE) } == 0 {
+        // DEFAULT draws the standard touch visuals for injected contacts and
+        // honors the user's "Touch indicator" setting; NONE draws nothing.
+        let mode = if feedback {
+            TOUCH_FEEDBACK_DEFAULT
+        } else {
+            TOUCH_FEEDBACK_NONE
+        };
+        if unsafe { InitializeTouchInjection(capacity as u32, mode) } == 0 {
             return Err(winerr("InitializeTouchInjection"));
         }
         log.event(format!(
-            "INITIALIZE_TOUCH_INJECTION success max_contacts={capacity}"
+            "INITIALIZE_TOUCH_INJECTION success max_contacts={capacity} feedback={feedback}"
         ));
         Ok(Self {
             engine,

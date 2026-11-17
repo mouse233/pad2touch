@@ -522,8 +522,15 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 &target,
                 target.bounds,
             ));
-            let mut injector =
-                Injector::new(target.hit, target.bounds, NormRect::FULL, 2, log.clone()).unwrap();
+            let mut injector = Injector::new(
+                target.hit,
+                target.bounds,
+                NormRect::FULL,
+                2,
+                false,
+                log.clone(),
+            )
+            .unwrap();
             injector.frame(&[]).unwrap();
             let c = target.bounds;
             let (w, h) = (c.right - c.left, c.bottom - c.top);
@@ -607,6 +614,7 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 rect_target.bounds,
                 NormRect::FULL,
                 2,
+                false,
                 log.clone(),
             )
             .unwrap();
@@ -666,8 +674,15 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 &screen,
                 screen.bounds,
             ));
-            let mut injector =
-                Injector::new(screen.hit, screen.bounds, NormRect::FULL, 1, log.clone()).unwrap();
+            let mut injector = Injector::new(
+                screen.hit,
+                screen.bounds,
+                NormRect::FULL,
+                1,
+                false,
+                log.clone(),
+            )
+            .unwrap();
             injector.frame(&[]).unwrap();
             taps(&mut injector, 7, &[(500, 500)]);
             drop(injector);
@@ -707,7 +722,7 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 strip.bounds,
             ));
             let mut injector =
-                Injector::new(strip.hit, strip.bounds, input, 2, log.clone()).unwrap();
+                Injector::new(strip.hit, strip.bounds, input, 2, false, log.clone()).unwrap();
             injector.frame(&[]).unwrap();
             // Outside the used part of the pad: ignored, nothing delivered.
             taps(&mut injector, 8, &[(0, 500), (1000, 500)]);

@@ -44,7 +44,8 @@ const WINDOW: usize = 115;
 const AREA: usize = 116;
 const TARGET_INFO: usize = 117;
 const PAD_FIT: usize = 118;
-const DEFAULT_CLIENT: (i32, i32) = (820, 594);
+const FEEDBACK: usize = 119;
+const DEFAULT_CLIENT: (i32, i32) = (820, 618);
 const PREVIEW_MS: u32 = 1500;
 const PANEL_LEFT: i32 = 274;
 const PANEL_TOP: i32 = 28;
@@ -405,7 +406,7 @@ impl Gui {
             "Capture activation",
             0,
             BS_GROUPBOX as u32,
-            [8, 100, 250, 130],
+            [8, 100, 250, 154],
         )?;
         g.add(
             "COMBOBOX",
@@ -447,19 +448,27 @@ impl Gui {
             [18, 194, 230, 20],
         )?;
         SendMessageW(g.item(INJECT), BM_SETCHECK, 1, 0);
+        // Off by default: injected touches draw no Windows touch visuals.
+        g.add(
+            "BUTTON",
+            "Show Windows touch feedback",
+            FEEDBACK,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            [34, 216, 214, 20],
+        )?;
         g.add(
             "BUTTON",
             "Windows system gestures",
             0,
             BS_GROUPBOX as u32,
-            [8, 238, 250, 82],
+            [8, 262, 250, 82],
         )?;
         g.add(
             "COMBOBOX",
             "",
             GUARD,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [18, 258, 230, 160],
+            [18, 282, 230, 160],
         )?;
         g.fill_combo(
             GUARD,
@@ -474,21 +483,21 @@ impl Gui {
             "Background: 120 s, restores on stop.",
             0,
             0,
-            [18, 295, 230, 16],
+            [18, 319, 230, 16],
         )?;
         g.add(
             "BUTTON",
             "Screen area",
             0,
             BS_GROUPBOX as u32,
-            [8, 328, 250, 142],
+            [8, 352, 250, 142],
         )?;
         g.add(
             "COMBOBOX",
             "",
             TARGET,
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 348, 230, 240],
+            [18, 372, 230, 240],
         )?;
         g.fill_targets();
         g.add(
@@ -496,22 +505,22 @@ impl Gui {
             "",
             WINDOW,
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 378, 230, 240],
+            [18, 402, 230, 240],
         )?;
         g.add(
             "BUTTON",
             "Select area…",
             AREA,
             WS_TABSTOP,
-            [18, 407, 96, 25],
+            [18, 431, 96, 25],
         )?;
-        g.add("STATIC", "Touchpad:", 0, 0, [18, 443, 64, 16])?;
+        g.add("STATIC", "Touchpad:", 0, 0, [18, 467, 64, 16])?;
         g.add(
             "COMBOBOX",
             "",
             PAD_FIT,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [84, 437, 164, 160],
+            [84, 461, 164, 160],
         )?;
         g.fill_combo(
             PAD_FIT,
@@ -522,23 +531,23 @@ impl Gui {
             ],
         );
         SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 0, 0);
-        g.add("STATIC", "", TARGET_INFO, 0x4000, [120, 412, 128, 16])?;
+        g.add("STATIC", "", TARGET_INFO, 0x4000, [120, 436, 128, 16])?;
         g.add(
             "BUTTON",
             "Start capture",
             START,
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            [8, 478, 122, 26],
+            [8, 502, 122, 26],
         )?;
         g.add(
             "BUTTON",
             "Stop / disarm",
             STOP,
             WS_TABSTOP,
-            [136, 478, 122, 26],
+            [136, 502, 122, 26],
         )?;
         // Four lines: the state plus up to three wrapped lines of detail.
-        g.status = g.add("STATIC", "", STATUS, 0, [8, 514, 250, 64])?;
+        g.status = g.add("STATIC", "", STATUS, 0, [8, 538, 250, 64])?;
         let emergency_label = g.add(
             "STATIC",
             "Emergency stop: Ctrl + Alt + Esc (or Esc here)",
@@ -1342,10 +1351,13 @@ impl Gui {
         let session = Session::start(
             device,
             target,
-            self.checked(INJECT),
-            self.selection(CONTACTS) + 1,
-            self.selection(GUARD) == 1,
-            self.selection(GUARD) == 2,
+            experiment::SessionSettings {
+                inject: self.checked(INJECT),
+                capacity: self.selection(CONTACTS) + 1,
+                suppress_gestures: self.selection(GUARD) == 1,
+                background_guard: self.selection(GUARD) == 2,
+                touch_feedback: self.checked(FEEDBACK),
+            },
             out.clone(),
         )?;
         session.shared.lock().unwrap().frame_signal = Some(experiment::FrameSignal::new(
@@ -1464,6 +1476,12 @@ impl Gui {
         ] {
             EnableWindow(self.item(id), i32::from(!locked));
         }
+        // Feedback is fixed when injection initializes, so it only applies
+        // to a session that injects.
+        EnableWindow(
+            self.item(FEEDBACK),
+            i32::from(!locked && self.checked(INJECT)),
+        );
         let choice = self.choice();
         EnableWindow(
             self.item(WINDOW),

@@ -10,6 +10,8 @@ The device list shows Precision Touchpad Raw Input collections with VID/PID. Ref
 
 The application opens idle. Native injection is selected by default, but capture only starts after an explicit action. Clearing **Inject native touch input** selects raw-only capture; no received touch trails are expected then. Contact capacity ranges from one to five, limited by the actual device.
 
+**Show Windows touch feedback** (off by default, available only with injection) makes Windows draw its standard touch visuals at the injected contacts. It initializes injection with `TOUCH_FEEDBACK_DEFAULT` instead of `TOUCH_FEEDBACK_NONE`, so the system **Touch indicator** setting still decides whether the visuals appear. The mode is fixed when a session starts; change it between sessions.
+
 ## Capture controls
 
 | Mode | Enable/start | Stop behavior |
@@ -109,7 +111,7 @@ The Foreground guard only applies while PadBridge itself is foreground, so it is
 
 ## Window layout and repainting
 
-The window has a fixed size: no sizing border and no maximize button (it can still be moved and minimized). The client area is 820 by 594 logical pixels, scaled using the monitor DPI and resized only when the DPI changes. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint are placed relative to the client bounds; controls are not vertically compressed.
+The window has a fixed size: no sizing border and no maximize button (it can still be moved and minimized). The client area is 820 by 618 logical pixels, scaled using the monitor DPI and resized only when the DPI changes. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint are placed relative to the client bounds; controls are not vertically compressed.
 
 Native labels, group boxes and read-only status fields use the system COLOR_BTNFACE brush through the control-color messages. Editable/selectable input surfaces retain their system theme.
 
