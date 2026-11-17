@@ -1,12 +1,18 @@
 # Architecture
 
-PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP keeps a fixed receiver rectangle and a minimal diagnostic window. Application-window targeting, persistent configuration, a full GUI, and release-level recovery remain outside this implementation.
+PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and a fixed per-session rectangle. Application-window targeting, persistent configuration, and release-level recovery remain outside this implementation. The CLI receiver remains available.
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
 | `main.rs` | Validate command-line options and dispatch capture or offline log verification. |
+| `gui.rs` | Own native controls, device selection, global shortcuts, the embedded receiver, and repeated capture sessions. |
+| `control.rs` | Track manual, Toggle, and Hold intent independently of asynchronous worker startup/shutdown. |
+| `mapping.rs` | Resolve the diagnostic target and define explicit future screen/window mapping configurations. |
+| `device_info.rs` | Interpret declared HID length units, physical shape, logical ranges and coordinate density. |
+| `report_rate.rs` | Distinguish observed raw delivery, complete frame delivery and PTP scan cadence. |
+| `background_guard.rs` | Adapt the validated bounded settings-cache transaction to GUI sessions, retain recovery assets, and wait for restoration. |
 | `capture.rs` | Attribute raw reports and complete frames to foreground/background intervals and count conservative background contact evidence. |
 | `hid.rs` | Discover Raw Input collections, retrieve HidP capabilities and values, and validate aligned RAWHID buffers. |
 | `decode.rs` | Interpret fields, assemble complete reports, and map absolute coordinates without Windows API dependencies. |
@@ -19,7 +25,7 @@ PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | `verify.rs` | Audit batch completeness, contact lifecycles, and received coordinates without injecting input. |
 | `logging.rs` | Write diagnostics through a bounded queue and count dropped records. |
 
-Raw Input processing and injection run serially on one worker thread. The receiver processes pointer messages on a separate thread. Painting copies a bounded display snapshot and releases the statistics lock before GDI calls. A cached memory DC/bitmap receives background, text, trails, and active contacts; one BitBlt then presents the completed frame. WM_ERASEBKGND is handled without erasure, and the window class has no background brush. Buffer resources are replaced on size changes and released on shutdown. Log writing runs on its own thread; queue overflow is reported rather than treated as complete evidence.
+Raw Input processing and injection run serially on one worker thread. The receiver processes pointer messages on a separate thread. Painting copies a bounded display snapshot and releases the statistics lock before GDI calls. A cached memory DC/bitmap receives background, text, trails, and active contacts; one BitBlt then presents the completed frame. The standalone CLI receiver suppresses background erasure. The native GUI parent paints the system dialog background, supplies the same system brush to native labels/group boxes, and batches child positions before invalidating all children. Its diagnostic child continues to use a back buffer. Buffer resources are replaced on size changes and released on shutdown. Log writing runs on its own thread; queue overflow is reported rather than treated as complete evidence.
 
 ## Optional foreground gesture ownership
 

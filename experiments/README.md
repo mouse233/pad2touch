@@ -2,6 +2,8 @@
 
 These developer tools investigate an undocumented Windows interface. They are separate from PadBridge's default capture path. They do not implement a production global-capture mode, a GUI, hotkeys, drivers, or process injection. Use the ordinary interactive desktop under the same user account as Explorer.
 
+The GUI's explicit **Background guard (experimental)** selection embeds this transaction and its native helper through a separate adapter. Its `session` mode retains the same journal, lease, snapshot, readback, and watchdog path while the GUI owns Raw Input capture. It monitors the GUI owner's process identity, accepts a stop marker after input cleanup, and signals expiry at 120 seconds before restoration. This GUI mode accepts only the locally validated build 26300.9974 and remains off by default. The original bounded `apply` experiment is still available independently.
+
 ## Build and read-only inspection
 
 ```powershell
@@ -55,4 +57,4 @@ After the experiment, confirm `restored.json` reports exact registry/cache resto
 
 Do not run concurrent experiments, edit preferences during one, replace the helper binary mid-run, or start a new experiment before an earlier journal has been recovered. A change to the same zero value cannot be distinguished from the experiment's own write. The watchdog is a separate best-effort process, not a guarantee against logoff, machine shutdown, killed recovery processes, Explorer failure, or incompatible undocumented interfaces. Forced-termination recovery needs its own test. There is no installed persistent recovery service or automatic startup recovery.
 
-The implementation is independently written using interface facts with source attribution. No external script or GPL implementation is embedded. These tools do not install or change the user's PowerShell execution policy and are not enabled by `Run-PadBridge.ps1`.
+The implementation is independently written using interface facts with source attribution. No external script or GPL implementation is embedded. These tools do not install or change the user's PowerShell execution policy. Normal CLI capture does not enable them; GUI use requires explicitly selecting Background guard.

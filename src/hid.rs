@@ -21,6 +21,84 @@ pub struct Device {
     pub caps: HIDP_CAPS,
 }
 impl Device {
+    pub fn geometry(&self) -> Result<crate::device_info::Geometry, String> {
+        use crate::device_info::{Axis, Geometry};
+        let mut count = self.caps.NumberInputValueCaps;
+        let mut caps = vec![HIDP_VALUE_CAPS::default(); count as usize];
+        if count == 0 {
+            return Err("no input value capabilities".into());
+        }
+        unsafe {
+            check_hid(
+                "HidP_GetValueCaps(geometry)",
+                HidP_GetValueCaps(HidP_Input, caps.as_mut_ptr(), &mut count, self.pp()),
+            )?;
+        }
+        let mut links = std::collections::BTreeSet::new();
+        for v in caps
+            .iter()
+            .take(count as usize)
+            .filter(|v| !v.IsAlias && v.UsagePage == 0x0D)
+        {
+            let (lo, hi) = unsafe {
+                if v.IsRange {
+                    (v.Anonymous.Range.UsageMin, v.Anonymous.Range.UsageMax)
+                } else {
+                    (v.Anonymous.NotRange.Usage, v.Anonymous.NotRange.Usage)
+                }
+            };
+            if (lo..=hi).contains(&0x51) {
+                links.insert((v.ReportID, v.LinkCollection));
+            }
+        }
+        let mut axes = std::collections::BTreeMap::<(u8, u16), (Option<Axis>, Option<Axis>)>::new();
+        for v in caps.iter().take(count as usize).filter(|v| {
+            !v.IsAlias && v.UsagePage == 1 && links.contains(&(v.ReportID, v.LinkCollection))
+        }) {
+            let (lo, hi) = unsafe {
+                if v.IsRange {
+                    (v.Anonymous.Range.UsageMin, v.Anonymous.Range.UsageMax)
+                } else {
+                    (v.Anonymous.NotRange.Usage, v.Anonymous.NotRange.Usage)
+                }
+            };
+            if !(lo..=hi).contains(&0x30) && !(lo..=hi).contains(&0x31) {
+                continue;
+            }
+            if !v.IsAbsolute {
+                return Err("contact coordinates are not absolute".into());
+            }
+            let axis = Axis {
+                logical_min: v.LogicalMin,
+                logical_max: v.LogicalMax,
+                physical_min: v.PhysicalMin,
+                physical_max: v.PhysicalMax,
+                units: v.Units,
+                exponent: v.UnitsExp,
+                bits: v.BitSize,
+            };
+            let pair = axes.entry((v.ReportID, v.LinkCollection)).or_default();
+            if (lo..=hi).contains(&0x30) {
+                pair.0 = Some(axis);
+            }
+            if (lo..=hi).contains(&0x31) {
+                pair.1 = Some(axis);
+            }
+        }
+        let mut result = None;
+        for (x, y) in axes.into_values() {
+            let geometry = Geometry {
+                x: x.ok_or("missing contact X capability")?,
+                y: y.ok_or("missing contact Y capability")?,
+            };
+            geometry.aspect()?;
+            if result.is_some_and(|old: Geometry| old != geometry) {
+                return Err("inconsistent physical/logical geometry across contacts".into());
+            }
+            result = Some(geometry);
+        }
+        result.ok_or("no physical contact X/Y geometry".into())
+    }
     pub fn pp(&self) -> PHIDP_PREPARSED_DATA {
         self.pp.as_ptr() as isize
     }
@@ -259,6 +337,10 @@ pub fn probe() -> Result<(), String> {
     );
     for (i, d) in devices.iter().enumerate() {
         println!("device[{i}]: {}", d.summary());
+        match d.geometry().and_then(|g| g.description()) {
+            Ok(info) => println!("  {info}"),
+            Err(error) => println!("  Physical geometry unavailable: {error}"),
+        }
         for f in d.fields()? {
             println!("  {f:?}");
         }

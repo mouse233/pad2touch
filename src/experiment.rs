@@ -41,11 +41,11 @@ pub struct Options {
 }
 #[derive(Clone, Copy)]
 pub struct TracePoint {
-    id: u32,
-    x: i32,
-    y: i32,
-    down: bool,
-    color: usize,
+    pub(crate) id: u32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) down: bool,
+    pub(crate) color: usize,
 }
 #[derive(Default)]
 pub struct Stats {
@@ -80,8 +80,11 @@ pub struct Stats {
     pub api_us: Vec<u128>,
     pub capture_us: Vec<u128>,
     pub scans: Vec<u32>,
+    pub report_rate: crate::report_rate::Snapshot,
     pub gesture_guard: bool,
     pub gesture_events: u64,
+    pub guard_status: String,
+    pub recovery_pending: bool,
     pub capture_stopped: bool,
     pub stop_reason: String,
     pub foreground: bool,
@@ -89,7 +92,7 @@ pub struct Stats {
     pub minimizations: u64,
     pub capture: crate::capture::Counters,
 }
-type Shared = Arc<Mutex<Stats>>;
+pub(crate) type Shared = Arc<Mutex<Stats>>;
 struct Ui {
     shared: Shared,
     log: Log,
@@ -136,7 +139,7 @@ unsafe fn make_window(
         hbrBackground: null_mut(),
         ..Default::default()
     };
-    if RegisterClassW(&wc) == 0 {
+    if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
         return Err(winerr("RegisterClassW"));
     }
     let hwnd = CreateWindowExW(
@@ -242,10 +245,10 @@ pub fn run(opt: Options) -> Result<(), String> {
         std::fs::write(opt.out.join("preparsed-data.bin"), pp).map_err(|e| e.to_string())?;
         let mut s = shared.lock().unwrap();
         s.device = d.summary();
-        s.device_label = format!(
-            "VID {:04X} / PID {:04X} | HID Touch Pad 0D:05 | {} bytes/report",
-            d.vid, d.pid, d.caps.InputReportByteLength
-        );
+        s.device_label = d
+            .geometry()
+            .and_then(|g| g.label())
+            .unwrap_or_else(|e| format!("Physical geometry unavailable: {e}"));
     }
     unsafe {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
@@ -268,11 +271,22 @@ pub fn run(opt: Options) -> Result<(), String> {
         if ClientToScreen(hwnd, &mut origin) == 0 {
             return Err(winerr("ClientToScreen"));
         }
-        let rect = RECT {
+        let area = RECT {
             left: origin.x + 40,
             top: origin.y + 220,
             right: origin.x + client.right - 40,
             bottom: origin.y + client.bottom - 40,
+        };
+        let rect = if let Some(device) = &device {
+            match device.geometry() {
+                Ok(g) => crate::mapping::fit_aspect(area, g.aspect()?)?,
+                Err(e) if opt.inject => {
+                    return Err(format!("Cannot preserve physical touchpad aspect: {e}"))
+                }
+                Err(_) => RECT::default(),
+            }
+        } else {
+            area
         };
         log.event(format!(
             "FIXED_RECT left={} top={} right={} bottom={}",
@@ -416,34 +430,212 @@ fn percentile(v: &[u128], p: usize) -> u128 {
     }
 }
 fn summary(s: &Stats, dropped: u64, seconds: u64) -> String {
-    format!("phase=1+2\nvalidation_status=PENDING_MANUAL_HARDWARE_TEST\nmode={}\nsource={}\nrequested_duration_s={seconds}\ndevice={}\ncapacity={}\nraw_reports={}\ncomplete_frames={}\npeak_active_contacts={}\nparse_errors={}\nincomplete_frames={}\ninjected_frames={}\ninjection_errors={}\nnot_ready_retries={}\ninjected_contacts_remaining={}\ncleanup_pending={}\nreceiver_PT_TOUCH_down={}\nreceiver_PT_TOUCH_update={}\nreceiver_PT_TOUCH_up={}\nreceiver_GetPointerTouchInfo_ok={}\nreceiver_peak_contacts={}\nreceiver_contacts_remaining={}\nreceiver_lifecycle_errors={}\nlog_dropped={}\ninject_api_p95_us={}\nraw_to_inject_call_p95_us={}\nlatency_note=host software only; excludes firmware, OS delivery and physical input latency\nlast_error={}\n",s.mode,if s.mode=="self-test"{"SYNTHETIC_API_TEST_NOT_HARDWARE"}else{"PHYSICAL_RAW_INPUT"},s.device,s.capacity,s.raw,s.frames,s.peak,s.parse_errors,s.incomplete,s.injected,s.inject_errors,s.retries,s.injected_active,s.cleanup_pending,s.down,s.update,s.up,s.touch_info,s.received_peak,s.received_active.len(),s.receive_errors,dropped,percentile(&s.api_us,95),percentile(&s.capture_us,95),s.error)
+    let report = format!("phase=1+2\nvalidation_status=PENDING_MANUAL_HARDWARE_TEST\nmode={}\nsource={}\nrequested_duration_s={seconds}\ndevice={}\ncapacity={}\nraw_reports={}\ncomplete_frames={}\npeak_active_contacts={}\nparse_errors={}\nincomplete_frames={}\ninjected_frames={}\ninjection_errors={}\nnot_ready_retries={}\ninjected_contacts_remaining={}\ncleanup_pending={}\nreceiver_PT_TOUCH_down={}\nreceiver_PT_TOUCH_update={}\nreceiver_PT_TOUCH_up={}\nreceiver_GetPointerTouchInfo_ok={}\nreceiver_peak_contacts={}\nreceiver_contacts_remaining={}\nreceiver_lifecycle_errors={}\nlog_dropped={}\ninject_api_p95_us={}\nraw_to_inject_call_p95_us={}\nlatency_note=host software only; excludes firmware, OS delivery and physical input latency\nlast_error={}\n",s.mode,if s.mode=="self-test"{"SYNTHETIC_API_TEST_NOT_HARDWARE"}else{"PHYSICAL_RAW_INPUT"},s.device,s.capacity,s.raw,s.frames,s.peak,s.parse_errors,s.incomplete,s.injected,s.inject_errors,s.retries,s.injected_active,s.cleanup_pending,s.down,s.update,s.up,s.touch_info,s.received_peak,s.received_active.len(),s.receive_errors,dropped,percentile(&s.api_us,95),percentile(&s.capture_us,95),s.error);
+    format!("{report}device_geometry={}\nobserved_rate_snapshot={}\nrate_note=observed host delivery and PTP scan cadence, not nominal bus polling\n", s.device_label.replace('\n', " | "), s.report_rate.label())
+}
+
+/// A GUI-owned session. The caller keeps pumping receiver messages during stop
+/// and only finalizes after the worker and the receiver drain have completed.
+pub(crate) struct Session {
+    pub shared: Shared,
+    pub log: Log,
+    pub out: PathBuf,
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<Result<(), String>>,
+    writer: std::thread::JoinHandle<Result<(), String>>,
+    drain_started: Option<Instant>,
+    started: Instant,
+    explicit_stop: AtomicBool,
+}
+impl Session {
+    pub fn start(
+        device: Device,
+        target: crate::mapping::ResolvedTarget,
+        inject: bool,
+        capacity: usize,
+        suppress_gestures: bool,
+        background_guard: bool,
+        out: PathBuf,
+    ) -> Result<Self, String> {
+        if !(1..=5).contains(&capacity) {
+            return Err("invalid GUI contact capacity".into());
+        }
+        // Resolve parser support before starting either thread.
+        device.fields()?;
+        if inject {
+            let ratio = device.geometry()?.aspect()?;
+            let width = target.bounds.right as f64 - target.bounds.left as f64;
+            let height = target.bounds.bottom as f64 - target.bounds.top as f64;
+            if width < 2.0 || height < 2.0 || (width - height * ratio).abs() > ratio.max(1.0) {
+                return Err(
+                    "Injection target does not preserve the physical touchpad aspect".into(),
+                );
+            }
+        }
+        let shared = Arc::new(Mutex::new(Stats {
+            device: device.summary(),
+            device_label: device
+                .geometry()
+                .and_then(|g| g.label())
+                .unwrap_or_else(|e| format!("Physical geometry unavailable: {e}")),
+            mode: "capture".into(),
+            capacity,
+            pinch_ratio: 1.0,
+            ..Default::default()
+        }));
+        let (log, writer) = Log::open(&out)?;
+        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} frontend=GUI"));
+        log.event(format!("DEVICE {}", device.summary()));
+        let r = target.bounds;
+        log.event(format!(
+            "FIXED_RECT left={} top={} right={} bottom={}",
+            r.left, r.top, r.right, r.bottom
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_shared = shared.clone();
+        let worker_log = log.clone();
+        let worker_stop = stop.clone();
+        let worker_done = done.clone();
+        let worker_out = out.clone();
+        let worker = std::thread::spawn(move || {
+            let _finished = WorkerFinished(worker_done);
+            let guard = if background_guard {
+                crate::background_guard::Guard::acquire(
+                    &worker_out,
+                    worker_shared.clone(),
+                    worker_log.clone(),
+                    worker_stop.clone(),
+                )
+            } else {
+                Ok(None)
+            };
+            let result = guard.and_then(|guard| {
+                let result = if worker_stop.load(Ordering::Relaxed) {
+                    Ok(())
+                } else {
+                    worker_loop(
+                        Some(device),
+                        ("capture".into(), inject, capacity, suppress_gestures),
+                        (target.window, target.bounds),
+                        worker_shared.clone(),
+                        worker_log.clone(),
+                        worker_stop,
+                    )
+                };
+                if let Some(guard) = guard {
+                    result.and(guard.release())
+                } else {
+                    result
+                }
+            });
+            worker_shared.lock().unwrap().capture_stopped = true;
+            if let Err(error) = &result {
+                worker_log.event(format!("WORKER_ERROR {error}"));
+                let mut s = worker_shared.lock().unwrap();
+                s.error = error.clone();
+                s.stop_reason = error.clone();
+                s.capture_stopped = true;
+            }
+            result
+        });
+        Ok(Self {
+            shared,
+            log,
+            out,
+            stop,
+            done,
+            worker,
+            writer,
+            drain_started: None,
+            started: Instant::now(),
+            explicit_stop: AtomicBool::new(false),
+        })
+    }
+    pub fn request_stop(&self, reason: &str) {
+        self.explicit_stop.store(true, Ordering::Relaxed);
+        let mut s = self.shared.lock().unwrap();
+        if s.stop_reason.is_empty() {
+            s.stop_reason = reason.into();
+        }
+        self.stop.store(true, Ordering::Relaxed);
+    }
+    pub fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+    pub fn stopped_unexpectedly(&self) -> bool {
+        !self.explicit_stop.load(Ordering::Relaxed) && (self.stopping() || self.worker_done())
+    }
+    pub fn worker_done(&self) -> bool {
+        self.done.load(Ordering::Acquire) && self.worker.is_finished()
+    }
+    pub fn ready_to_finish(&mut self) -> bool {
+        if !self.worker_done() {
+            return false;
+        }
+        self.drain_started
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            >= Duration::from_millis(300)
+    }
+    pub fn finish(self) -> Result<(), String> {
+        let result = self
+            .worker
+            .join()
+            .map_err(|_| "Raw Input worker panicked".to_string())
+            .and_then(|r| r);
+        let s = self.shared.lock().unwrap();
+        let dropped = self.log.dropped.load(Ordering::Relaxed);
+        let result = result.and(
+            if dropped > 0
+                || s.cleanup_pending
+                || s.recovery_pending
+                || s.injected_active > 0
+                || !s.received_active.is_empty()
+                || !s.error.is_empty()
+            {
+                Err("Session ended with errors or unresolved contacts. Review diagnostics and logs.".into())
+            } else {
+                Ok(())
+            },
+        );
+        let report = format!(
+            "{}{}actual_duration_ms={}\nrun_status={}\nstop_reason={}\nbackground_guard_status={}\nsettings_recovery_pending={}\n",
+            summary(&s, dropped, 0),
+            s.capture.summary(),
+            self.started.elapsed().as_millis(),
+            if result.is_ok() {
+                "COMPLETED"
+            } else {
+                "COMPLETED_WITH_ERRORS"
+            },
+            s.stop_reason,
+            s.guard_status,
+            s.recovery_pending
+        );
+        self.log
+            .event(format!("SUMMARY {}", report.replace('\n', " | ")));
+        let written =
+            std::fs::write(self.out.join("summary.txt"), report).map_err(|e| e.to_string());
+        drop(s);
+        drop(self.log);
+        let flushed = self
+            .writer
+            .join()
+            .map_err(|_| "log writer panicked".to_string())
+            .and_then(|r| r);
+        result.and(written).and(flushed)
+    }
 }
 unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
-            UI.with(|u|{if let Some(u)=u.borrow().as_ref(){
-                let mut info=POINTER_INFO::default();let id=(w&0xFFFF) as u32;
-                if GetPointerInfo(id,&mut info)==0{u.log.event(winerr("GetPointerInfo"));return;}
-                if info.pointerType!=PT_TOUCH{return;}
-                let mut touch=POINTER_TOUCH_INFO::default();let touch_ok=GetPointerTouchInfo(id,&mut touch)!=0;
-                let kind=match msg{WM_POINTERDOWN=>"DOWN",WM_POINTERUP=>"UP",_=>"UPDATE"};
-                u.log.event(format!("RECEIVE_PT_TOUCH {kind} id={id} frame={} x={} y={} flags=0x{:X} touch_info={touch_ok}",info.frameId,info.ptPixelLocation.x,info.ptPixelLocation.y,info.pointerFlags));
-                let mut s=u.shared.lock().unwrap();match msg{WM_POINTERDOWN=>s.down+=1,WM_POINTERUP=>s.up+=1,_=>s.update+=1};if touch_ok{s.touch_info+=1;}
-                let mut p=info.ptPixelLocation;ScreenToClient(hwnd,&mut p);
-                if msg==WM_POINTERDOWN {let color=(0..5).find(|c|!s.received_colors.values().any(|v|v==c)).unwrap_or(id as usize%5);s.received_colors.insert(id,color);if s.received_active.insert(id,(p.x,p.y)).is_some(){s.receive_errors+=1;}}
-                else if msg==WM_POINTERUP {if s.received_active.remove(&id).is_none(){s.receive_errors+=1;}}
-                else if let Some(point)=s.received_active.get_mut(&id){*point=(p.x,p.y);}else{s.receive_errors+=1;}
-                s.received_peak=s.received_peak.max(s.received_active.len());
-                if s.received_active.len()==2 {
-                    let pair:Vec<_>=s.received_active.iter().collect();let (&a,&(ax,ay))=pair[0];let (&b,&(bx,by))=pair[1];
-                    let distance=((ax as f64-bx as f64).powi(2)+(ay as f64-by as f64).powi(2)).sqrt();
-                    if let Some((old_a,old_b,baseline))=s.pinch_pair {if old_a==a&&old_b==b&&baseline>0.0{s.pinch_ratio=distance/baseline;}else{s.pinch_pair=Some((a,b,distance));}}
-                    else{s.pinch_pair=Some((a,b,distance));s.pinch_ratio=1.0;}
-                }else{s.pinch_pair=None;}
-                let color=s.received_colors.get(&id).copied().unwrap_or(0);
-                s.points.push_back(TracePoint{id,x:p.x,y:p.y,down:msg==WM_POINTERDOWN,color});if s.points.len()>5000{s.points.pop_front();}
-                if msg==WM_POINTERUP{s.received_colors.remove(&id);}
-            }});
+            UI.with(|u| {
+                if let Some(u) = u.borrow().as_ref() {
+                    receive_touch(hwnd, msg, w, &u.shared, &u.log);
+                }
+            });
             return 0;
         }
         WM_TIMER => {
@@ -553,6 +745,89 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     }
     DefWindowProcW(hwnd, msg, w, l)
 }
+pub(crate) unsafe fn receive_touch(hwnd: HWND, msg: u32, w: WPARAM, shared: &Shared, log: &Log) {
+    let mut info = POINTER_INFO::default();
+    let id = (w & 0xFFFF) as u32;
+    if GetPointerInfo(id, &mut info) == 0 {
+        log.event(winerr("GetPointerInfo"));
+        return;
+    }
+    if info.pointerType != PT_TOUCH {
+        return;
+    }
+    let mut touch = POINTER_TOUCH_INFO::default();
+    let touch_ok = GetPointerTouchInfo(id, &mut touch) != 0;
+    let kind = match msg {
+        WM_POINTERDOWN => "DOWN",
+        WM_POINTERUP => "UP",
+        _ => "UPDATE",
+    };
+    log.event(format!(
+        "RECEIVE_PT_TOUCH {kind} id={id} frame={} x={} y={} flags=0x{:X} touch_info={touch_ok}",
+        info.frameId, info.ptPixelLocation.x, info.ptPixelLocation.y, info.pointerFlags
+    ));
+    let mut s = shared.lock().unwrap();
+    match msg {
+        WM_POINTERDOWN => s.down += 1,
+        WM_POINTERUP => s.up += 1,
+        _ => s.update += 1,
+    };
+    if touch_ok {
+        s.touch_info += 1;
+    }
+    let mut p = info.ptPixelLocation;
+    ScreenToClient(hwnd, &mut p);
+    if msg == WM_POINTERDOWN {
+        let color = (0..5)
+            .find(|c| !s.received_colors.values().any(|v| v == c))
+            .unwrap_or(id as usize % 5);
+        s.received_colors.insert(id, color);
+        if s.received_active.insert(id, (p.x, p.y)).is_some() {
+            s.receive_errors += 1;
+        }
+    } else if msg == WM_POINTERUP {
+        if s.received_active.remove(&id).is_none() {
+            s.receive_errors += 1;
+        }
+    } else if let Some(point) = s.received_active.get_mut(&id) {
+        *point = (p.x, p.y);
+    } else {
+        s.receive_errors += 1;
+    }
+    s.received_peak = s.received_peak.max(s.received_active.len());
+    if s.received_active.len() == 2 {
+        let pair: Vec<_> = s.received_active.iter().collect();
+        let (&a, &(ax, ay)) = pair[0];
+        let (&b, &(bx, by)) = pair[1];
+        let distance = ((ax as f64 - bx as f64).powi(2) + (ay as f64 - by as f64).powi(2)).sqrt();
+        if let Some((old_a, old_b, baseline)) = s.pinch_pair {
+            if old_a == a && old_b == b && baseline > 0.0 {
+                s.pinch_ratio = distance / baseline;
+            } else {
+                s.pinch_pair = Some((a, b, distance));
+            }
+        } else {
+            s.pinch_pair = Some((a, b, distance));
+            s.pinch_ratio = 1.0;
+        }
+    } else {
+        s.pinch_pair = None;
+    }
+    let color = s.received_colors.get(&id).copied().unwrap_or(0);
+    s.points.push_back(TracePoint {
+        id,
+        x: p.x,
+        y: p.y,
+        down: msg == WM_POINTERDOWN,
+        color,
+    });
+    if s.points.len() > 5000 {
+        s.points.pop_front();
+    }
+    if msg == WM_POINTERUP {
+        s.received_colors.remove(&id);
+    }
+}
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let screen = BeginPaint(hwnd, &mut ps);
@@ -581,18 +856,36 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
         let buffer = ui.back_buffer.as_ref().unwrap();
-        paint_contents(hwnd, buffer.dc, &rc, ui);
+        paint_diagnostics(hwnd, buffer.dc, &rc, &ui.shared, ui.rect, 96);
         if let Err(error) = buffer.present(screen) {
             ui.log.event(format!("RENDER_ERROR {error}"));
         }
     });
     EndPaint(hwnd, &ps);
 }
-unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
-    FillRect(dc, rc, (COLOR_WINDOW + 1) as HBRUSH);
+pub(crate) fn diagnostic_text(s: &Stats) -> String {
+    let text = format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} / events {}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if !s.gesture_guard || s.capture_stopped{"OFF"}else if s.foreground{"ACTIVE (foreground)"}else{"INACTIVE (background)"},s.gesture_events,if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
+    let text = format!("{text}\n{}", s.report_rate.label());
+    if s.guard_status.is_empty() {
+        text
+    } else {
+        format!("{text}\n{}", s.guard_status)
+    }
+}
+
+pub(crate) unsafe fn paint_diagnostics(
+    hwnd: HWND,
+    dc: HDC,
+    rc: &RECT,
+    shared: &Shared,
+    rect: RECT,
+    dpi: u32,
+) {
+    let px = |n: i32| n * dpi as i32 / 96;
+    FillRect(dc, rc, (COLOR_BTNFACE + 1) as HBRUSH);
     let (text, points, active, active_colors, pinch_ratio) = {
-        let s = u.shared.lock().unwrap();
-        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} / events {}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if !s.gesture_guard || s.capture_stopped{"OFF"}else if s.foreground{"ACTIVE (foreground)"}else{"INACTIVE (background)"},s.gesture_events,if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
+        let s = shared.lock().unwrap();
+        let text = diagnostic_text(&s);
         (
             text,
             s.points.clone(),
@@ -604,7 +897,7 @@ unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
     // Release the statistics lock before GDI painting.
     let face = wide("Segoe UI");
     let font = CreateFontW(
-        -20,
+        -px(12),
         0,
         0,
         0,
@@ -624,14 +917,21 @@ unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
     } else {
         null_mut()
     };
+    let mut header_origin = POINT::default();
+    ClientToScreen(hwnd, &mut header_origin);
     let mut tr = RECT {
-        left: 20,
-        top: 12,
-        right: rc.right - 20,
-        bottom: 215,
+        left: px(20),
+        top: px(12),
+        right: rc.right - px(20),
+        bottom: if rect.right > rect.left && rect.bottom > rect.top {
+            rect.top - header_origin.y - px(8)
+        } else {
+            rc.bottom - px(12)
+        },
     };
     let t = wide(&text);
     SetBkMode(dc, TRANSPARENT as i32);
+    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
     DrawTextW(
         dc,
         t.as_ptr(),
@@ -642,12 +942,26 @@ unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
     let mut org = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut org);
     let boxrect = RECT {
-        left: u.rect.left - org.x,
-        top: u.rect.top - org.y,
-        right: u.rect.right - org.x,
-        bottom: u.rect.bottom - org.y,
+        left: rect.left - org.x,
+        top: rect.top - org.y,
+        right: rect.right - org.x,
+        bottom: rect.bottom - org.y,
     };
-    FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
+    if boxrect.right > boxrect.left && boxrect.bottom > boxrect.top {
+        FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
+    }
+    let saved = SaveDC(dc);
+    if boxrect.right > boxrect.left && boxrect.bottom > boxrect.top {
+        IntersectClipRect(
+            dc,
+            boxrect.left + 1,
+            boxrect.top + 1,
+            boxrect.right - 1,
+            boxrect.bottom - 1,
+        );
+    } else {
+        IntersectClipRect(dc, 0, 0, 0, 0);
+    }
     let colors = [0x00709010, 0x002070D0, 0x00C06050, 0x009040A0, 0x0020A0A0];
     let pens: Vec<_> = colors
         .iter()
@@ -688,6 +1002,7 @@ unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
     for pen in pens {
         DeleteObject(pen);
     }
+    RestoreDC(dc, saved);
     if !font.is_null() {
         SelectObject(dc, old_font);
         DeleteObject(font);
@@ -706,7 +1021,8 @@ struct Worker {
     last_raw: Instant,
     mode: String,
     target: usize,
-    rect: RECT,
+    target_origin: POINT,
+    target_size: (i32, i32),
     synthetic_step: u32,
     capacity: usize,
     pending_since: Option<Instant>,
@@ -714,6 +1030,7 @@ struct Worker {
     gesture_events: Option<Arc<AtomicU64>>,
     capture: crate::capture::Evidence,
     last_scope: Option<crate::capture::Scope>,
+    rates: crate::report_rate::Meter,
 }
 fn worker_loop(
     device: Option<Device>,
@@ -735,6 +1052,15 @@ fn worker_loop(
     } else {
         None
     };
+    let mut target_origin = POINT::default();
+    let mut target_client = RECT::default();
+    unsafe {
+        if ClientToScreen(target as HWND, &mut target_origin) == 0
+            || GetClientRect(target as HWND, &mut target_client) == 0
+        {
+            return Err(winerr("resolve diagnostic target"));
+        }
+    }
     let mut worker = Worker {
         device,
         fields,
@@ -747,7 +1073,8 @@ fn worker_loop(
         last_raw: Instant::now(),
         mode,
         target,
-        rect,
+        target_origin,
+        target_size: (target_client.right, target_client.bottom),
         synthetic_step: 0,
         capacity,
         pending_since: None,
@@ -755,9 +1082,9 @@ fn worker_loop(
         gesture_events: None,
         capture: crate::capture::Evidence::default(),
         last_scope: None,
+        rates: crate::report_rate::Meter::default(),
     };
     unsafe {
-        let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
         let mut gesture_guard = if suppress_gestures {
             let guard = crate::gestures::Guard::create(log.clone())?;
             worker.shared.lock().unwrap().gesture_guard = true;
@@ -766,6 +1093,7 @@ fn worker_loop(
         } else {
             None
         };
+        let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
         INPUT.with(|i| *i.borrow_mut() = Some(worker));
         let rid = RAWINPUTDEVICE {
             usUsagePage: 0x0D,
@@ -836,13 +1164,21 @@ impl Worker {
         self.pending_since = None;
         self.capture.reset_fragments();
     }
-    fn accept(&mut self, contacts: Vec<Contact>, start: Instant) {
+    fn accept(&mut self, contacts: Vec<Contact>, start: Instant, scan: Option<u32>) {
+        if self.stop.load(Ordering::Relaxed) || EXIT.load(Ordering::Relaxed) {
+            return;
+        }
         let scope = self.capture.frame(&contacts);
         let live = contacts.iter().filter(|c| c.tip && c.confidence).count();
+        if self.mode == "capture" {
+            self.rates.frame(start, scan, live > 0);
+        }
         self.log.event(format!(
-            "FRAME active={live} records={} contacts={contacts:?} foreground_scope={}",
+            "FRAME active={live} records={} contacts={contacts:?} foreground_scope={} scan_time={}",
             contacts.len(),
-            scope.label()
+            scope.label(),
+            scan.map(|v| v.to_string())
+                .unwrap_or_else(|| "unavailable".into())
         ));
         {
             let mut s = self.shared.lock().unwrap();
@@ -879,6 +1215,7 @@ impl Worker {
         self.sync_stats();
     }
     fn sync_stats(&self) {
+        self.shared.lock().unwrap().report_rate = self.rates.snapshot(Instant::now());
         self.shared.lock().unwrap().capture = self.capture.counts.clone();
         if let Some(events) = &self.gesture_events {
             self.shared.lock().unwrap().gesture_events = events.load(Ordering::Relaxed);
@@ -928,6 +1265,7 @@ impl Worker {
         }
         let scope = self.sample_scope();
         for report in reports {
+            self.rates.raw(Instant::now());
             self.capture
                 .raw(scope, delivery_code == RIM_INPUTSINK as usize);
             self.last_raw = Instant::now();
@@ -942,6 +1280,7 @@ impl Worker {
             ));
             match self.device.as_ref().unwrap().parse(&self.fields, &report) {
                 Ok(Some(r)) => {
+                    let frame_scan = r.scan;
                     self.capture.fragment(scope);
                     if let Some(scan) = r.scan {
                         let mut s = self.shared.lock().unwrap();
@@ -952,7 +1291,7 @@ impl Worker {
                     match self.assembler.push(r) {
                         Ok(Some(frame)) => {
                             self.pending_since = None;
-                            self.accept(frame, start)
+                            self.accept(frame, start, frame_scan)
                         }
                         Ok(None) => {
                             self.pending_since.get_or_insert_with(Instant::now);
@@ -979,15 +1318,20 @@ impl Worker {
         }
         if self.injector.is_some() {
             unsafe {
-                let mut origin = POINT { x: 40, y: 220 };
+                let mut origin = POINT::default();
+                let mut client = RECT::default();
                 let reason = if IsWindow(self.target as HWND) == 0 {
                     Some("receiver closed; fixed mapping stopped")
-                } else if IsIconic(self.target as HWND) != 0 {
+                } else if IsIconic(GetAncestor(self.target as HWND, GA_ROOT)) != 0 {
                     Some("receiver minimized (possible Windows system gesture); injection stopped")
                 } else if ClientToScreen(self.target as HWND, &mut origin) == 0 {
                     Some("receiver position unavailable; fixed mapping stopped")
-                } else if origin.x != self.rect.left || origin.y != self.rect.top {
+                } else if origin.x != self.target_origin.x || origin.y != self.target_origin.y {
                     Some("receiver moved; fixed mapping stopped")
+                } else if GetClientRect(self.target as HWND, &mut client) == 0
+                    || (client.right, client.bottom) != self.target_size
+                {
+                    Some("receiver resized; fixed mapping stopped")
                 } else {
                     None
                 };
@@ -1017,7 +1361,7 @@ impl Worker {
                     step.label, self.capacity
                 ));
                 self.synthetic_step += 1;
-                self.accept(contacts, Instant::now());
+                self.accept(contacts, Instant::now(), None);
             }
         } else if self.last_raw.elapsed() > Duration::from_millis(500) {
             if self.assembler.is_pending() {

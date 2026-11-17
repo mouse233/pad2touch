@@ -1,8 +1,8 @@
 [package]
 name = "padbridge-phase0"
-version = "0.2.3"
+version = "0.3.2"
 edition = "2021"
-description = "Phase 1+2 MVP: fixed-rectangle Precision Touchpad input and synchronized native touch injection"
+description = "Native GUI for Precision Touchpad capture and synchronized native touch injection"
 license = "MIT"
 repository = "https://github.com/mouse233/padbridge"
 
@@ -12,7 +12,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security",
     "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Console",
     "Win32_UI_Input", "Win32_UI_Input_Pointer", "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"
+    "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls"
 ] }
 
 [profile.release]

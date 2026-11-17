@@ -1,11 +1,13 @@
 param(
-    [ValidateSet('probe','apply','restore','watchdog','self-test')][string]$Mode='probe',
+    [ValidateSet('probe','apply','session','restore','watchdog','self-test')][string]$Mode='probe',
     [string]$ExpectedBuild,
     [ValidateRange(15,120)][int]$Seconds=75,
     [string]$RunDirectory,
     [string]$Journal,
     [string]$CaptureExecutable,
-    [switch]$WaitForStart
+    [switch]$WaitForStart,
+    [int]$OwnerPid,
+    [long]$OwnerStartedFileTime
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
@@ -167,6 +169,11 @@ public static class PadBridgeExperimentStart {
     if($choice -ne 1){Write-Output 'Experiment cancelled before any preference changes.';return}
 }
 $version=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+if($Mode -eq 'session'){
+    if($version.CurrentBuildNumber -cne '26300' -or [int]$version.UBR -ne 9974){throw 'GUI background guard is validated only on Windows build 26300.9974'}
+    $guiOwner=Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
+    if($null -eq $guiOwner -or $guiOwner.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $OwnerStartedFileTime){throw 'GUI owner identity is unavailable or changed'}
+}
 $cache=Read-Cache
 $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$false)
 if($null -eq $key){throw 'Touchpad preferences key is unavailable'}
@@ -178,7 +185,7 @@ if($Mode -eq 'probe'){
 if(!$ExpectedBuild -or $ExpectedBuild -cne $version.CurrentBuildNumber){throw 'Apply requires -ExpectedBuild matching the explicitly reviewed current Windows build; no automatic version compatibility is claimed'}
 foreach($p in $original){if($p.exists -and [BitConverter]::ToUInt32([Convert]::FromBase64String($p.bytes),0) -ne $p.cacheValue){throw ('Registry/cache prerequisite mismatch: '+$p.name)}}
 if(!$RunDirectory){throw '-RunDirectory is required for apply'}
-if(!(Test-Path -LiteralPath $captureExe)){throw 'Build the raw capture executable before applying settings'}
+if($Mode -ne 'session' -and !(Test-Path -LiteralPath $captureExe)){throw 'Build the raw capture executable before applying settings'}
 $runPath=[IO.Path]::GetFullPath($RunDirectory)
 $allowedRoot=[IO.Path]::GetFullPath((Join-Path $repoPath 'artifacts'))+[IO.Path]::DirectorySeparatorChar
 if(!$runPath.StartsWith($allowedRoot,[StringComparison]::OrdinalIgnoreCase)){throw 'RunDirectory must be under this checkout artifacts directory'}
@@ -228,7 +235,7 @@ try {
         try {
             try {$writeHeld=$writeLock.WaitOne(3000)} catch [Threading.AbandonedMutexException] {$writeHeld=$true}
             if(!$writeHeld){throw 'Recovery owns the mutation lock; refusing to write'}
-            if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge (Get-DeadlineUtc $j.deadlineUtc)){throw 'Recovery completed, unavailable, or expired before mutation; refusing to write'}
+            if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or (Test-Path -LiteralPath (Join-Path $runPath 'stop-requested.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge (Get-DeadlineUtc $j.deadlineUtc)){throw 'Recovery completed, cancellation requested, unavailable, or expired before mutation; refusing to write'}
             $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$true)
             if($null -eq $key){throw 'Cannot open the exact preferences key for this experiment'}
             try {
@@ -247,8 +254,22 @@ try {
         Save-NewJson (Join-Path $runPath 'active.json') ([ordered]@{active=$true;utc=[DateTime]::UtcNow.ToString('o');capture_target_seconds=$Seconds;watchdog_deadline_utc=$j.deadlineUtc;scope='current-user';undocumented=$true})
         Write-Host "Experimental override active; capture target=$Seconds seconds; watchdog deadline UTC=$($j.deadlineUtc); journal=$journalPath"
         try {[Console]::Beep(1100,250)} catch {}
-        & $captureExe --capture --background --contacts 5 --seconds $Seconds --out (Join-Path $runPath 'capture')
-        if($LASTEXITCODE -ne 0){throw 'Background capture failed; restoring preferences'}
+        if($Mode -eq 'session'){
+            $activeTimer=[Diagnostics.Stopwatch]::StartNew()
+            while($activeTimer.Elapsed.TotalSeconds -lt $Seconds -and !(Test-Path -LiteralPath (Join-Path $runPath 'stop-requested.json'))){
+                $guiOwner=Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
+                if($null -eq $guiOwner -or $guiOwner.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $OwnerStartedFileTime){break}
+                Start-Sleep -Milliseconds 100
+            }
+            if($activeTimer.Elapsed.TotalSeconds -ge $Seconds){
+                Save-NewJson (Join-Path $runPath 'expired.json') ([ordered]@{expired=$true;utc=[DateTime]::UtcNow.ToString('o')})
+                $drainTimer=[Diagnostics.Stopwatch]::StartNew()
+                while($drainTimer.Elapsed.TotalSeconds -lt 3 -and !(Test-Path -LiteralPath (Join-Path $runPath 'stop-requested.json'))){Start-Sleep -Milliseconds 50}
+            }
+        } else {
+            & $captureExe --capture --background --contacts 5 --seconds $Seconds --out (Join-Path $runPath 'capture')
+            if($LASTEXITCODE -ne 0){throw 'Background capture failed; restoring preferences'}
+        }
     } finally {
         if($mutationStarted){Restore-Preferences $journalPath}
         elseif(!(Test-Path -LiteralPath (Join-Path $runPath 'restored.json'))){Save-NewJson (Join-Path $runPath 'restored.json') ([ordered]@{restored=$true;no_mutation=$true})}
