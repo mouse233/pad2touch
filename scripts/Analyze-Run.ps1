@@ -1,15 +1,21 @@
-param([Parameter(Mandatory=$true)][string]$RunDirectory)
+param([Parameter(Mandatory=$true)][string]$RunDirectory,[switch]$Strict)
 $ErrorActionPreference = 'Stop'
 $runPath = (Resolve-Path -LiteralPath $RunDirectory).Path
 $lines = Get-Content -LiteralPath (Join-Path $runPath 'events.log')
 if($lines | Select-String -Pattern ' RUN format=2 ' -Quiet){
     $exePath=Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\padbridge-phase0.exe'
     if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
-    $analysis=& $exePath --verify-log (Join-Path $runPath 'events.log')
+    # The verifier's JSON and exit status carry the result. Capture its stderr
+    # separately so PowerShell 5 does not turn an expected failed audit into a
+    # terminating NativeCommandError before analysis.json can be written.
+    $analysis=& $exePath --verify-log (Join-Path $runPath 'events.log') 2> (Join-Path $runPath 'verification-stderr.txt')
     $code=$LASTEXITCODE
     $analysis | Set-Content -LiteralPath (Join-Path $runPath 'analysis.json') -Encoding utf8
     $analysis
-    if($code -ne 0){throw 'Touch log verification failed; inspect analysis.json and events.log'}
+    if($code -ne 0){
+        $message='Touch delivery audit FAILED. This is a failed log check, not evidence of a process crash. Inspect summary.txt, analysis.json and events.log.'
+        if($Strict){throw $message};Write-Warning $message
+    }
     return
 }
 $injected = [System.Collections.Generic.List[object]]::new()

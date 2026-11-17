@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -80,6 +80,12 @@ pub struct Stats {
     pub capture_us: Vec<u128>,
     pub scans: Vec<u32>,
     pub gesture_guard: bool,
+    pub gesture_events: u64,
+    pub capture_stopped: bool,
+    pub stop_reason: String,
+    pub foreground: bool,
+    pub foreground_losses: u64,
+    pub minimizations: u64,
 }
 type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -92,6 +98,7 @@ struct Ui {
     worker_done: Arc<AtomicBool>,
     drain_started: Option<Instant>,
     back_buffer: Option<crate::render::BackBuffer>,
+    close_requested: bool,
 }
 struct WorkerFinished(Arc<AtomicBool>);
 impl Drop for WorkerFinished {
@@ -280,6 +287,7 @@ pub fn run(opt: Options) -> Result<(), String> {
                 worker_done: worker_done.clone(),
                 drain_started: None,
                 back_buffer: None,
+                close_requested: false,
             })
         });
         // A second call also handles a launcher specifying SW_HIDE for the
@@ -313,7 +321,10 @@ pub fn run(opt: Options) -> Result<(), String> {
             );
             if let Err(e) = &result {
                 worker_log.event(format!("WORKER_ERROR {e}"));
-                worker_shared.lock().unwrap().error = e.clone();
+                let mut s = worker_shared.lock().unwrap();
+                s.error = e.clone();
+                s.stop_reason = e.clone();
+                s.capture_stopped = true;
             }
             result
         });
@@ -365,10 +376,15 @@ pub fn run(opt: Options) -> Result<(), String> {
             },
         );
         let summary = format!(
-            "{}actual_duration_ms={}\nforeground_gesture_guard_used={}\n",
+            "{}actual_duration_ms={}\nforeground_gesture_guard_used={}\ngesture_events_received={}\nforeground_losses={}\nwindow_minimizations={}\nrun_status={}\nstop_reason={}\n",
             summary(&s, dropped, opt.seconds),
             experiment_start.elapsed().as_millis(),
-            s.gesture_guard
+            s.gesture_guard,
+            s.gesture_events,
+            s.foreground_losses,
+            s.minimizations,
+            if result.is_ok() && s.error.is_empty() { "COMPLETED" } else { "COMPLETED_WITH_ERRORS" },
+            s.stop_reason
         );
         println!("{summary}");
         log.event(format!("SUMMARY {}", summary.replace('\n', " | ")));
@@ -425,10 +441,21 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let Some(u) = ui.as_mut() else {
                     return false;
                 };
+                u.shared.lock().unwrap().foreground = GetForegroundWindow() == hwnd;
                 if u.start.elapsed().as_secs() >= u.seconds || EXIT.load(Ordering::Relaxed) {
+                    u.close_requested = true;
+                    let mut s = u.shared.lock().unwrap();
+                    if s.stop_reason.is_empty() {
+                        s.stop_reason = if EXIT.load(Ordering::Relaxed) {
+                            "console stop requested"
+                        } else {
+                            "duration elapsed"
+                        }
+                        .into();
+                    }
                     u.stop.store(true, Ordering::Relaxed);
                 }
-                if u.stop.load(Ordering::Relaxed) && u.worker_done.load(Ordering::Acquire) {
+                if u.close_requested && u.worker_done.load(Ordering::Acquire) {
                     let since = u.drain_started.get_or_insert_with(Instant::now);
                     since.elapsed() >= Duration::from_millis(300)
                 } else {
@@ -444,7 +471,12 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_KEYDOWN if w == 27 => {
             UI.with(|u| {
-                if let Some(u) = u.borrow().as_ref() {
+                if let Some(u) = u.borrow_mut().as_mut() {
+                    u.close_requested = true;
+                    let mut s = u.shared.lock().unwrap();
+                    if s.stop_reason.is_empty() {
+                        s.stop_reason = "Esc requested".into();
+                    }
                     u.stop.store(true, Ordering::Relaxed);
                 }
             });
@@ -454,13 +486,20 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             UI.with(|u| {
                 if let Some(u) = u.borrow().as_ref() {
                     u.stop.store(true, Ordering::Relaxed);
-                    u.shared.lock().unwrap().error = "display changed; experiment stopped".into();
+                    let mut s = u.shared.lock().unwrap();
+                    s.error = "display changed; experiment stopped".into();
+                    s.stop_reason = s.error.clone();
                 }
             });
         }
         WM_CLOSE => {
             UI.with(|u| {
-                if let Some(u) = u.borrow().as_ref() {
+                if let Some(u) = u.borrow_mut().as_mut() {
+                    u.close_requested = true;
+                    let mut s = u.shared.lock().unwrap();
+                    if s.stop_reason.is_empty() {
+                        s.stop_reason = "window close requested".into();
+                    }
                     u.stop.store(true, Ordering::Relaxed);
                 }
             });
@@ -480,6 +519,25 @@ unsafe extern "system" fn ui_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             return 0;
         }
         WM_ERASEBKGND => return 1,
+        WM_SIZE | WM_ACTIVATEAPP => {
+            UI.with(|u| {
+                if let Some(u) = u.borrow().as_ref() {
+                    let mut s = u.shared.lock().unwrap();
+                    s.foreground = GetForegroundWindow() == hwnd;
+                    if msg == WM_ACTIVATEAPP && w == 0 {
+                        s.foreground_losses += 1;
+                    }
+                    if msg == WM_SIZE && w == SIZE_MINIMIZED as usize {
+                        s.minimizations += 1;
+                    }
+                    u.log.event(format!(
+                        "WINDOW_STATE message={msg} value={w} minimized={} foreground={}",
+                        IsIconic(hwnd) != 0,
+                        GetForegroundWindow() == hwnd
+                    ));
+                }
+            });
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, w, l)
@@ -523,7 +581,7 @@ unsafe fn paint_contents(hwnd: HWND, dc: HDC, rc: &RECT, u: &Ui) {
     FillRect(dc, rc, (COLOR_WINDOW + 1) as HBRUSH);
     let (text, points, active, active_colors, pinch_ratio) = {
         let s = u.shared.lock().unwrap();
-        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} | {}\nESC: release and stop | Native mouse remains active",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if s.gesture_guard{"FOREGROUND ONLY"}else{"OFF"},s.error);
+        let text=format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} / events {}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if !s.gesture_guard || s.capture_stopped{"OFF"}else if s.foreground{"ACTIVE (foreground)"}else{"INACTIVE (background)"},s.gesture_events,if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
         (
             text,
             s.points.clone(),
@@ -642,6 +700,7 @@ struct Worker {
     capacity: usize,
     pending_since: Option<Instant>,
     scenarios: Vec<crate::scenarios::Step>,
+    gesture_events: Option<Arc<AtomicU64>>,
 }
 fn worker_loop(
     device: Option<Device>,
@@ -663,7 +722,7 @@ fn worker_loop(
     } else {
         None
     };
-    let worker = Worker {
+    let mut worker = Worker {
         device,
         fields,
         assembler: Assembler::default(),
@@ -680,12 +739,14 @@ fn worker_loop(
         capacity,
         pending_since: None,
         scenarios: crate::scenarios::steps(capacity),
+        gesture_events: None,
     };
     unsafe {
         let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
         let mut gesture_guard = if suppress_gestures {
             let guard = crate::gestures::Guard::create(log.clone())?;
             worker.shared.lock().unwrap().gesture_guard = true;
+            worker.gesture_events = Some(guard.event_counter());
             Some(guard)
         } else {
             None
@@ -800,6 +861,9 @@ impl Worker {
         self.sync_stats();
     }
     fn sync_stats(&self) {
+        if let Some(events) = &self.gesture_events {
+            self.shared.lock().unwrap().gesture_events = events.load(Ordering::Relaxed);
+        }
         if let Some(i) = &self.injector {
             let mut s = self.shared.lock().unwrap();
             s.injected = i.successes();
@@ -870,16 +934,20 @@ impl Worker {
         if self.injector.is_some() {
             unsafe {
                 let mut origin = POINT { x: 40, y: 220 };
-                if IsWindow(self.target as HWND) == 0
-                    || IsIconic(self.target as HWND) != 0
-                    || ClientToScreen(self.target as HWND, &mut origin) == 0
-                    || origin.x != self.rect.left
-                    || origin.y != self.rect.top
-                {
-                    self.error(
-                        "test window moved/minimized/closed; fixed mapping experiment stopped"
-                            .into(),
-                    );
+                let reason = if IsWindow(self.target as HWND) == 0 {
+                    Some("receiver closed; fixed mapping stopped")
+                } else if IsIconic(self.target as HWND) != 0 {
+                    Some("receiver minimized (possible Windows system gesture); injection stopped")
+                } else if ClientToScreen(self.target as HWND, &mut origin) == 0 {
+                    Some("receiver position unavailable; fixed mapping stopped")
+                } else if origin.x != self.rect.left || origin.y != self.rect.top {
+                    Some("receiver moved; fixed mapping stopped")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    self.error(reason.into());
+                    self.shared.lock().unwrap().stop_reason = reason.into();
                     self.stop.store(true, Ordering::Relaxed);
                     PostQuitMessage(0);
                     return;
@@ -938,6 +1006,7 @@ impl Worker {
             self.shared.lock().unwrap().api_us = i.durations().to_vec();
         }
         self.sync_stats();
+        self.shared.lock().unwrap().capture_stopped = true;
         self.log.event(format!(
             "WORKER_STOP active_contacts={} cleanup_pending={}",
             self.injector.as_ref().map_or(0, |i| i.active_count()),
@@ -972,6 +1041,8 @@ unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                         .is_some_and(|d| d.handle == l as usize)
                     {
                         worker.error("selected Raw Input device removed".into());
+                        worker.shared.lock().unwrap().stop_reason =
+                            "selected Raw Input device removed".into();
                         worker.stop.store(true, Ordering::Relaxed);
                         PostQuitMessage(0);
                     }

@@ -22,9 +22,11 @@ Raw Input processing and injection run serially on one worker thread. The receiv
 
 ## Optional foreground gesture ownership
 
-`--suppress-system-gestures` is valid only for physical capture with injection enabled. It creates a TouchpadGesturesController on the input worker, which has the message pump required by the API. The enabled controller declares ThreeFingerManipulations, FourFingerManipulations, ThreeFingerActions, and FourFingerActions (mask `0x1B`). It deliberately does not claim unrelated mouse input or five-finger actions.
+`--suppress-system-gestures` can be used during physical capture or the explicit native self-test. Injection can be omitted in capture mode to isolate physical gesture handling. It creates a TouchpadGesturesController on the input worker, which has the message pump required by the API. All controller interfaces and subscriptions are created and released on that thread. The enabled controller declares ThreeFingerManipulations, FourFingerManipulations, ThreeFingerActions, and FourFingerActions (mask `0x1B`). It deliberately does not claim unrelated mouse input or five-finger actions.
 
 The API routes these gestures to an eligible foreground controller instead of the shell. The controller acts as the destination; the bridge still consumes raw HID coordinates for touch injection. Its Enabled and SupportedGestures properties are read back after activation. Failed activation/readback triggers disabling and reports an error. Normal shutdown disables and verifies the controller before releasing it and uninitializing its WinRT apartment.
+
+IUnknown-based typed delegates subscribe to PointerPressed, PointerMoved, PointerReleased, and GlobalActionPerformed before enabling. Pointer callbacks query ICoreWindowEventArgs, set Handled, and verify its readback; actions have no Handled property and are consumed by the registered action handler. Tokens are revoked before releasing the controller. Atomic reference counts own the delegates, and their shared data consists only of a thread-safe logger and event counter. Actual receipt, sampled movement, handler failures, and receiver activation/minimization are logged. The receiver distinguishes foreground eligibility from merely having enabled the controller. None of these observations guarantees that every physical or injected gesture was suppressed.
 
 No user settings are saved or changed, so there is no registry snapshot or persistent preference to restore after termination. Ownership is process-foreground scoped: background controllers are ignored. The implementation uses the published UniversalApiContract v19 interface prefix from the Windows SDK and checks IsSupported at runtime because the API is experimental. It does not extend support to older systems by undocumented registry writes.
 
@@ -84,6 +86,8 @@ Normal DOWN/UPDATE submissions must hit the dedicated receiver according to Wind
 The receiver only counts messages confirmed as PT_TOUCH by GetPointerInfo and also calls GetPointerTouchInfo. Each system pointer ID has an independent trail, color, and active position. Two received contacts drive a distance ratio and a small scale demonstration; this is a receiver diagnostic rather than proof of third-party gesture support.
 
 Esc, WM_CLOSE, Ctrl+C, and duration expiry request worker shutdown. The worker attempts cancellation before publishing completion. The receiver then continues processing messages for approximately 300 ms before closing, allowing final UP events to arrive. Summaries include contacts remaining on both sides, cleanup failures, and log loss.
+
+Runtime safety stops are distinct from a request to close the receiver. A moved or minimized target stops injection and records the specific reason, but leaves the result window available until explicit close or the original duration expires. It does not force foreground activation, restore a minimized window, or resume injection. Summary fields include stop reason, run status, actual gesture-event count, foreground losses, and minimizations. Normal close itself can cause a final activation loss; use event timestamps when correlating a fault.
 
 Forced termination, process crashes, secure-desktop transitions, or rejected native cleanup can bypass this cooperative path. A successful API return alone does not establish correct receiver delivery or hardware acceptance.
 

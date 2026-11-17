@@ -186,6 +186,7 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
             || line.contains("RELEASE_ERROR")
             || line.contains("WORKER_ERROR")
             || line.contains("GESTURE_GUARD_DISABLE_ERROR")
+            || line.contains("GESTURE_HANDLER_ERROR")
             || line.contains("RENDER_ERROR")
         {
             audit
@@ -201,6 +202,9 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
             }
         }
         if line.contains(" SUMMARY ") {
+            if field(line, "run_status=") == Some("COMPLETED_WITH_ERRORS") {
+                audit.errors.push("run summary reports errors".into());
+            }
             if field(line, "log_dropped=") != Some("0") {
                 audit
                     .errors
@@ -416,5 +420,18 @@ mod tests {
         assert!(!analyze(&log().replace("log_dropped=0", "log_dropped=1"))
             .unwrap()
             .passed());
+    }
+    #[test]
+    fn gesture_handler_errors_fail_even_with_balanced_touch_delivery() {
+        let l = log() + "t_us=4 GESTURE_HANDLER_ERROR pointer event Handled readback was false\n";
+        assert!(!analyze(&l).unwrap().passed());
+    }
+    #[test]
+    fn runtime_stop_in_summary_is_not_a_clean_audit() {
+        let l = log().replace(
+            "SUMMARY log_dropped=0",
+            "SUMMARY run_status=COMPLETED_WITH_ERRORS log_dropped=0",
+        );
+        assert!(!analyze(&l).unwrap().passed());
     }
 }

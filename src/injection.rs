@@ -40,8 +40,7 @@ impl Transport for WindowsTransport {
                     } as usize
                         != self.target
                 {
-                    self.log
-                        .event("INJECT_BLOCKED fixed target unavailable or occluded");
+                    self.log.event(format!("INJECT_BLOCKED fixed target unavailable or occluded minimized={} foreground={} x={} y={}", unsafe {IsIconic(self.target as HWND) != 0}, unsafe {GetForegroundWindow() as usize == self.target},p.point.x,p.point.y));
                     return Err(Failure::TargetUnavailable);
                 }
             }

@@ -16,6 +16,18 @@ pub struct Log {
     start: Instant,
 }
 impl Log {
+    #[cfg(test)]
+    pub fn memory() -> (Self, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::sync_channel(128);
+        (
+            Self {
+                tx,
+                dropped: Arc::new(AtomicU64::new(0)),
+                start: Instant::now(),
+            },
+            rx,
+        )
+    }
     pub fn open(dir: &Path) -> Result<(Self, std::thread::JoinHandle<Result<(), String>>), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let file = OpenOptions::new()

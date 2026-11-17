@@ -33,14 +33,15 @@ fn run() -> Result<(), String> {
         let audit =
             verify::analyze(&std::fs::read_to_string(&args[1]).map_err(|e| e.to_string())?)?;
         println!("{}", audit.json());
-        return if audit.passed() {
-            Ok(())
-        } else {
-            Err("log audit found incomplete or inconsistent touch delivery".into())
-        };
+        // Expected audit failures are already explained by JSON on stdout.
+        // Keep stderr for command/parse errors, which also helps PowerShell 5.
+        if !audit.passed() {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     if args.is_empty() || args == ["--help"] {
-        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\nGesture suppression requires capture+inject and a supported foreground-process API.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
+        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
         return Ok(());
     }
     if args == ["--probe"] {
@@ -103,9 +104,6 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
             "--inject is only used with --capture; --self-test injects automatically".into(),
         );
     }
-    if opt.suppress_gestures && (!opt.inject || opt.mode != "capture") {
-        return Err("--suppress-system-gestures requires --capture --inject".into());
-    }
     Ok(opt)
 }
 
@@ -124,8 +122,6 @@ mod cli_tests {
             vec!["--capture", "--seconds", "0"],
             vec!["--capture", "--device"],
             vec!["--self-test", "--inject"],
-            vec!["--capture", "--suppress-system-gestures"],
-            vec!["--self-test", "--suppress-system-gestures"],
         ] {
             assert!(parse_options(&args(&a)).is_err());
         }
@@ -148,7 +144,7 @@ mod cli_tests {
         }
     }
     #[test]
-    fn gesture_guard_is_explicit_and_capture_only() {
+    fn gesture_guard_is_explicit_and_can_be_exercised_without_hardware() {
         let o = parse_options(&args(&[
             "--capture",
             "--inject",
@@ -156,6 +152,12 @@ mod cli_tests {
         ]))
         .unwrap();
         assert!(o.suppress_gestures);
+        let raw = parse_options(&args(&["--capture", "--suppress-system-gestures"])).unwrap();
+        assert!(raw.suppress_gestures);
+        assert!(!raw.inject);
+        let synthetic =
+            parse_options(&args(&["--self-test", "--suppress-system-gestures"])).unwrap();
+        assert!(synthetic.suppress_gestures);
         let o = parse_options(&args(&["--capture", "--inject"])).unwrap();
         assert!(!o.suppress_gestures);
     }

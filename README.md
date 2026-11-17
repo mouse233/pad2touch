@@ -68,9 +68,11 @@ Each run writes to a new timestamped directory under `artifacts/`. An explicit `
 
 `-SuppressSystemGestures` uses `Windows.UI.Input.TouchpadGesturesController` to claim three- and four-finger touchpad swipes, taps, and presses for the foreground PadBridge process. The current receiver acts as the gesture destination while Raw Input continues supplying contact coordinates. The controller is disabled and released when capture ends. No registry values, persistent gesture preferences, mouse hooks, or device firmware are changed.
 
-The API is experimental and requires runtime support. Check availability with `padbridge-phase0.exe --gesture-support`; `--gesture-check` briefly exercises activation, readback, and release without injecting touch. If the API is unavailable or activation fails, a run requesting suppression fails with a diagnostic rather than claiming gestures were disabled.
+The API is experimental and requires runtime support. Check availability with `padbridge-phase0.exe --gesture-support`; `--gesture-check` briefly exercises activation, handler subscription, readback, and release without injecting touch. If the API is unavailable or activation fails, a run requesting suppression fails with a diagnostic rather than claiming gestures were disabled. The receiver shows `ACTIVE (foreground)` or `INACTIVE (background)` and counts actual controller events. Pointer handlers set and verify `Handled`; this diagnostic does not establish reliable suppression for every gesture.
 
 Ownership only applies while PadBridge is foreground. Switching to another process returns gesture handling to Windows. This does not suppress native mouse movement or Windows' separate touchscreen gestures, and it does not provide background ownership for future third-party target windows.
+
+To isolate physical touchpad gestures, run capture with `-SuppressSystemGestures` and omit `-Inject`. Compare it with injection enabled while keeping the receiver foreground until each test ends. Windows 11 also has a separate **Bluetooth & devices > Touch > Three- and four-finger touch gestures** preference; [Microsoft documents its effect on application touch delivery](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works). The controller does not change that setting.
 
 ## Development and testing
 
@@ -101,6 +103,7 @@ See the [testing guide](docs/testing.md) for procedures and interpretation. Mach
 - Injection targets the receiver's fixed rectangle. Arbitrary target windows, dynamic rectangle tracking, and a full GUI are not implemented.
 - Raw Input does not provide exclusive touchpad capture. Native mouse behavior remains active; optional foreground gesture ownership has the scope and availability limits described above.
 - Moving, minimizing, or covering the receiver may pause or cancel output. Display changes and device removal stop the experiment rather than automatically reconnecting.
+- A runtime safety stop keeps the receiver available for inspection until Esc, close, or the original duration expires. If Windows minimizes it, restore it from the taskbar to read the reason. It does not resume injection automatically.
 - A gap of more than 500 ms in raw reports cancels active injection. Devices that stop reporting stationary contacts require particular attention during hold tests.
 - Unsupported HID layouts are rejected. Windows preparsed data is opaque and is not a portable HID report descriptor.
 - Contact cancellation can be rejected by Windows. Unresolved contacts remain tracked and block new DOWN events; forced termination and crashes cannot guarantee cleanup.

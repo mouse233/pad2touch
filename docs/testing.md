@@ -34,7 +34,15 @@ To temporarily claim three-/four-finger touchpad gestures while the PadBridge re
 .\scripts\Run-PadBridge.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
 ```
 
-Check that the receiver shows `3/4-finger guard: FOREGROUND ONLY`. Repeat three-/four-finger swipes and taps, confirm independent contact trails, and observe whether task switching or desktop actions occur. End capture, then verify ordinary Windows touchpad gestures work again in another foreground application. Gesture-controller activation/readback alone does not establish that physical gesture interception worked.
+Check that the receiver shows `3/4-finger guard: ACTIVE (foreground)`. Repeat three-/four-finger swipes and taps, confirm independent contact trails, and observe whether task switching or desktop actions occur. Do not switch to a chat or another application to report progress while testing. Wait until capture ends before giving feedback. A visible topmost window is not necessarily the foreground window: `INACTIVE (background)` means that the controller is ineligible. End capture, then verify ordinary Windows touchpad gestures work again in another foreground application. Gesture-controller activation/readback alone does not establish that physical gesture interception worked.
+
+For isolation, run a separate capture without injection:
+
+```powershell
+.\scripts\Run-PadBridge.ps1 -Mode capture -SuppressSystemGestures -Contacts 5 -Seconds 30
+```
+
+No received touch trails are expected in this run. Review `GESTURE_EVENT`, `GESTURE_HANDLER_ERROR`, and `WINDOW_STATE` records and compare timestamps. Then repeat with `-Inject`. A system action during raw-only capture cannot have been caused by PadBridge's injected touches. A failure only with injection calls for separate investigation of touchscreen gesture handling. If needed, open `ms-settings:devices-touch` and manually compare the Windows three-/four-finger **Touch** preference on and off, restoring the original preference afterward. PadBridge does not modify this setting.
 
 The option does not modify Windows preferences. If unavailable, the requested run fails before capture. Do not report suppression as working simply because capture without the option succeeds. If conflicts persist, distinguish physical touchpad shell gestures from Windows' separate three-/four-finger touchscreen gestures; see the [Microsoft explanation](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works).
 
@@ -76,6 +84,8 @@ Hold multiple contacts and press Esc. Repeat with duration expiry while contacts
 
 Occlusion, minimization, window movement, display changes, and device removal are cancellation tests. Keep them separate from clean gesture runs, since intentionally triggered runtime errors require manual interpretation. Forced process termination is not a substitute for cooperative shutdown testing.
 
+A runtime safety stop keeps the result window until explicit close or the original duration expires. If minimized, restore it from the taskbar and inspect the stop reason; it must remain stopped and release contacts rather than automatically rearm. Check that the gesture controller is disabled even while the result window is retained.
+
 ## Optional native API exercise
 
 ```powershell
@@ -83,6 +93,8 @@ Occlusion, minimization, window movement, display changes, and device removal ar
 ```
 
 This command submits **real native touch input** using synthetic coordinates. It covers dragging, holds, quick taps, two-finger pinch/expand, partial release, replacement, and concurrent contacts. A successful synthetic exercise does not replace physical touchpad testing.
+
+Add `-SuppressSystemGestures` to check coexistence with the controller. Start with `-Contacts 1` to avoid the separate three-/four-finger touchscreen gesture layer, then test capacity 5 independently. Run native checks on the ordinary interactive desktop; restricted execution contexts may reject injection or prevent receiver delivery. Keep input and focus undisturbed during an automated sequence.
 
 ## Interpret logs
 
@@ -93,5 +105,7 @@ This command submits **real native touch input** using synthetic coordinates. It
 Review `summary.txt` and `analysis.json`, including parse failures, incomplete frames, injection errors, log loss, receiver lifecycle errors, remaining contacts, and cleanup status. Injection batch counts need not equal received message counts because Windows can coalesce UPDATE messages.
 
 The verifier checks complete lifetimes and ordered coordinates. `passed=true` means that these log checks succeeded. It does not by itself prove every manual scenario, visual behavior, edge coordinate, hold duration, or compatibility requirement passed.
+
+The wrapper saves the audit JSON and emits a warning for failed touch-delivery checks by default. This does not convert a failure to a pass. Use `-Strict` on `Analyze-Run.ps1` or `Run-PadBridge.ps1` when an automated workflow needs a terminating failure. Native `--verify-log` retains its nonzero exit code for failed audits. Command errors, missing files, and invalid arguments remain errors.
 
 Record each manual outcome locally as passed, failed, or not tested, with the observation and any scope exception. Preserve the distinction between a confirmed failure, an untested boundary, and a hardware-specific reserved region. Review device paths, usernames, local directories, and screen content before sharing diagnostics.

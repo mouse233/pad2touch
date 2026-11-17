@@ -7,6 +7,10 @@ use std::{
     marker::PhantomData,
     ptr::{null_mut, NonNull},
     rc::Rc,
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc,
+    },
 };
 use windows_sys::core::GUID;
 
@@ -37,13 +41,19 @@ struct Inspectable {
     get_trust: *const c_void,
 }
 #[repr(C)]
+struct Unknown {
+    query: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+#[repr(C)]
 struct Statics {
     base: Inspectable,
     is_supported: unsafe extern "system" fn(*mut c_void, *mut u8) -> i32,
     create: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
 }
-// Only the published prefix through SupportedGestures is used. The following
-// event registration methods remain owned by the runtime, not fabricated here.
+type AddHandler = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i64) -> i32;
+type RemoveHandler = unsafe extern "system" fn(*mut c_void, i64) -> i32;
 #[repr(C)]
 struct Controller {
     base: Inspectable,
@@ -51,6 +61,203 @@ struct Controller {
     set_enabled: unsafe extern "system" fn(*mut c_void, u8) -> i32,
     get_gestures: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32,
     set_gestures: unsafe extern "system" fn(*mut c_void, i32) -> i32,
+    add_pressed: AddHandler,
+    remove_pressed: RemoveHandler,
+    add_moved: AddHandler,
+    remove_moved: RemoveHandler,
+    add_released: AddHandler,
+    remove_released: RemoveHandler,
+    add_action: AddHandler,
+    remove_action: RemoveHandler,
+}
+const IID_POINTER_HANDLER: GUID = GUID {
+    data1: 0x0b05a28c,
+    data2: 0x2064,
+    data3: 0x5b06,
+    data4: [0x94, 0xf3, 0x32, 0x4f, 0xb0, 0x04, 0xec, 0xe0],
+};
+const IID_ACTION_HANDLER: GUID = GUID {
+    data1: 0x3fdb14d0,
+    data2: 0xc3b2,
+    data3: 0x576e,
+    data4: [0xb9, 0x00, 0xaa, 0xa1, 0x4e, 0x0f, 0xf7, 0x7c],
+};
+const IID_CORE_ARGS: GUID = GUID {
+    data1: 0x272b1ef3,
+    data2: 0xc633,
+    data3: 0x4da5,
+    data4: [0xa2, 0x6c, 0xc6, 0xd0, 0xf5, 0x6b, 0x29, 0xda],
+};
+const IID_UNKNOWN: GUID = GUID {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+const IID_AGILE: GUID = GUID {
+    data1: 0x94ea2b94,
+    data2: 0xe9cc,
+    data3: 0x49e0,
+    data4: [0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90],
+};
+#[repr(C)]
+struct CoreArgs {
+    base: Inspectable,
+    get_handled: unsafe extern "system" fn(*mut c_void, *mut u8) -> i32,
+    set_handled: unsafe extern "system" fn(*mut c_void, u8) -> i32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Event {
+    Pressed,
+    Moved,
+    Released,
+    Action,
+}
+impl Event {
+    fn methods(self, v: &Controller) -> (AddHandler, RemoveHandler) {
+        match self {
+            Self::Pressed => (v.add_pressed, v.remove_pressed),
+            Self::Moved => (v.add_moved, v.remove_moved),
+            Self::Released => (v.add_released, v.remove_released),
+            Self::Action => (v.add_action, v.remove_action),
+        }
+    }
+    fn iid(self) -> &'static GUID {
+        if self == Self::Action {
+            &IID_ACTION_HANDLER
+        } else {
+            &IID_POINTER_HANDLER
+        }
+    }
+}
+#[repr(C)]
+struct SinkVtable {
+    base: Unknown,
+    invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
+}
+#[repr(C)]
+struct Sink {
+    vtable: &'static SinkVtable,
+    refs: AtomicU32,
+    event: Event,
+    log: Log,
+    count: Arc<AtomicU64>,
+}
+static SINK_VTABLE: SinkVtable = SinkVtable {
+    base: Unknown {
+        query: sink_query,
+        add_ref: sink_add_ref,
+        release: sink_release,
+    },
+    invoke: sink_invoke,
+};
+fn same_guid(a: &GUID, b: &GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+unsafe extern "system" fn sink_query(
+    this: *mut c_void,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> i32 {
+    if this.is_null() || iid.is_null() || out.is_null() {
+        return 0x80004003u32 as i32;
+    }
+    *out = null_mut();
+    let sink = &*(this as *const Sink);
+    if same_guid(&*iid, &IID_UNKNOWN)
+        || same_guid(&*iid, &IID_AGILE)
+        || same_guid(&*iid, sink.event.iid())
+    {
+        *out = this;
+        sink_add_ref(this);
+        0
+    } else {
+        0x80004002u32 as i32
+    }
+}
+unsafe extern "system" fn sink_add_ref(this: *mut c_void) -> u32 {
+    (&*(this as *const Sink))
+        .refs
+        .fetch_add(1, Ordering::Relaxed)
+        + 1
+}
+unsafe extern "system" fn sink_release(this: *mut c_void) -> u32 {
+    let old = (&*(this as *const Sink))
+        .refs
+        .fetch_sub(1, Ordering::Release);
+    if old == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this as *mut Sink));
+        0
+    } else {
+        old - 1
+    }
+}
+unsafe fn handle_pointer(args: *mut c_void) -> Result<(), String> {
+    if args.is_null() {
+        return Err("pointer event arguments are null".into());
+    }
+    let unknown = &**(args as *const *const Unknown);
+    let mut raw = null_mut();
+    checked(
+        "PointerEventArgs.QueryInterface(ICoreWindowEventArgs)",
+        (unknown.query)(args, &IID_CORE_ARGS, &mut raw),
+    )?;
+    let core = Object::owned(raw)?;
+    checked(
+        "PointerEventArgs.Handled=true",
+        (core.vtable::<CoreArgs>().set_handled)(core.raw(), 1),
+    )?;
+    let mut value = 0;
+    checked(
+        "PointerEventArgs.get_Handled",
+        (core.vtable::<CoreArgs>().get_handled)(core.raw(), &mut value),
+    )?;
+    if value == 0 {
+        return Err("pointer event Handled readback was false".into());
+    }
+    Ok(())
+}
+unsafe extern "system" fn sink_invoke(
+    this: *mut c_void,
+    _sender: *mut c_void,
+    args: *mut c_void,
+) -> i32 {
+    let sink = &*(this as *const Sink);
+    let count = sink.count.fetch_add(1, Ordering::Relaxed) + 1;
+    let result = if sink.event == Event::Action {
+        Ok(())
+    } else {
+        handle_pointer(args)
+    };
+    match result {
+        Ok(()) => {
+            if sink.event != Event::Moved || count.is_multiple_of(32) {
+                sink.log.event(format!(
+                    "GESTURE_EVENT kind={:?} handled=true count={count}",
+                    sink.event
+                ));
+            }
+            0
+        }
+        Err(error) => {
+            sink.log.event(format!(
+                "GESTURE_HANDLER_ERROR kind={:?} {error}",
+                sink.event
+            ));
+            0x80004005u32 as i32
+        }
+    }
+}
+fn new_sink(event: Event, log: Log, count: Arc<AtomicU64>) -> Object {
+    let sink = Box::new(Sink {
+        vtable: &SINK_VTABLE,
+        refs: AtomicU32::new(1),
+        event,
+        log,
+        count,
+    });
+    unsafe { Object::owned(Box::into_raw(sink).cast()).expect("boxed delegate is non-null") }
 }
 fn checked(name: &str, result: i32) -> Result<(), String> {
     if result >= 0 {
@@ -106,7 +313,7 @@ impl Object {
 }
 impl Drop for Object {
     fn drop(&mut self) {
-        unsafe { (self.vtable::<Inspectable>().release)(self.raw()) };
+        unsafe { (self.vtable::<Unknown>().release)(self.raw()) };
     }
 }
 fn factory() -> Result<Option<Object>, String> {
@@ -219,46 +426,71 @@ impl Control for Object {
         Ok(())
     }
 }
-/// Must be created and dropped on the input worker, which pumps messages.
+/// Must be created and dropped on one thread with a message pump.
 pub struct Guard {
     controller: Object,
     // COM interfaces must be released before uninitializing the apartment.
     _apartment: Apartment,
     log: Log,
     enabled: bool,
+    subscriptions: Vec<(Event, i64, Object)>,
+    events: Arc<AtomicU64>,
 }
 impl Guard {
     pub fn create(log: Log) -> Result<Self, String> {
         let apartment = Apartment::new()?;
-        let factory=factory()?.ok_or("foreground touchpad gesture API is unavailable; use Windows touchpad gesture settings or --keep-system-gestures")?;
+        let factory=factory()?.ok_or("foreground touchpad gesture API is unavailable; use Windows touchpad settings or omit --suppress-system-gestures")?;
         if !supported(&factory)? {
-            return Err("foreground touchpad gesture ownership is unsupported on this system; use Windows touchpad settings or --keep-system-gestures".into());
+            return Err("foreground touchpad gesture ownership is unsupported on this system; use Windows touchpad settings or omit --suppress-system-gestures".into());
         }
         let mut raw = null_mut();
         checked("TouchpadGesturesController.CreateForProcess", unsafe {
             (factory.vtable::<Statics>().create)(factory.raw(), &mut raw)
         })?;
-        let mut controller = unsafe { Object::owned(raw)? };
-        enable(&mut controller)?;
-        log.event(
-            "GESTURE_GUARD enabled scope=foreground-process fingers=3,4 settings_changed=false",
-        );
-        Ok(Self {
+        let controller = unsafe { Object::owned(raw)? };
+        let mut guard = Self {
             controller,
             _apartment: apartment,
             log,
             enabled: true,
-        })
+            subscriptions: vec![],
+            events: Arc::new(AtomicU64::new(0)),
+        };
+        guard.controller.set_enabled(false)?;
+        for event in [Event::Pressed, Event::Moved, Event::Released, Event::Action] {
+            let sink = new_sink(event, guard.log.clone(), guard.events.clone());
+            let mut token = 0;
+            checked("TouchpadGesturesController.subscribe", unsafe {
+                let (add, _) = event.methods(guard.controller.vtable::<Controller>());
+                add(guard.controller.raw(), sink.raw(), &mut token)
+            })?;
+            guard.subscriptions.push((event, token, sink));
+        }
+        enable(&mut guard.controller)?;
+        guard.log.event("GESTURE_GUARD enabled scope=foreground-process fingers=3,4 handlers=4 settings_changed=false");
+        Ok(guard)
     }
     pub fn disable(&mut self) -> Result<(), String> {
         if self.enabled {
             self.controller.set_enabled(false)?;
-            self.controller.verify(THREE_FOUR_FINGER_MASK, false)?;
+            let mut value = 1;
+            checked("TouchpadGesturesController.get_Enabled", unsafe {
+                (self.controller.vtable::<Controller>().get_enabled)(
+                    self.controller.raw(),
+                    &mut value,
+                )
+            })?;
+            if value != 0 {
+                return Err("gesture controller did not disable".into());
+            }
             self.enabled = false;
             self.log
                 .event("GESTURE_GUARD disabled settings_changed=false");
         }
         Ok(())
+    }
+    pub fn event_counter(&self) -> Arc<AtomicU64> {
+        self.events.clone()
     }
 }
 impl Drop for Guard {
@@ -267,12 +499,141 @@ impl Drop for Guard {
             self.log
                 .event(format!("GESTURE_GUARD_DISABLE_ERROR {error}"));
         }
+        for (event, token, _) in &self.subscriptions {
+            let result = unsafe {
+                let (_, remove) = event.methods(self.controller.vtable::<Controller>());
+                remove(self.controller.raw(), *token)
+            };
+            if let Err(error) = checked("TouchpadGesturesController.unsubscribe", result) {
+                self.log.event(format!("GESTURE_HANDLER_ERROR {error}"));
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    #[repr(C)]
+    struct FakeArgs {
+        table: *const CoreArgs,
+        refs: Cell<u32>,
+        handled: Cell<u8>,
+        ignore_handled: bool,
+    }
+    unsafe extern "system" fn args_query(
+        this: *mut c_void,
+        iid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        *out = null_mut();
+        if same_guid(&*iid, &IID_CORE_ARGS) {
+            *out = this;
+            args_addref(this);
+            0
+        } else {
+            0x80004002u32 as i32
+        }
+    }
+    unsafe extern "system" fn args_addref(this: *mut c_void) -> u32 {
+        let a = &*(this as *const FakeArgs);
+        a.refs.set(a.refs.get() + 1);
+        a.refs.get()
+    }
+    unsafe extern "system" fn args_release(this: *mut c_void) -> u32 {
+        let a = &*(this as *const FakeArgs);
+        a.refs.set(a.refs.get() - 1);
+        a.refs.get()
+    }
+    unsafe extern "system" fn args_get(this: *mut c_void, out: *mut u8) -> i32 {
+        *out = (&*(this as *const FakeArgs)).handled.get();
+        0
+    }
+    unsafe extern "system" fn args_set(this: *mut c_void, value: u8) -> i32 {
+        let a = &*(this as *const FakeArgs);
+        if !a.ignore_handled {
+            a.handled.set(value);
+        }
+        0
+    }
+    fn args_table() -> CoreArgs {
+        CoreArgs {
+            base: Inspectable {
+                query: args_query,
+                add_ref: args_addref,
+                release: args_release,
+                get_iids: std::ptr::null(),
+                get_name: std::ptr::null(),
+                get_trust: std::ptr::null(),
+            },
+            get_handled: args_get,
+            set_handled: args_set,
+        }
+    }
+    #[test]
+    fn pointer_delegate_handles_events_and_balances_com_references() {
+        let table = args_table();
+        let mut args = FakeArgs {
+            table: &table,
+            refs: Cell::new(1),
+            handled: Cell::new(0),
+            ignore_handled: false,
+        };
+        let (log, records) = Log::memory();
+        let count = Arc::new(AtomicU64::new(0));
+        let sink = new_sink(Event::Pressed, log, count.clone());
+        unsafe {
+            let mut interface = null_mut();
+            assert_eq!(
+                sink_query(sink.raw(), &IID_POINTER_HANDLER, &mut interface),
+                0
+            );
+            assert_eq!(interface, sink.raw());
+            assert_eq!(sink_release(interface), 1);
+            assert!(sink_query(sink.raw(), &IID_ACTION_HANDLER, &mut interface) < 0);
+            assert!(interface.is_null());
+            assert_eq!(
+                (sink.vtable::<SinkVtable>().invoke)(
+                    sink.raw(),
+                    null_mut(),
+                    (&mut args as *mut FakeArgs).cast()
+                ),
+                0
+            );
+        }
+        assert_eq!(args.handled.get(), 1);
+        assert_eq!(args.refs.get(), 1);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        drop(sink);
+        assert!(records
+            .try_iter()
+            .any(|l| l.contains("GESTURE_EVENT kind=Pressed handled=true")));
+    }
+    #[test]
+    fn pointer_handler_rejects_null_and_failed_handled_readback() {
+        let table = args_table();
+        let mut args = FakeArgs {
+            table: &table,
+            refs: Cell::new(1),
+            handled: Cell::new(0),
+            ignore_handled: true,
+        };
+        unsafe {
+            assert!(handle_pointer(null_mut()).is_err());
+            assert!(handle_pointer((&mut args as *mut FakeArgs).cast()).is_err());
+        }
+        assert_eq!(args.refs.get(), 1);
+        let (log, records) = Log::memory();
+        let sink = new_sink(Event::Moved, log, Arc::new(AtomicU64::new(0)));
+        unsafe {
+            assert!(sink_invoke(sink.raw(), null_mut(), null_mut()) < 0);
+        }
+        drop(sink);
+        assert!(records
+            .try_iter()
+            .any(|l| l.contains("GESTURE_HANDLER_ERROR")));
+    }
     #[derive(Default)]
     struct Fake {
         ops: Vec<String>,
