@@ -103,45 +103,53 @@ struct Gui {
 /// Screen area choices, Wacom-style: presets first, then custom portions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
-    Diagnostic,
     Desktop,
     Monitor(usize),
     ScreenPortion,
+    /// A window's whole client area, or a dragged part of it.
     Window,
-    WindowPortion,
+    /// PadBridge's own receiver, for checking touch delivery.
+    Diagnostic,
 }
 impl Choice {
     fn uses_window(self) -> bool {
-        matches!(self, Self::Window | Self::WindowPortion)
-    }
-    fn selects_area(self) -> bool {
-        matches!(self, Self::ScreenPortion | Self::WindowPortion)
+        self == Self::Window
     }
 }
+/// Whole screen(s) first, then a portion, a window, and the test area last.
+/// A single monitor is listed once (it is the whole desktop).
 fn choices(monitors: usize) -> Vec<Choice> {
-    let mut list = vec![Choice::Diagnostic, Choice::Desktop];
-    list.extend((0..monitors).map(Choice::Monitor));
-    list.extend([Choice::ScreenPortion, Choice::Window, Choice::WindowPortion]);
+    let mut list = match monitors {
+        0 => vec![Choice::Desktop],
+        1 => vec![Choice::Monitor(0)],
+        n => std::iter::once(Choice::Desktop)
+            .chain((0..n).map(Choice::Monitor))
+            .collect(),
+    };
+    list.extend([Choice::ScreenPortion, Choice::Window, Choice::Diagnostic]);
     list
 }
 fn choice_label(choice: Choice, monitors: &[mapping::MonitorEntry]) -> String {
     match choice {
-        Choice::Diagnostic => "Diagnostic area (test)".into(),
         Choice::Desktop => "Full desktop".into(),
         Choice::Monitor(i) => match monitors.get(i) {
             Some(m) => {
                 let (w, h) = mapping::size(m.rect);
-                format!(
-                    "Monitor {} · {w}×{h}{}",
-                    i + 1,
-                    if m.primary { " (main)" } else { "" }
-                )
+                if monitors.len() == 1 {
+                    format!("Screen · {w}×{h}")
+                } else {
+                    format!(
+                        "Monitor {} · {w}×{h}{}",
+                        i + 1,
+                        if m.primary { " (main)" } else { "" }
+                    )
+                }
             }
             None => format!("Monitor {}", i + 1),
         },
         Choice::ScreenPortion => "Portion of screen…".into(),
         Choice::Window => "Application window".into(),
-        Choice::WindowPortion => "Portion of window…".into(),
+        Choice::Diagnostic => "Test area (inside PadBridge)".into(),
     }
 }
 /// What an in-progress overlay selection will configure.
@@ -831,6 +839,7 @@ impl Gui {
         usize::try_from(index)
             .ok()
             .and_then(|i| self.choices.get(i).copied())
+            .or_else(|| self.choices.first().copied())
             .unwrap_or(Choice::Diagnostic)
     }
     unsafe fn select_choice(&self, choice: Choice) {
@@ -838,8 +847,10 @@ impl Gui {
         SendMessageW(self.item(TARGET), CB_SETCURSEL, index, 0);
     }
     /// (Re)build the screen area list from the connected monitors, keeping the
-    /// current choice; a disconnected monitor falls back to the diagnostic area.
+    /// current choice. The first fill and a disconnected monitor select the
+    /// first entry (the whole screen).
     unsafe fn fill_targets(&mut self) {
+        let first_fill = self.choices.is_empty();
         let previous = self.choice();
         let previous_device = match previous {
             Choice::Monitor(i) => self.monitors.get(i).map(|m| m.device.clone()),
@@ -859,9 +870,14 @@ impl Gui {
                     Some(i) => Choice::Monitor(i),
                     None => {
                         self.last_status = "The selected monitor was disconnected.".into();
-                        Choice::Diagnostic
+                        self.choices[0]
                     }
                 }
+            }
+            _ if first_fill => self.choices[0],
+            // Full desktop and the single "Screen" entry are the same area.
+            (Choice::Desktop, _) | (Choice::Monitor(_), _) if self.monitors.len() == 1 => {
+                Choice::Monitor(0)
             }
             (other, _) => other,
         };
@@ -890,18 +906,14 @@ impl Gui {
                 .screen_rect
                 .map(|bounds| MappingTarget::ScreenRectangle { bounds })
                 .ok_or_else(|| "Click Select area… and drag a screen rectangle.".into()),
-            Choice::Window => self
-                .selected_window()
-                .map(|handle| MappingTarget::Window { handle })
-                .ok_or_else(|| "Choose an application window from the list.".into()),
-            Choice::WindowPortion => {
+            Choice::Window => {
                 let handle = self
                     .selected_window()
                     .ok_or("Choose an application window from the list.")?;
-                let area = self
-                    .window_area
-                    .ok_or("Click Select area… and drag inside the window.")?;
-                Ok(MappingTarget::WindowRectangle { handle, area })
+                Ok(match self.window_area {
+                    Some(area) => MappingTarget::WindowRectangle { handle, area },
+                    None => MappingTarget::Window { handle },
+                })
             }
             Choice::Diagnostic => Ok(MappingTarget::Diagnostics),
         }
@@ -1055,7 +1067,12 @@ impl Gui {
                 "Drag to select the screen area to map. Esc or right-click cancels.",
             )
             .map(|_| self.pending_selection = Some(Pending::Screen)),
-            Choice::WindowPortion => self
+            Choice::Window if self.window_area.is_some() => {
+                self.window_area = None;
+                self.refresh_diagram_preview();
+                self.show_target_preview()
+            }
+            Choice::Window => self
                 .selected_window()
                 .ok_or("Choose an application window first.".to_string())
                 .and_then(|handle| mapping::window_client(handle).map(|client| (handle, client)))
@@ -1064,11 +1081,9 @@ impl Gui {
                     overlay::begin(
                         self.hwnd,
                         client,
-                        "Drag inside the window to select the mapped area. Esc or right-click cancels.",
+                        "Drag inside the window to map only that part. Esc or right-click cancels.",
                     )
-                    .map(|_| {
-                        self.pending_selection = Some(Pending::WindowArea { handle, client })
-                    })
+                    .map(|_| self.pending_selection = Some(Pending::WindowArea { handle, client }))
                 }),
             _ => self.show_target_preview(),
         };
@@ -1137,8 +1152,7 @@ impl Gui {
                 .get(i)
                 .map_or("Disconnected".into(), |m| at(m.rect)),
             Choice::ScreenPortion => self.screen_rect.map_or("Not selected".into(), at),
-            Choice::Window => "Whole client area".into(),
-            Choice::WindowPortion => self.window_area.map_or("Not selected".into(), |a| {
+            Choice::Window => self.window_area.map_or("Whole window".into(), |a| {
                 format!(
                     "{:.0}–{:.0}% × {:.0}–{:.0}%",
                     a.left * 100.0,
@@ -1390,10 +1404,11 @@ impl Gui {
         );
         set_text(
             self.item(AREA),
-            if choice.selects_area() {
-                "Select area…"
-            } else {
-                "Show area"
+            match choice {
+                Choice::ScreenPortion => "Select area…",
+                Choice::Window if self.window_area.is_some() => "Whole window",
+                Choice::Window => "Select part…",
+                _ => "Show area",
             },
         );
         set_text(self.item(TARGET_INFO), &self.target_info());
@@ -1907,14 +1922,19 @@ mod tests {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             pump_for(Duration::from_millis(100));
             with(|g| {
-                assert_eq!(
-                    g.choice(),
-                    Choice::Diagnostic,
-                    "diagnostic target is the default"
-                );
-                assert_eq!(g.target().unwrap(), MappingTarget::Diagnostics);
+                assert_eq!(g.choice(), g.choices[0], "the whole screen is the default");
+                assert_ne!(g.choice(), Choice::Diagnostic);
+                assert!(matches!(
+                    g.target().unwrap(),
+                    MappingTarget::ScreenRectangle { .. }
+                ));
                 assert_eq!(IsWindowEnabled(g.item(WINDOW)), 0);
-                assert_eq!(IsWindowEnabled(g.item(AREA)), 0);
+                assert_ne!(IsWindowEnabled(g.item(AREA)), 0, "Show area");
+                assert_eq!(
+                    *g.choices.last().unwrap(),
+                    Choice::Diagnostic,
+                    "test area is listed last"
+                );
             });
 
             let host = Host::spawn("pmv2");
@@ -1933,25 +1953,27 @@ mod tests {
             });
             choose(hwnd, WINDOW, index);
             with(|g| {
+                // Choosing a window maps its whole client area right away.
                 assert_eq!(
                     g.target().unwrap(),
                     MappingTarget::Window { handle: host.hwnd }
                 );
+                assert_eq!(g.target_info(), "Whole window");
                 assert_ne!(IsWindowEnabled(g.item(AREA)), 0);
             });
+
+            // Emergency stop cancels an in-progress selection.
             click(hwnd, AREA);
+            assert!(crate::overlay::active());
+            SendMessageW(hwnd, WM_HOTKEY, EMERGENCY as usize, 0);
+            pump_for(Duration::from_millis(100));
             with(|g| {
-                assert!(
-                    g.last_status.starts_with("Mapped region"),
-                    "{}",
-                    g.last_status
-                );
-                assert!(crate::overlay::outline_visible());
+                assert!(!crate::overlay::active());
+                assert!(g.pending_selection.is_none());
+                assert!(g.window_area.is_none(), "cancel keeps the whole window");
             });
 
-            // Window rectangle: drag the central half of the client area.
-            choose(hwnd, TARGET, index_of(Choice::WindowPortion));
-            with(|g| assert!(g.target().is_err(), "area not selected yet"));
+            // Select part…: drag the central half of the client area.
             click(hwnd, AREA);
             with(|g| {
                 assert!(g.pending_selection.is_some());
@@ -1981,19 +2003,25 @@ mod tests {
                 );
                 assert_ne!(IsWindowEnabled(g.item(TARGET)), 0);
                 assert!(g.target_info().contains('%'));
+                assert!(crate::overlay::outline_visible(), "preview outline");
             });
             pump_for(Duration::from_millis(300));
             std::fs::create_dir_all("artifacts").unwrap();
             save_client_bitmap(hwnd, "artifacts/diagram-window-portion.bmp");
 
-            // Emergency stop also cancels an in-progress selection.
+            // The same button returns to the whole window.
             click(hwnd, AREA);
-            SendMessageW(hwnd, WM_HOTKEY, EMERGENCY as usize, 0);
-            pump_for(Duration::from_millis(100));
             with(|g| {
-                assert!(!crate::overlay::active());
-                assert!(g.pending_selection.is_none());
-                assert!(g.window_area.is_some(), "cancel keeps the previous area");
+                assert!(g.window_area.is_none());
+                assert_eq!(
+                    g.target().unwrap(),
+                    MappingTarget::Window { handle: host.hwnd }
+                );
+                assert!(
+                    g.last_status.starts_with("Mapped region"),
+                    "{}",
+                    g.last_status
+                );
             });
 
             // Screen rectangle: drag in virtual-desktop coordinates.
@@ -2024,7 +2052,7 @@ mod tests {
             });
 
             // A closed target window is dropped from the selection.
-            choose(hwnd, TARGET, index_of(Choice::WindowPortion));
+            choose(hwnd, TARGET, index_of(Choice::Window));
             host.close();
             SendMessageW(
                 hwnd,
@@ -2078,26 +2106,47 @@ mod tests {
             primary,
             device: String::new(),
         };
+        // One monitor: listed once, as the whole screen.
+        let single = [monitor(0, true)];
+        let list = choices(single.len());
+        assert_eq!(
+            list,
+            [
+                Choice::Monitor(0),
+                Choice::ScreenPortion,
+                Choice::Window,
+                Choice::Diagnostic
+            ]
+        );
+        let labels: Vec<_> = list.iter().map(|&c| choice_label(c, &single)).collect();
+        assert_eq!(
+            labels,
+            [
+                "Screen · 2560×1440",
+                "Portion of screen…",
+                "Application window",
+                "Test area (inside PadBridge)"
+            ]
+        );
+        // Several monitors: full desktop, then each monitor, main first.
         let monitors = [monitor(0, true), monitor(-2560, false)];
         let list = choices(monitors.len());
         assert_eq!(
             list,
             [
-                Choice::Diagnostic,
                 Choice::Desktop,
                 Choice::Monitor(0),
                 Choice::Monitor(1),
                 Choice::ScreenPortion,
                 Choice::Window,
-                Choice::WindowPortion
+                Choice::Diagnostic
             ]
         );
         let labels: Vec<_> = list.iter().map(|&c| choice_label(c, &monitors)).collect();
-        assert_eq!(labels[2], "Monitor 1 · 2560×1440 (main)");
-        assert_eq!(labels[3], "Monitor 2 · 2560×1440");
-        assert!(labels[4].ends_with('…') && labels[6].ends_with('…'));
-        assert!(Choice::ScreenPortion.selects_area() && !Choice::Monitor(0).selects_area());
-        assert!(Choice::WindowPortion.uses_window() && !Choice::Desktop.uses_window());
+        assert_eq!(labels[1], "Monitor 1 · 2560×1440 (main)");
+        assert_eq!(labels[2], "Monitor 2 · 2560×1440");
+        assert_eq!(choices(0)[0], Choice::Desktop);
+        assert!(Choice::Window.uses_window() && !Choice::ScreenPortion.uses_window());
     }
 
     /// The Wacom-style diagram is drawn for screen targets, with the red
@@ -2152,10 +2201,13 @@ mod tests {
             assert!(!monitors.is_empty());
             with(|g| {
                 assert_eq!(g.monitors.len(), monitors.len());
-                assert_eq!(g.choices.len(), monitors.len() + 5);
+                assert_eq!(g.choices, choices(monitors.len()));
             });
 
             choose(hwnd, Choice::Monitor(0));
+            // Let the requested thumbnail capture (150 ms) happen.
+            pump_for(Duration::from_millis(250));
+            InvalidateRect(panel, null(), 0);
             pump_for(Duration::from_millis(100));
             let (area, dpi) = with(|g| {
                 assert_eq!(
@@ -2221,7 +2273,7 @@ mod tests {
             pump_for(Duration::from_millis(300));
             assert_eq!(with(|g| g.thumbnail_captures), captured, "resize");
             // Changing the screen area requests exactly one new capture.
-            choose(hwnd, Choice::Desktop);
+            choose(hwnd, Choice::ScreenPortion);
             pump_for(Duration::from_millis(300));
             InvalidateRect(panel, null(), 0);
             pump_for(Duration::from_millis(100));

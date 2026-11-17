@@ -117,10 +117,11 @@ pub fn cancel() {
 }
 
 fn finish(result: Option<RECT>, destroy: bool) {
-    let Some(selection) = SELECTION.with(|s| s.borrow_mut().take()) else {
+    // try_with: may run from a destructor during thread teardown.
+    let Some(selection) = SELECTION.try_with(|s| s.borrow_mut().take()).ok().flatten() else {
         return;
     };
-    RESULT.with(|r| *r.borrow_mut() = Some(result));
+    let _ = RESULT.try_with(|r| *r.borrow_mut() = Some(result));
     unsafe {
         if GetCapture() == selection.hwnd {
             ReleaseCapture();
@@ -311,7 +312,9 @@ pub fn flash(bounds: RECT, millis: u32) -> Result<(), String> {
 }
 
 pub fn hide_outline() {
-    let hwnd = OUTLINE.with(|o| std::mem::replace(&mut *o.borrow_mut(), null_mut()));
+    let hwnd = OUTLINE
+        .try_with(|o| std::mem::replace(&mut *o.borrow_mut(), null_mut()))
+        .unwrap_or(null_mut());
     if !hwnd.is_null() {
         unsafe { DestroyWindow(hwnd) };
     }

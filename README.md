@@ -14,7 +14,7 @@ PadBridge reads absolute finger coordinates through Windows Raw Input, maps them
 - Read the touchpad's declared physical size, logical ranges, coordinate density and observed report/frame/scan cadence.
 
 **Mapping**
-- **Screen area**, chosen like a pen tablet: full desktop, a specific monitor, a dragged portion of the screen, an application window's client area, or a dragged portion of a window. Physical pixels throughout, including negative multi-monitor coordinates and per-monitor DPI.
+- **Screen area**, chosen like a pen tablet: the whole screen (or a specific monitor), a dragged portion of the screen, or an application window's client area, optionally narrowed to a dragged part of it. Physical pixels throughout, including negative multi-monitor coordinates and per-monitor DPI.
 - **Touchpad area**, for when the touchpad's shape differs from the screen area: use the whole pad and keep its shape, stretch the whole pad, or use a centered part of the pad to fill the whole area.
 - A **mapping diagram** shows your monitors, the touchpad at its physical shape, the mapped region in red, and live finger positions during capture.
 - Window targets are followed live: moving or resizing retargets, minimizing or hiding pauses and releases contacts, closing stops. Touches where another window covers the target are blocked instead of reaching the wrong application.
@@ -39,16 +39,14 @@ cargo build --release --locked
 ```
 
 1. **Input device:** pick your touchpad. The diagnostics panel shows its physical size.
-2. **Screen area:** choose where touches go.
+2. **Screen area:** choose where touches go. The whole screen is the default.
 
    | Choice | What it maps to |
    |---|---|
-   | Diagnostic area (test) | The receiver inside PadBridge, for checking touch delivery |
-   | Full desktop | All monitors (when they form a rectangle) |
-   | Monitor N | One display |
+   | Screen · W×H | The whole screen. With several monitors this becomes **Full desktop** plus one **Monitor N** entry per display |
    | Portion of screen… | **Select area…**, then drag on the dimmed desktop |
-   | Application window | A window from the list (client area, without title bar) |
-   | Portion of window… | Choose a window, **Select area…**, drag inside it |
+   | Application window | A window from the list (client area, without title bar). **Select part…** narrows it to a dragged part; **Whole window** goes back |
+   | Test area (inside PadBridge) | PadBridge's own receiver, for checking touch delivery |
 
 3. **Touchpad:** choose how shapes are reconciled.
 
@@ -59,7 +57,7 @@ cargo build --release --locked
    | Part of pad · fill area | Centered part with the area's shape; touches outside are ignored | All of it | Undistorted |
 
    For example, a 1.6:1 touchpad mapped to a tall phone-emulator window either leaves most of the window unreachable (keep shape), squeezes movement horizontally (stretch), or uses only the middle strip of the pad (fill area).
-4. **Show area** flashes the mapped region on screen. The diagram shows the same region.
+4. The diagram shows the mapped region; **Show area** also flashes it on screen.
 5. Click **Start capture**, or pick Toggle/Hold and **Enable shortcut** (Ctrl+Alt+F8–F11). Touch the pad and lift all fingers once to arm.
 6. **Stop / disarm**, Esc in PadBridge, or Ctrl+Alt+Esc anywhere stops capture and releases all contacts.
 
