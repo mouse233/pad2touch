@@ -59,7 +59,7 @@ The option changes user-wide settings during its interval; native pointer moveme
 
 ## Window layout and repainting
 
-The default client area is 820 by 480 logical pixels, scaled using the monitor DPI; minimum client size is 760 by 470. Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint stretch or anchor to the client bounds; controls are not vertically compressed.
+The default client area is 820 by 512 logical pixels, scaled using the monitor DPI; minimum client size is 760 by 504. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint stretch or anchor to the client bounds; controls are not vertically compressed.
 
 Native labels, group boxes and read-only status fields use the system COLOR_BTNFACE brush through the control-color messages. Editable/selectable input surfaces retain their system theme. Transparent group boxes and sibling clipping preserve overlapping control ordering. The parent paints its background under group boxes, with no blanket WS_CLIPCHILDREN exclusion.
 

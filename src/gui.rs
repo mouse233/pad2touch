@@ -35,8 +35,8 @@ const DIAGNOSTICS_GROUP: usize = 111;
 const LOG_PATH: usize = 112;
 const STATUS: usize = 113;
 const STOP_HINT: usize = 114;
-const DEFAULT_CLIENT: (i32, i32) = (820, 480);
-const MIN_CLIENT: (i32, i32) = (760, 470);
+const DEFAULT_CLIENT: (i32, i32) = (820, 512);
+const MIN_CLIENT: (i32, i32) = (760, 504);
 const PANEL_LEFT: i32 = 274;
 const PANEL_TOP: i32 = 28;
 
@@ -189,8 +189,9 @@ fn run_window() -> Result<(), String> {
                 result = Err(winerr("GetMessageW(GUI)"));
                 break;
             }
-            // Esc works even while a native child control has keyboard focus.
-            if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize {
+            // Esc works even while a native child control has keyboard focus. With no
+            // focus window, Windows delivers keys to the active window as WM_SYSKEYDOWN.
+            if is_plain_escape(&msg) {
                 GUI.with(|slot| {
                     if let Some(g) = slot.borrow_mut().as_mut() {
                         g.disarm("Emergency stop requested.");
@@ -387,7 +388,8 @@ impl Gui {
             WS_TABSTOP,
             [136, 396, 122, 26],
         )?;
-        g.status = g.add("STATIC", "", STATUS, 0, [8, 432, 250, 32])?;
+        // Four lines: the state plus up to three wrapped lines of detail.
+        g.status = g.add("STATIC", "", STATUS, 0, [8, 432, 250, 64])?;
         let emergency_label = g.add(
             "STATIC",
             "Emergency stop: Ctrl + Alt + Esc (or Esc here)",
@@ -880,6 +882,24 @@ impl Gui {
         self.update_controls();
         InvalidateRect(self.panel, null(), 0);
     }
+    /// Disabling the focused control (e.g. Start right after it is clicked) sets
+    /// focus to NULL, which leaves the window without keyboard navigation.
+    /// Move focus to the next usable button, or the window itself.
+    unsafe fn keep_focus(&self) {
+        if GetActiveWindow() != self.hwnd {
+            return;
+        }
+        let focus = GetFocus();
+        if !focus.is_null() && IsWindowEnabled(focus) != 0 {
+            return;
+        }
+        let next = [STOP, START]
+            .into_iter()
+            .map(|id| self.item(id))
+            .find(|&h| IsWindowEnabled(h) != 0)
+            .unwrap_or(self.hwnd);
+        SetFocus(next);
+    }
     unsafe fn update_controls(&self) {
         let locked = self.session.is_some() || self.controller.enabled || self.closing;
         for id in [DEVICE, REFRESH, MODE, CONTACTS, INJECT, GUARD, TARGET] {
@@ -903,6 +923,7 @@ impl Gui {
             self.item(STOP),
             i32::from(!self.closing && (self.controller.enabled || self.session.is_some())),
         );
+        self.keep_focus();
         set_text(
             self.item(START),
             if self.selection(MODE) == 0 {
@@ -936,6 +957,14 @@ impl Gui {
         };
         set_text(self.status, &format!("{state}\r\n{info}"));
     }
+}
+
+/// Esc as WM_KEYDOWN, or as WM_SYSKEYDOWN without Alt (lParam bit 29), which is
+/// how it arrives when no window has focus. Alt+Esc stays the system window switch.
+fn is_plain_escape(msg: &MSG) -> bool {
+    msg.wParam == VK_ESCAPE as usize
+        && (msg.message == WM_KEYDOWN
+            || (msg.message == WM_SYSKEYDOWN && msg.lParam & (1 << 29) == 0))
 }
 
 unsafe fn set_text(hwnd: HWND, text: &str) -> bool {
@@ -1167,6 +1196,99 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn escape_is_recognized_without_focus_but_not_alt_escape() {
+        let key = |message, lparam| MSG {
+            message,
+            wParam: VK_ESCAPE as usize,
+            lParam: lparam,
+            ..Default::default()
+        };
+        assert!(is_plain_escape(&key(WM_KEYDOWN, 0)));
+        // No focus window: Esc reaches the active window as WM_SYSKEYDOWN.
+        assert!(is_plain_escape(&key(WM_SYSKEYDOWN, 0)));
+        // Alt+Esc is the system window switch.
+        assert!(!is_plain_escape(&key(WM_SYSKEYDOWN, 1 << 29)));
+        assert!(!is_plain_escape(&key(WM_KEYUP, 0)));
+        let mut other = key(WM_KEYDOWN, 0);
+        other.wParam = VK_RETURN as usize;
+        assert!(!is_plain_escape(&other));
+    }
+
+    #[test]
+    #[ignore = "shows and activates an idle native window; no device, hotkey, capture or settings changes"]
+    fn native_gui_focus_moves_off_disabled_controls() {
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            register("PadBridgeGui", Some(window_proc)).unwrap();
+            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            let hwnd = CreateWindowExW(
+                0,
+                wide("PadBridgeGui").as_ptr(),
+                wide("PadBridge focus regression").as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                40,
+                40,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            let mut g = Gui::new(hwnd).unwrap();
+            g.refresh_devices();
+            SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
+            let (start, stop) = (g.item(START), g.item(STOP));
+            GUI.with(|slot| *slot.borrow_mut() = Some(g));
+            GUI.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let g = slot.as_mut().unwrap();
+                g.layout();
+                g.update_controls();
+            });
+            ShowWindow(hwnd, SW_SHOW);
+            SetActiveWindow(hwnd);
+            pump_for(Duration::from_millis(100));
+            assert_eq!(GetActiveWindow(), hwnd, "window could not be activated");
+            // Start when a device is present, else another control the lock disables.
+            let first = if IsWindowEnabled(start) != 0 {
+                start
+            } else {
+                GetDlgItem(hwnd, MODE as i32)
+            };
+            SetFocus(first);
+            assert_eq!(GetFocus(), first);
+            // Same lock state as an enabled shortcut, without registering one.
+            GUI.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let g = slot.as_mut().unwrap();
+                g.controller.mode = TakeoverMode::Toggle;
+                g.controller.enabled = true;
+                g.update_controls();
+            });
+            assert_eq!(IsWindowEnabled(first), 0);
+            assert_eq!(GetFocus(), stop, "focus was left on a disabled control");
+            SendMessageW(hwnd, WM_COMMAND, STOP, 0);
+            assert_eq!(IsWindowEnabled(stop), 0);
+            let expected = if IsWindowEnabled(start) != 0 {
+                start
+            } else {
+                hwnd
+            };
+            assert_eq!(
+                GetFocus(),
+                expected,
+                "focus was left on the disabled Stop button"
+            );
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            GUI.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
 
     unsafe fn assert_live_layout(hwnd: HWND) {
         GUI.with(|slot| {
