@@ -26,6 +26,8 @@ cargo build --release --locked
 .\experiments\Test-BackgroundGestureSettings.ps1 -Mode apply -ExpectedBuild YOUR_REVIEWED_BUILD -Seconds 75 -RunDirectory artifacts\YOUR_NEW_EXPERIMENT
 ```
 
+For a physical test, add `-WaitForStart`: an operator-controlled dialog appears before any settings change, and the timed test starts only after OK. A start tone and a successful-restoration tone distinguish the interval from ordinary restored operation. Begin the gestures promptly and lift all fingers before the ending tone. `-CaptureExecutable` can pin a previously validated capture binary while unrelated development continues in the checkout.
+
 `-ExpectedBuild` is an operator acknowledgement of the exact experimental build, not an automatic compatibility check. Unrecognized registry types, missing prerequisites, failed cache reads, or mismatching existing registry/cache values prevent mutation. Absent registry values are preserved as absent; the snapshot also records their pre-experiment cached defaults.
 
 The script preserves the existence, type, and original DWORD bytes of only these names under `HKCU\Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad`:
@@ -42,6 +44,8 @@ Once active, it runs a raw-only, minimized PadBridge capture for the requested d
 Normal completion and failures after mutation request exact restoration. The recovery process also attempts restoration when its parent exits or its deadline expires. The original existence/type/bytes and cache values are checked after restoration; originally missing values are removed again instead of being restored as enabled DWORDs. Changed external values are retained and reported for review. A per-run mutex serializes normal and watchdog restoration.
 
 The same per-run lock also protects the mutation marker and four registry writes. The writer checks the recovery marker, deadline, and watchdog under that lock, so an expired or restored run cannot write disabled values afterward. A persistent lease under the current user's local application data (`PadBridge/ExperimentalGestureCache/active.json`) records the active journal across checkout/process lifetimes. A new apply is rejected while an earlier lease lacks verified restoration; the original settings are re-read only after this check under a global mutex. A damaged lease fails closed and requires manual recovery review. Recovery artifacts are local and never part of a source commit.
+
+Deadline normalization preserves UTC and subsecond precision for both ISO strings and DateTime objects returned by PowerShell JSON deserialization. The pure self-test covers both representations. A successful settings-cache notification, a completed capture timer, and verified restoration are separate from the operator's physical suppression result; test activity must overlap the recorded active interval.
 
 After the experiment, confirm `restored.json` reports exact registry/cache restoration and check ordinary gestures physically. Preserve the entire local directory until recovery is verified. To retry recovery explicitly:
 

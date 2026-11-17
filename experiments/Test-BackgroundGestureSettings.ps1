@@ -3,11 +3,14 @@ param(
     [string]$ExpectedBuild,
     [ValidateRange(15,120)][int]$Seconds=75,
     [string]$RunDirectory,
-    [string]$Journal
+    [string]$Journal,
+    [string]$CaptureExecutable,
+    [switch]$WaitForStart
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
 $helper=Join-Path $repoPath 'artifacts\gesture-cache-probe.exe'
+$captureExe=if($CaptureExecutable){[IO.Path]::GetFullPath($CaptureExecutable)}else{Join-Path $repoPath 'target\release\padbridge-phase0.exe'}
 $subkey='Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad'
 $names=@('ThreeFingerTapEnabled','FourFingerTapEnabled','ThreeFingerSlideEnabled','FourFingerSlideEnabled')
 $leaseDirectory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'PadBridge\ExperimentalGestureCache'
@@ -26,6 +29,12 @@ function Get-RestoreAction($old,$current) {
     if(Test-SamePreference $old $current){return 'already-original'}
     if($current.exists -and $current.kind -ceq 'DWord' -and $current.bytes -ceq 'AAAAAA=='){return 'restore-owned-zero'}
     return 'conflict'
+}
+function Get-DeadlineUtc($value) {
+    # PowerShell 7 can materialize JSON ISO timestamps as DateTime. Passing
+    # that object through Parse(string) loses its zone and subsecond precision.
+    if($value -is [DateTime]){return $value.ToUniversalTime()}
+    return [DateTime]::Parse([string]$value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
 }
 function Save-NewJson([string]$path,$value) {
     $json=$value | ConvertTo-Json -Depth 8
@@ -106,6 +115,7 @@ function Restore-Preferences([string]$path) {
         foreach($p in $j.preferences){if($cache[$p.name] -ne [uint32]$p.cacheValue){throw ('Cache restoration mismatch: '+$p.name)}}
         Save-NewJson $done ([ordered]@{restored=$true;registry_exact=$true;cache_exact=$true;utc=[DateTime]::UtcNow.ToString('o')})
         Write-Host 'Exact registry presence/type/bytes and cache values restored.'
+        try {[Console]::Beep(650,250)} catch {}
     } finally {if($held){$lock.ReleaseMutex()};$lock.Dispose()}
 }
 
@@ -117,7 +127,13 @@ if($Mode -eq 'self-test'){
     foreach($case in @(@($absent,$zero,'restore-owned-zero'),@($one,$zero,'restore-owned-zero'),@($one,$one,'already-original'),@($absent,$absent,'already-original'),@($one,$two,'conflict'),@($absent,$two,'conflict'))){
         if((Get-RestoreAction $case[0] $case[1]) -cne $case[2]){throw 'Restoration decision self-test failed'}
     }
-    Write-Output 'restoration_decision_tests=6 passed; registry_access=false'
+    $utcText='2099-12-31T11:46:57.2856908Z'
+    $jsonDate=('{"deadlineUtc":"'+$utcText+'"}') | ConvertFrom-Json
+    $expectedTicks=[DateTime]::Parse($utcText,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).Ticks
+    foreach($value in @($utcText,$jsonDate.deadlineUtc)){
+        if((Get-DeadlineUtc $value).Ticks -ne $expectedTicks){throw 'Deadline timezone/precision regression'}
+    }
+    Write-Output 'restoration_decision_tests=6 passed; deadline_roundtrip_tests=2 passed; registry_access=false'
     return
 }
 if(!(Test-Path -LiteralPath $helper)){throw 'Compile experiments/gesture-cache-probe.rs into artifacts/gesture-cache-probe.exe first'}
@@ -129,11 +145,26 @@ if($Mode -eq 'watchdog'){
     Save-NewJson (Join-Path $dir 'watchdog-ready.json') ([ordered]@{pid=$PID;ready=$true})
     while(!(Test-Path -LiteralPath (Join-Path $dir 'restored.json'))){
         $parent=Get-Process -Id $j.parentPid -ErrorAction SilentlyContinue
-        if($null -eq $parent -or $parent.StartTime.ToUniversalTime().Ticks -ne [long]$j.parentStartedTicks -or [DateTime]::UtcNow -ge [DateTime]::Parse($j.deadlineUtc).ToUniversalTime()){break}
+        if($null -eq $parent -or $parent.StartTime.ToUniversalTime().Ticks -ne [long]$j.parentStartedTicks -or [DateTime]::UtcNow -ge (Get-DeadlineUtc $j.deadlineUtc)){break}
         Start-Sleep -Milliseconds 250
     }
     if(!(Test-Path -LiteralPath (Join-Path $dir 'restored.json'))){Restore-Preferences $Journal}
     return
+}
+if($WaitForStart){
+    if($Mode -ne 'apply'){throw '-WaitForStart is only valid with apply'}
+    if(!('PadBridgeExperimentStart' -as [type])){
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PadBridgeExperimentStart {
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int MessageBox(IntPtr owner, string text, string caption, uint flags);
+}
+'@
+    }
+    $choice=[PadBridgeExperimentStart]::MessageBox([IntPtr]::Zero,"Click OK only when ready to operate the touchpad immediately. After activation, test three- and four-finger swipes and taps for $Seconds seconds, then lift all fingers. A start tone and restoration tone mark the test. Settings are unchanged while this dialog is open.",'PadBridge - start bounded gesture test',0x50041)
+    if($choice -ne 1){Write-Output 'Experiment cancelled before any preference changes.';return}
 }
 $version=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $cache=Read-Cache
@@ -147,7 +178,7 @@ if($Mode -eq 'probe'){
 if(!$ExpectedBuild -or $ExpectedBuild -cne $version.CurrentBuildNumber){throw 'Apply requires -ExpectedBuild matching the explicitly reviewed current Windows build; no automatic version compatibility is claimed'}
 foreach($p in $original){if($p.exists -and [BitConverter]::ToUInt32([Convert]::FromBase64String($p.bytes),0) -ne $p.cacheValue){throw ('Registry/cache prerequisite mismatch: '+$p.name)}}
 if(!$RunDirectory){throw '-RunDirectory is required for apply'}
-if(!(Test-Path -LiteralPath (Join-Path $repoPath 'target\release\padbridge-phase0.exe'))){throw 'Build the raw capture executable before applying settings'}
+if(!(Test-Path -LiteralPath $captureExe)){throw 'Build the raw capture executable before applying settings'}
 $runPath=[IO.Path]::GetFullPath($RunDirectory)
 $allowedRoot=[IO.Path]::GetFullPath((Join-Path $repoPath 'artifacts'))+[IO.Path]::DirectorySeparatorChar
 if(!$runPath.StartsWith($allowedRoot,[StringComparison]::OrdinalIgnoreCase)){throw 'RunDirectory must be under this checkout artifacts directory'}
@@ -197,7 +228,7 @@ try {
         try {
             try {$writeHeld=$writeLock.WaitOne(3000)} catch [Threading.AbandonedMutexException] {$writeHeld=$true}
             if(!$writeHeld){throw 'Recovery owns the mutation lock; refusing to write'}
-            if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge [DateTime]::Parse($j.deadlineUtc).ToUniversalTime()){throw 'Recovery completed, unavailable, or expired before mutation; refusing to write'}
+            if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge (Get-DeadlineUtc $j.deadlineUtc)){throw 'Recovery completed, unavailable, or expired before mutation; refusing to write'}
             $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$true)
             if($null -eq $key){throw 'Cannot open the exact preferences key for this experiment'}
             try {
@@ -212,10 +243,11 @@ try {
         Reload-Cache
         $disabled=Read-Cache
         foreach($name in $names){if($disabled[$name] -ne 0){throw ('Disabled cache readback mismatch: '+$name)}}
-        if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge [DateTime]::Parse($j.deadlineUtc).ToUniversalTime()){throw 'Recovery began before capture; refusing to start'}
+        if((Test-Path -LiteralPath (Join-Path $runPath 'restored.json')) -or $watchdog.HasExited -or [DateTime]::UtcNow -ge (Get-DeadlineUtc $j.deadlineUtc)){throw 'Recovery began before capture; refusing to start'}
         Save-NewJson (Join-Path $runPath 'active.json') ([ordered]@{active=$true;utc=[DateTime]::UtcNow.ToString('o');capture_target_seconds=$Seconds;watchdog_deadline_utc=$j.deadlineUtc;scope='current-user';undocumented=$true})
         Write-Host "Experimental override active; capture target=$Seconds seconds; watchdog deadline UTC=$($j.deadlineUtc); journal=$journalPath"
-        & (Join-Path $repoPath 'target\release\padbridge-phase0.exe') --capture --background --contacts 5 --seconds $Seconds --out (Join-Path $runPath 'capture')
+        try {[Console]::Beep(1100,250)} catch {}
+        & $captureExe --capture --background --contacts 5 --seconds $Seconds --out (Join-Path $runPath 'capture')
         if($LASTEXITCODE -ne 0){throw 'Background capture failed; restoring preferences'}
     } finally {
         if($mutationStarted){Restore-Preferences $journalPath}
