@@ -1,99 +1,52 @@
 # PadBridge
 
-**Map a Windows Precision Touchpad to native touchscreen input.**
+**Turn a Windows Precision Touchpad into a touchscreen.**
 
-PadBridge reads absolute finger coordinates through Windows Raw Input, maps them to a screen rectangle, and submits native touch frames through `InjectTouchInput`. It runs in user mode, without installing a driver or modifying another application.
+PadBridge reads absolute finger positions from your touchpad through Windows Raw Input and replays them as native multitouch input (`InjectTouchInput`) on a window or region of your screen. It runs entirely in user mode — no driver, no hooks into the target application.
 
-The current implementation is an experimental single-touch and multitouch MVP with a native Windows GUI. The GUI integrates device selection, manual and hotkey capture controls, and the touch diagnostic receiver. Phase 3 adds mapping to an application window's client area, a sub-rectangle of a window, or any desktop rectangle, following window movement and resizing. Persistent configuration and production reliability work remain future stages.
+> **Status:** experimental. Expect rough edges; settings are not saved between launches yet.
 
 ## Features
 
-- Discover HID touchpad collections with usage page `0x0D`, usage `0x05`.
-- Select and refresh touchpads from the GUI; run repeatable sessions without closing the window.
-- Start/stop manually, toggle with a global shortcut, or capture while holding a shortcut.
-- Parse Contact ID, Tip Switch, Confidence, and X/Y using Windows HID descriptor information.
-- Assemble parallel and hybrid reports into complete contact frames.
-- Map absolute touchpad coordinates into the diagnostic receiver, an application window's client area, a selected rectangle inside a window, or a selected desktop rectangle (including negative multi-monitor coordinates), in physical screen pixels and preserving the device-declared physical aspect.
-- Follow a target window as it moves or resizes, pause and release contacts while it is minimized, hidden or cloaked, stop when it closes, and block touches where another window covers the target.
-- Inspect physical dimensions, logical X/Y ranges, coordinate density/DPI and observed report/frame/scan cadence.
-- Track a single finger or inject synchronized frames containing up to five contacts.
-- Preserve contact identity across report reordering, partial lifts, and finger replacement.
-- Commit contact state only after successful injection, retry `ERROR_NOT_READY`, and cancel contacts when capture stops or encounters an error.
-- Display received `PT_TOUCH` contacts as separate colored trails, with a two-finger distance/scale demonstration.
-- Optionally claim three- and four-finger touchpad gestures while PadBridge is the foreground process, using the official gesture controller API.
-- Render the diagnostic window through a reusable back buffer to avoid background-erasure flicker.
-- Check recorded event lifecycles and coordinates with an offline log verifier.
+- Up to 5 simultaneous contacts, delivered as real `PT_TOUCH` events (not mouse emulation)
+- Map the touchpad to a whole window, a rectangle inside a window, or any desktop rectangle — the mapping follows the window as it moves or resizes
+- Preserves the touchpad's physical aspect ratio
+- Native GUI with device picker, Start/Stop, and global Toggle / Hold shortcuts
+- Built-in diagnostic view with per-finger trails and device info (size, DPI, report rate)
+- Optional suppression of Windows' three-/four-finger touchpad gestures while capturing
 
-PadBridge produces touch events rather than mouse-click substitutes. Native touchpad pointer movement, clicks, and scrolling remain active. System gestures remain active unless a gesture guard is explicitly selected. The optional GUI background guard temporarily changes user-wide gesture settings and restores them after capture.
+## Requirements
 
-## Build
+- Windows x64 with a Precision Touchpad
+- Rust (stable, MSVC toolchain) with Visual C++ build tools and a Windows SDK
 
-Requirements:
-
-- Windows x64 with the Raw Input and Touch Injection APIs.
-- A recent stable Rust MSVC toolchain.
-- Visual C++ build tools and a Windows SDK.
-- A Precision Touchpad exposed as a Raw Input HID collection for physical-input capture.
+## Getting started
 
 ```powershell
 cargo build --release --locked
+.\target\release\padbridge-phase0.exe
 ```
 
-The executable currently retains the original package name: `target\release\padbridge-phase0.exe`.
+The GUI opens idle. Pick a touchpad and a mapping target, then click **Start capture** (or enable a shortcut, Ctrl+Alt+F8 – F11). Touch the pad and lift all fingers once to arm injection.
 
-## Run
+**Ctrl+Alt+Esc** stops capture from anywhere.
 
-Run from the repository directory in a normal PowerShell session. Basic operation is intended to work without administrator privileges.
+Command-line modes (probe, raw capture, self-test, …) are available through the helper script:
 
 ```powershell
-# Open the GUI (also the executable's default with no arguments).
-.\scripts\Run-PadBridge.ps1 -Mode gui
-# Or: .\target\release\padbridge-phase0.exe --gui
-
-# Discover available touchpad collections.
 .\scripts\Run-PadBridge.ps1 -Mode probe
-
-# Capture raw input without injecting touch.
-.\scripts\Run-PadBridge.ps1 -Mode capture -Contacts 5 -Seconds 120
-
-# Verify raw receipt while another app stays foreground; start minimized.
-.\scripts\Run-PadBridge.ps1 -Mode capture -Background -Contacts 5 -Seconds 75
-
-# Single-contact mode.
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 1 -Seconds 120
-
-# Synchronized multitouch mode.
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 180
-
-# Claim three-/four-finger touchpad gestures while PadBridge is foreground.
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
+.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 120
 ```
 
-The GUI opens idle. Choose a device, contact capacity, and manual / Toggle / Hold mode, then click **Start capture** or **Enable shortcut**. Shortcuts are selectable from Ctrl+Alt+F8 through Ctrl+Alt+F11. **Stop / disarm** disarms shortcut activation as well as stopping capture. Ctrl+Alt+Esc is the global emergency stop when registration succeeds; Esc also stops capture while the GUI has focus. Registration failures are shown in the UI. Clear **Inject native touch input** for raw-only diagnostics.
+## Limitations
 
-The original colored trails, counters, errors, and two-finger scale demonstration are embedded in the main window. Stopping retains the diagnostics and waits for cleanup before allowing another session. Mapping currently uses that diagnostic area; future screen/window modes are clearly marked and cannot start capture. GUI settings are not persisted. See the [GUI guide](docs/gui.md) for behavior and extension points.
+- Windows routes injected touches by hit testing, so the target must stay visible. Touches over a covering window are dropped.
+- Apps running elevated (as administrator) may reject the input.
+- The touchpad keeps acting as a mouse at the same time; Raw Input cannot capture it exclusively.
 
-For CLI capture, use `-Device N` when more than one collection is available. The contact capacity can be set from 1 to 5; actual input remains limited by the device.
+See the [GUI guide](docs/gui.md) and [architecture notes](docs/architecture.md) for the full list.
 
-At startup, touch the pad and lift all fingers once. Injection waits for a complete clear frame before entering `ARMED`. Keep the receiver window visible and stationary. Press Esc, close the window, use Ctrl+C, or wait for the timer to request cancellation and shutdown.
-
-Each run writes to a new timestamped directory under `artifacts/`. An explicit `--out` directory containing an existing `events.log` is rejected to avoid overwriting an earlier run.
-
-### Experimental GUI background guard
-
-Select **Background guard (experimental)** under **Windows system gestures** to use the settings-cache route validated on the local Windows build. It is off by default, restricted to build 26300.9974, and bounded to 120 seconds per session. The existing exact snapshot/restore transaction, durable journal, global lease, and independent recovery watchdog are embedded with the GUI adapter. Capture starts after successful activation; stop releases contacts before settings restoration. New sessions wait for verified recovery. Raw-only GUI capture can stay minimized or background. This remains an experimental user-wide preference override; simultaneous native touch injection and forced-termination recovery need separate acceptance. See the [GUI guide](docs/gui.md).
-
-### Temporary foreground system-gesture ownership
-
-`-SuppressSystemGestures` uses `Windows.UI.Input.TouchpadGesturesController` to claim three- and four-finger touchpad swipes, taps, and presses for the foreground PadBridge process. The current receiver acts as the gesture destination while Raw Input continues supplying contact coordinates. The controller is disabled and released when capture ends. No registry values, persistent gesture preferences, mouse hooks, or device firmware are changed.
-
-The API is experimental and requires runtime support. Check availability with `padbridge-phase0.exe --gesture-support`; `--gesture-check` briefly exercises activation, handler subscription, readback, and release without injecting touch. If the API is unavailable or activation fails, a run requesting suppression fails with a diagnostic rather than claiming gestures were disabled. The receiver shows `ACTIVE (foreground)` or `INACTIVE (background)` and counts actual controller events. Pointer handlers set and verify `Handled`; this diagnostic does not establish reliable suppression for every gesture.
-
-Ownership only applies while PadBridge is foreground. Switching to another process returns gesture handling to Windows. This does not suppress native mouse movement or Windows' separate touchscreen gestures, and it does not provide background ownership for future third-party target windows.
-
-To isolate physical touchpad gestures, run capture with `-SuppressSystemGestures` and omit `-Inject`. Compare it with injection enabled while keeping the receiver foreground until each test ends. Windows 11 also has a separate **Bluetooth & devices > Touch > Three- and four-finger touch gestures** preference; [Microsoft documents its effect on application touch delivery](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works). The controller does not change that setting.
-
-## Development and testing
+## Development
 
 ```powershell
 cargo test --locked
@@ -101,44 +54,22 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
-Default tests do not open windows or inject input. Two optional recording tests require local HID fixtures and are ignored by default; see [fixture documentation](tests/fixtures/README.md).
-
-An optional synthetic API exercise submits **real native touch input** to the receiver window. Run it only when ready to interact with the desktop:
-
-```powershell
-.\scripts\Run-PadBridge.ps1 -Mode self-test -Contacts 5 -Seconds 40
-```
-
-To audit an existing run without injecting input:
-
-```powershell
-.\scripts\Analyze-Run.ps1 -RunDirectory artifacts\YOUR_RUN
-```
-
-See the [testing guide](docs/testing.md) for procedures and interpretation. Machine-specific test results are kept locally and are not part of the repository.
-
-## Current limitations
-
-- `InjectTouchInput` has no window parameter: Windows delivers touches by hit testing. PadBridge blocks DOWN/UPDATE points that another window covers, but the target must remain visible. Targets at a higher integrity level (for example, running as administrator) may reject injected input; the GUI warns but cannot bypass this. Target selection is not persisted across launches.
-- Raw Input does not provide exclusive touchpad capture. Native mouse behavior remains active; optional foreground gesture ownership has the scope and availability limits described above.
-- Moving, minimizing, or covering the receiver may pause or cancel output. Display changes and device removal stop the experiment rather than automatically reconnecting.
-- A runtime safety stop keeps the receiver available for inspection until Esc, close, or the original duration expires. If Windows minimizes it, restore it from the taskbar to read the reason. It does not resume injection automatically.
-- A gap of more than 500 ms in raw reports cancels active injection. Devices that stop reporting stationary contacts require particular attention during hold tests.
-- Unsupported HID layouts are rejected. Windows preparsed data is opaque and is not a portable HID report descriptor.
-- Contact cancellation can be rejected by Windows. Unresolved contacts remain tracked and block new DOWN events; forced termination and crashes cannot guarantee cleanup.
-- The two-finger demonstration uses coordinates received by the test window. It does not establish gesture compatibility with every application.
+Default tests never open windows or inject input. See the [testing guide](docs/testing.md) for hardware tests and log analysis.
 
 ## Documentation
 
-- [Technical whitepaper and development specification (Chinese)](docs/PadBridge.md)
-- [Architecture and implementation decisions](docs/architecture.md)
-- [Testing guide](docs/testing.md)
-- [GUI controls and mapping extension points](docs/gui.md)
-- [Background capture and gesture-suppression feasibility](docs/background-gesture-feasibility.md)
-- [Third-party notices](docs/third-party-notices.md)
+- [GUI guide](docs/gui.md)
+- [Architecture](docs/architecture.md)
+- [Testing](docs/testing.md)
+- [Background capture & gesture suppression research](docs/background-gesture-feasibility.md)
+- [Design spec (Chinese)](docs/PadBridge.md)
 
-## License and privacy
+## Acknowledgments
 
-PadBridge's original code and accompanying documentation are licensed under the [MIT License](LICENSE). Dependencies retain their own licenses.
+Huge thanks to **[JohnAZoidberg/tapview](https://github.com/JohnAZoidberg/tapview)**, the touchpad visualizer whose Windows Raw Input / HID approach showed the way and inspired this project. PadBridge is an independent implementation — no Tapview code is included.
 
-The program has no telemetry or network-upload feature and does not record ordinary keyboard input. Raw reports, logs, screenshots, local test reports, private HID recordings, build artifacts, credentials, and machine configuration are excluded by `.gitignore`. Review diagnostics before sharing them: device instance paths and screen content can be machine-specific.
+Thanks also to the [windows-rs](https://github.com/microsoft/windows-rs) project. See [third-party notices](docs/third-party-notices.md) for details.
+
+## License
+
+[MIT](LICENSE). PadBridge has no telemetry or network features. Logs written to `artifacts/` may contain device paths — review them before sharing.
