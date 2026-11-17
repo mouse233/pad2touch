@@ -768,6 +768,17 @@ impl Gui {
                 SetWindowPos(hwnd, null_mut(), x, y, w, h, flags);
             }
         }
+        // The group box overlaps this child. Keep the receiver above it so
+        // WindowFromPoint and native touch delivery reach the receiver itself.
+        SetWindowPos(
+            self.panel,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         self.refresh_preview_rect();
         // Queued redraw avoids reentrant WM_PAINT while GUI's RefCell is borrowed.
         RedrawWindow(
@@ -2197,6 +2208,11 @@ mod tests {
             });
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             pump_for(Duration::from_millis(100));
+            // The decorative group must not intercept the receiver's area.
+            let mut receiver_point = POINT { x: 100, y: 100 };
+            assert_ne!(ClientToScreen(panel, &mut receiver_point), 0);
+            assert_ne!(ScreenToClient(hwnd, &mut receiver_point), 0);
+            assert_eq!(ChildWindowFromPointEx(hwnd, receiver_point, 0), panel);
             let monitors = mapping::monitors();
             assert!(!monitors.is_empty());
             with(|g| {
