@@ -1,30 +1,152 @@
-//! Target selection boundary for Phase 3. Unimplemented targets fail explicitly.
+//! Phase 3 target selection and resolution.
+//!
+//! Pure geometry (normalized client areas, drag rectangles, virtual-screen
+//! validation, hit policies and the dynamic target tracker) is separated from
+//! Win32 queries so it can be tested without windows or touch injection.
+//! All resolved bounds are physical desktop pixels with exclusive right/bottom.
+use std::mem::size_of;
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::Gdi::ClientToScreen,
-    UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
+    Graphics::{
+        Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
+        Gdi::{ClientToScreen, MonitorFromPoint, MONITOR_DEFAULTTONULL},
+    },
+    Security::*,
+    System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    },
+    UI::{
+        HiDpi::{
+            AreDpiAwarenessContextsEqual, GetDpiForWindow, GetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        },
+        WindowsAndMessaging::*,
+    },
 };
 
-#[derive(Clone, Copy, Default)]
-pub enum MappingTarget {
-    #[default]
-    Diagnostics,
-    ScreenRectangle {
-        bounds: RECT,
-    },
-    Window {
-        handle: usize,
-    },
-    WindowRectangle {
-        handle: usize,
-        client_bounds: RECT,
-    },
+/// Smallest selectable target edge in physical pixels.
+pub const MIN_TARGET_PX: i32 = 16;
+
+/// A rectangle relative to a window's client area, 0.0..=1.0 on both axes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormRect {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+impl NormRect {
+    pub const FULL: Self = Self {
+        left: 0.0,
+        top: 0.0,
+        right: 1.0,
+        bottom: 1.0,
+    };
+    pub fn validate(self) -> Result<Self, String> {
+        let v = [self.left, self.top, self.right, self.bottom];
+        if v.iter().any(|n| !n.is_finite() || !(0.0..=1.0).contains(n))
+            || self.right <= self.left
+            || self.bottom <= self.top
+        {
+            return Err("invalid normalized window rectangle".into());
+        }
+        Ok(self)
+    }
+    /// Normalize a selected screen rectangle against the client area it was
+    /// selected in. The selection is clipped to the client area first.
+    pub fn from_screen(client: RECT, selected: RECT) -> Result<Self, String> {
+        let w = client.right as f64 - client.left as f64;
+        let h = client.bottom as f64 - client.top as f64;
+        if w < 2.0 || h < 2.0 {
+            return Err("target client area is empty".into());
+        }
+        let clipped = intersect(client, selected)
+            .ok_or("selected area lies outside the target window's client area")?;
+        Self {
+            left: (clipped.left - client.left) as f64 / w,
+            top: (clipped.top - client.top) as f64 / h,
+            right: (clipped.right - client.left) as f64 / w,
+            bottom: (clipped.bottom - client.top) as f64 / h,
+        }
+        .validate()
+    }
+    /// Scale into a client area in physical pixels; rounding is at most one pixel.
+    pub fn apply(self, client: RECT) -> RECT {
+        let w = client.right as f64 - client.left as f64;
+        let h = client.bottom as f64 - client.top as f64;
+        RECT {
+            left: client.left + (self.left * w).round() as i32,
+            top: client.top + (self.top * h).round() as i32,
+            right: client.left + (self.right * w).round() as i32,
+            bottom: client.top + (self.bottom * h).round() as i32,
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
-pub struct ResolvedTarget {
-    pub window: usize,
-    pub bounds: RECT,
+pub fn intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let r = RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    };
+    (r.right > r.left && r.bottom > r.top).then_some(r)
+}
+
+pub fn size(r: RECT) -> (i64, i64) {
+    (
+        r.right as i64 - r.left as i64,
+        r.bottom as i64 - r.top as i64,
+    )
+}
+
+/// Rectangle covered by a drag between two inclusive pixel positions.
+pub fn rect_from_drag(a: POINT, b: POINT) -> RECT {
+    RECT {
+        left: a.x.min(b.x),
+        top: a.y.min(b.y),
+        right: a.x.max(b.x).saturating_add(1),
+        bottom: a.y.max(b.y).saturating_add(1),
+    }
+}
+
+/// A screen rectangle must be large enough and inside the virtual desktop,
+/// which can start at negative coordinates on secondary monitors.
+pub fn validate_screen_rect(r: RECT, virtual_screen: RECT) -> Result<RECT, String> {
+    let (w, h) = size(r);
+    if w < MIN_TARGET_PX as i64 || h < MIN_TARGET_PX as i64 {
+        return Err(format!(
+            "Screen rectangle must be at least {MIN_TARGET_PX}×{MIN_TARGET_PX} physical pixels."
+        ));
+    }
+    if r.left < virtual_screen.left
+        || r.top < virtual_screen.top
+        || r.right > virtual_screen.right
+        || r.bottom > virtual_screen.bottom
+    {
+        return Err("Screen rectangle extends outside the current virtual desktop.".into());
+    }
+    Ok(r)
+}
+
+/// Points used for occlusion sampling and monitor coverage checks.
+pub fn sample_points(r: RECT, per_axis: i32) -> Vec<POINT> {
+    let n = per_axis.max(2);
+    let (w, h) = size(r);
+    if w < 1 || h < 1 {
+        return vec![];
+    }
+    let mut points = Vec::with_capacity((n * n) as usize);
+    for j in 0..n {
+        for i in 0..n {
+            points.push(POINT {
+                x: (r.left as i64 + (w - 1) * i as i64 / (n - 1) as i64) as i32,
+                y: (r.top as i64 + (h - 1) * j as i64 / (n - 1) as i64) as i32,
+            });
+        }
+    }
+    points
 }
 
 /// Fit a physical aspect into available pixels; one-pixel rounding is inevitable.
@@ -56,10 +178,213 @@ pub fn fit_aspect(area: RECT, aspect: f64) -> Result<RECT, String> {
     })
 }
 
+/// Which window may receive a non-cleanup injected DOWN/UPDATE at a point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitPolicy {
+    /// Only this exact window (the embedded diagnostic receiver).
+    Exact(usize),
+    /// This top-level window or any of its child windows.
+    SameRoot(usize),
+    /// Any window: a screen rectangle has no window ownership.
+    Any,
+}
+impl HitPolicy {
+    pub fn accepts(self, hit: usize, hit_root: usize) -> bool {
+        match self {
+            Self::Exact(w) => hit != 0 && hit == w,
+            Self::SameRoot(w) => hit != 0 && hit_root == w,
+            Self::Any => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum MappingTarget {
+    #[default]
+    Diagnostics,
+    ScreenRectangle {
+        bounds: RECT,
+    },
+    Window {
+        handle: usize,
+    },
+    WindowRectangle {
+        handle: usize,
+        area: NormRect,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub struct ResolvedTarget {
+    pub spec: MappingTarget,
+    /// Diagnostic receiver or target top-level window; 0 for screen rectangles.
+    pub window: usize,
+    pub bounds: RECT,
+    pub hit: HitPolicy,
+    /// Physical touchpad aspect used when the target is re-resolved.
+    pub aspect: Option<f64>,
+}
+
+/// Current availability of a dynamic target.
+#[derive(Clone)]
+pub enum Observation {
+    Ready(RECT),
+    Paused(String),
+    Gone(String),
+}
+
+#[derive(Clone)]
+pub enum Decision {
+    Keep,
+    Retarget(RECT),
+    Pause(String),
+    Resume(RECT),
+    Stop(String),
+}
+
+/// RECT from windows-sys has no Debug/PartialEq; compare and print as tuples.
+pub fn tuple(r: RECT) -> (i32, i32, i32, i32) {
+    (r.left, r.top, r.right, r.bottom)
+}
+impl PartialEq for MappingTarget {
+    fn eq(&self, other: &Self) -> bool {
+        use MappingTarget::*;
+        match (*self, *other) {
+            (Diagnostics, Diagnostics) => true,
+            (ScreenRectangle { bounds: a }, ScreenRectangle { bounds: b }) => tuple(a) == tuple(b),
+            (Window { handle: a }, Window { handle: b }) => a == b,
+            (WindowRectangle { handle: a, area: x }, WindowRectangle { handle: b, area: y }) => {
+                a == b && x == y
+            }
+            _ => false,
+        }
+    }
+}
+impl std::fmt::Debug for MappingTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Diagnostics => write!(f, "Diagnostics"),
+            Self::ScreenRectangle { bounds } => write!(f, "ScreenRectangle{:?}", tuple(bounds)),
+            Self::Window { handle } => write!(f, "Window(0x{handle:X})"),
+            Self::WindowRectangle { handle, area } => {
+                write!(f, "WindowRectangle(0x{handle:X}, {area:?})")
+            }
+        }
+    }
+}
+impl PartialEq for Observation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ready(a), Self::Ready(b)) => tuple(*a) == tuple(*b),
+            (Self::Paused(a), Self::Paused(b)) | (Self::Gone(a), Self::Gone(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl std::fmt::Debug for Observation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(r) => write!(f, "Ready{:?}", tuple(*r)),
+            Self::Paused(r) => write!(f, "Paused({r})"),
+            Self::Gone(r) => write!(f, "Gone({r})"),
+        }
+    }
+}
+impl PartialEq for Decision {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Keep, Self::Keep) => true,
+            (Self::Retarget(a), Self::Retarget(b)) | (Self::Resume(a), Self::Resume(b)) => {
+                tuple(*a) == tuple(*b)
+            }
+            (Self::Pause(a), Self::Pause(b)) | (Self::Stop(a), Self::Stop(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl std::fmt::Debug for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => write!(f, "Keep"),
+            Self::Retarget(r) => write!(f, "Retarget{:?}", tuple(*r)),
+            Self::Resume(r) => write!(f, "Resume{:?}", tuple(*r)),
+            Self::Pause(r) => write!(f, "Pause({r})"),
+            Self::Stop(r) => write!(f, "Stop({r})"),
+        }
+    }
+}
+
+/// Follows a window target during a session. Movement/resizing retargets,
+/// minimization/hiding pauses, destruction stops. Every transition except
+/// Keep requires the caller to release active contacts first.
+#[derive(Clone)]
+pub struct Tracker {
+    bounds: RECT,
+    paused: bool,
+}
+impl Tracker {
+    pub fn new(bounds: RECT) -> Self {
+        Self {
+            bounds,
+            paused: false,
+        }
+    }
+    #[cfg(test)]
+    pub fn bounds(&self) -> RECT {
+        self.bounds
+    }
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+    pub fn observe(&mut self, observation: Observation) -> Decision {
+        match observation {
+            Observation::Gone(reason) => Decision::Stop(reason),
+            Observation::Paused(_) if self.paused => Decision::Keep,
+            Observation::Paused(reason) => {
+                self.paused = true;
+                Decision::Pause(reason)
+            }
+            Observation::Ready(bounds) if self.paused => {
+                self.paused = false;
+                self.bounds = bounds;
+                Decision::Resume(bounds)
+            }
+            Observation::Ready(bounds) if tuple(bounds) != tuple(self.bounds) => {
+                self.bounds = bounds;
+                Decision::Retarget(bounds)
+            }
+            Observation::Ready(_) => Decision::Keep,
+        }
+    }
+}
+
+pub fn describe(r: RECT) -> String {
+    let (w, h) = size(r);
+    format!("{w}×{h} px at ({}, {})", r.left, r.top)
+}
+
 impl MappingTarget {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Diagnostics => "diagnostic",
+            Self::ScreenRectangle { .. } => "screen-rectangle",
+            Self::Window { .. } => "window",
+            Self::WindowRectangle { .. } => "window-rectangle",
+        }
+    }
+    pub fn is_diagnostic(&self) -> bool {
+        matches!(self, Self::Diagnostics)
+    }
+    pub fn window_handle(&self) -> Option<usize> {
+        match *self {
+            Self::Window { handle } | Self::WindowRectangle { handle, .. } => Some(handle),
+            _ => None,
+        }
+    }
     pub fn resolve_with_aspect(self, window: HWND, aspect: f64) -> Result<ResolvedTarget, String> {
         let mut target = self.resolve(window)?;
         target.bounds = fit_aspect(target.bounds, aspect)?;
+        target.aspect = Some(aspect);
         Ok(target)
     }
     pub fn resolve(self, diagnostic_window: HWND) -> Result<ResolvedTarget, String> {
@@ -81,6 +406,7 @@ impl MappingTarget {
                     );
                 }
                 Ok(ResolvedTarget {
+                    spec: self,
                     window: diagnostic_window as usize,
                     bounds: RECT {
                         left: origin.x + px(16),
@@ -88,22 +414,307 @@ impl MappingTarget {
                         right: origin.x + client.right - px(16),
                         bottom: origin.y + client.bottom - px(20),
                     },
+                    hit: HitPolicy::Exact(diagnostic_window as usize),
+                    aspect: None,
                 })
             },
-            Self::ScreenRectangle { bounds } => Err(format!(
-                "Screen rectangle mapping is planned ({}, {}, {}, {})。",
-                bounds.left, bounds.top, bounds.right, bounds.bottom
-            )),
-            Self::Window { handle } => Err(format!(
-                "Application window mapping is planned (0x{handle:X})。"
-            )),
-            Self::WindowRectangle {
-                handle,
-                client_bounds,
-            } => Err(format!(
-                "Window rectangle mapping is planned (0x{handle:X}, {}, {}, {}, {})。",
-                client_bounds.left, client_bounds.top, client_bounds.right, client_bounds.bottom
-            )),
+            Self::ScreenRectangle { bounds } => {
+                require_physical_coordinates()?;
+                let bounds = validate_screen_rect(bounds, unsafe { virtual_screen() })?;
+                for p in sample_points(bounds, 3) {
+                    if unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_null() {
+                        return Err(format!(
+                            "Screen rectangle point ({}, {}) is not on any display. Select the area again.",
+                            p.x, p.y
+                        ));
+                    }
+                }
+                Ok(ResolvedTarget {
+                    spec: self,
+                    window: 0,
+                    bounds,
+                    hit: HitPolicy::Any,
+                    aspect: None,
+                })
+            }
+            Self::Window { handle } | Self::WindowRectangle { handle, .. } => {
+                require_physical_coordinates()?;
+                check_foreign_window(handle)?;
+                match self.observe_bounds() {
+                    Observation::Ready(bounds) => Ok(ResolvedTarget {
+                        spec: self,
+                        window: handle,
+                        bounds,
+                        hit: HitPolicy::SameRoot(handle),
+                        aspect: None,
+                    }),
+                    Observation::Paused(reason) | Observation::Gone(reason) => Err(format!(
+                        "Target window unavailable: {reason}. Restore it before capturing."
+                    )),
+                }
+            }
+        }
+    }
+    /// Unfitted bounds of a window target in physical pixels.
+    pub fn observe_bounds(&self) -> Observation {
+        let (handle, area) = match *self {
+            Self::Window { handle } => (handle, NormRect::FULL),
+            Self::WindowRectangle { handle, area } => (handle, area),
+            Self::ScreenRectangle { bounds } => return Observation::Ready(bounds),
+            Self::Diagnostics => return Observation::Gone("not a dynamic target".into()),
+        };
+        let client = match unsafe { client_screen_rect(handle) } {
+            Ok(client) => client,
+            Err(o) => return o,
+        };
+        let r = area.apply(client);
+        let (w, h) = size(r);
+        if w < MIN_TARGET_PX as i64 || h < MIN_TARGET_PX as i64 {
+            return Observation::Paused("target area is too small".into());
+        }
+        Observation::Ready(r)
+    }
+}
+
+impl ResolvedTarget {
+    /// Re-resolve a window target, applying the session's physical aspect.
+    pub fn observe(&self) -> Observation {
+        match self.spec.observe_bounds() {
+            Observation::Ready(r) => match self.aspect {
+                Some(aspect) => match fit_aspect(r, aspect) {
+                    Ok(fitted) => Observation::Ready(fitted),
+                    Err(_) => Observation::Paused("target area cannot fit touchpad aspect".into()),
+                },
+                None => Observation::Ready(r),
+            },
+            other => other,
+        }
+    }
+    pub fn dynamic(&self) -> bool {
+        self.spec.window_handle().is_some()
+    }
+}
+
+/// Coordinate APIs return physical pixels only for per-monitor-aware threads.
+fn require_physical_coordinates() -> Result<(), String> {
+    if unsafe {
+        AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    } == 0
+    {
+        return Err("Per-Monitor DPI Awareness V2 is required to resolve physical pixels.".into());
+    }
+    Ok(())
+}
+
+pub unsafe fn virtual_screen() -> RECT {
+    let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    RECT {
+        left,
+        top,
+        right: left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        bottom: top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    }
+}
+
+pub unsafe fn cloaked(hwnd: HWND) -> bool {
+    let mut value: u32 = 0;
+    DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED as u32,
+        (&mut value as *mut u32).cast(),
+        size_of::<u32>() as u32,
+    ) == 0
+        && value != 0
+}
+
+/// Client area in physical screen coordinates. Both corners pass through
+/// ClientToScreen, so DPI virtualization of other processes is consistent.
+unsafe fn client_screen_rect(handle: usize) -> Result<RECT, Observation> {
+    let hwnd = handle as HWND;
+    if handle == 0 || IsWindow(hwnd) == 0 {
+        return Err(Observation::Gone("target window closed".into()));
+    }
+    if IsIconic(hwnd) != 0 {
+        return Err(Observation::Paused("target window minimized".into()));
+    }
+    if IsWindowVisible(hwnd) == 0 {
+        return Err(Observation::Paused("target window hidden".into()));
+    }
+    if cloaked(hwnd) {
+        return Err(Observation::Paused(
+            "target window cloaked (another virtual desktop or suspended)".into(),
+        ));
+    }
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client) == 0 {
+        return Err(if IsWindow(hwnd) == 0 {
+            Observation::Gone("target window closed".into())
+        } else {
+            Observation::Paused("target client area unavailable".into())
+        });
+    }
+    let mut a = POINT { x: 0, y: 0 };
+    let mut b = POINT {
+        x: client.right,
+        y: client.bottom,
+    };
+    if ClientToScreen(hwnd, &mut a) == 0 || ClientToScreen(hwnd, &mut b) == 0 {
+        return Err(Observation::Paused("target position unavailable".into()));
+    }
+    let r = RECT {
+        left: a.x,
+        top: a.y,
+        right: b.x,
+        bottom: b.y,
+    };
+    let (w, h) = size(r);
+    if w < 2 || h < 2 {
+        return Err(Observation::Paused("target client area is empty".into()));
+    }
+    Ok(r)
+}
+
+/// Client area of a window target in physical screen coordinates.
+pub fn window_client(handle: usize) -> Result<RECT, String> {
+    require_physical_coordinates()?;
+    unsafe { client_screen_rect(handle) }.map_err(|o| match o {
+        Observation::Paused(r) | Observation::Gone(r) => r,
+        Observation::Ready(_) => unreachable!(),
+    })
+}
+
+fn check_foreign_window(handle: usize) -> Result<(), String> {
+    let hwnd = handle as HWND;
+    unsafe {
+        if handle == 0 || IsWindow(hwnd) == 0 {
+            return Err("Select an existing application window.".into());
+        }
+        if GetAncestor(hwnd, GA_ROOT) != hwnd {
+            return Err("Select a top-level application window.".into());
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == GetCurrentProcessId() {
+            return Err(
+                "PadBridge's own window cannot be an application target; use Diagnostic area."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowEntry {
+    pub handle: usize,
+    pub title: String,
+    pub minimized: bool,
+}
+
+/// Visible top-level windows of other processes, in Z order. Titles are shown
+/// for selection only; logs record handles and geometry, never titles.
+pub fn list_windows() -> Vec<WindowEntry> {
+    unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> windows_sys::core::BOOL {
+        let out = &mut *(l as *mut Vec<WindowEntry>);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if pid == GetCurrentProcessId()
+            || IsWindowVisible(hwnd) == 0
+            || cloaked(hwnd)
+            || ex & WS_EX_TOOLWINDOW != 0
+            || !GetWindow(hwnd, GW_OWNER).is_null()
+        {
+            return 1;
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return 1;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        if title.trim().is_empty() {
+            return 1;
+        }
+        out.push(WindowEntry {
+            handle: hwnd as usize,
+            title,
+            minimized: IsIconic(hwnd) != 0,
+        });
+        1
+    }
+    let mut out = Vec::new();
+    unsafe {
+        EnumWindows(Some(each), &mut out as *mut _ as LPARAM);
+    }
+    out
+}
+
+unsafe fn integrity_of(process: HANDLE) -> Option<u32> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+        return None;
+    }
+    let mut needed = 0;
+    GetTokenInformation(
+        token,
+        TokenIntegrityLevel,
+        std::ptr::null_mut(),
+        0,
+        &mut needed,
+    );
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    let ok = GetTokenInformation(
+        token,
+        TokenIntegrityLevel,
+        buffer.as_mut_ptr().cast(),
+        (buffer.len() * 8) as u32,
+        &mut needed,
+    ) != 0;
+    CloseHandle(token);
+    if !ok {
+        return None;
+    }
+    let label = &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+    let sid = label.Label.Sid;
+    let count = *GetSidSubAuthorityCount(sid);
+    if count == 0 {
+        return None;
+    }
+    Some(*GetSidSubAuthority(sid, count as u32 - 1))
+}
+
+/// Warn when User Interface Privilege Isolation may block injected input.
+pub fn integrity_warning(handle: usize) -> Option<String> {
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(handle as HWND, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let own = integrity_of(GetCurrentProcess())?;
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return Some(
+                "Target process integrity unavailable; Windows may block injected touch.".into(),
+            );
+        }
+        let theirs = integrity_of(process);
+        CloseHandle(process);
+        match theirs {
+            Some(level) if level > own => Some(
+                "Target runs at higher integrity (e.g. as administrator); Windows UIPI may block injected touch."
+                    .into(),
+            ),
+            None => Some(
+                "Target process integrity unavailable; Windows may block injected touch.".into(),
+            ),
+            _ => None,
         }
     }
 }
@@ -111,27 +722,20 @@ impl MappingTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
     #[test]
     fn physical_shape_is_centered_inside_wide_tall_and_negative_screen_bounds() {
         for area in [
-            RECT {
-                left: -1600,
-                top: 30,
-                right: -600,
-                bottom: 330,
-            },
-            RECT {
-                left: 10,
-                top: -800,
-                right: 310,
-                bottom: 100,
-            },
-            RECT {
-                left: 0,
-                top: 0,
-                right: 1001,
-                bottom: 777,
-            },
+            rect(-1600, 30, -600, 330),
+            rect(10, -800, 310, 100),
+            rect(0, 0, 1001, 777),
         ] {
             for ratio in [1.6003, 0.6, 2.4] {
                 let r = fit_aspect(area, ratio).unwrap();
@@ -150,31 +754,151 @@ mod tests {
             }
         }
         for ratio in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e-100, 1e100] {
-            assert!(fit_aspect(
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: 100,
-                    bottom: 100
-                },
-                ratio
-            )
-            .is_err());
+            assert!(fit_aspect(rect(0, 0, 100, 100), ratio).is_err());
         }
     }
     #[test]
-    fn reserved_targets_never_fall_back_to_diagnostic_injection() {
+    fn invalid_targets_never_fall_back_to_diagnostic_injection() {
         for target in [
             MappingTarget::ScreenRectangle {
                 bounds: RECT::default(),
             },
-            MappingTarget::Window { handle: 1 },
+            MappingTarget::Window { handle: 0 },
             MappingTarget::WindowRectangle {
-                handle: 1,
-                client_bounds: RECT::default(),
+                handle: 0,
+                area: NormRect::FULL,
             },
         ] {
             assert!(target.resolve(std::ptr::null_mut()).is_err());
         }
+    }
+    #[test]
+    fn drag_rectangles_are_order_independent_and_inclusive() {
+        let a = POINT { x: -1900, y: 40 };
+        let b = POINT { x: -1500, y: -200 };
+        assert_eq!(tuple(rect_from_drag(a, b)), (-1900, -200, -1499, 41));
+        assert_eq!(tuple(rect_from_drag(b, a)), tuple(rect_from_drag(a, b)));
+        assert_eq!(tuple(rect_from_drag(a, a)), (-1900, 40, -1899, 41));
+    }
+    #[test]
+    fn screen_rectangles_accept_negative_virtual_desktop_and_reject_outside() {
+        let desktop = rect(-2560, -360, 1920, 1080);
+        assert!(validate_screen_rect(rect(-2560, -360, -1280, 360), desktop).is_ok());
+        assert!(validate_screen_rect(rect(0, 0, 1920, 1080), desktop).is_ok());
+        assert!(validate_screen_rect(rect(-2561, 0, -1000, 300), desktop).is_err());
+        assert!(validate_screen_rect(rect(100, 100, 1921, 300), desktop).is_err());
+        assert!(validate_screen_rect(rect(0, 0, 15, 300), desktop).is_err());
+        assert!(validate_screen_rect(rect(0, 0, 300, 10), desktop).is_err());
+        assert!(validate_screen_rect(rect(300, 0, 0, 300), desktop).is_err());
+    }
+    #[test]
+    fn normalized_window_area_follows_client_moves_and_dpi_scaling() {
+        // Selected at 100% scaling on the primary monitor.
+        let client = rect(100, 200, 1100, 800);
+        let selected = rect(350, 350, 850, 650);
+        let area = NormRect::from_screen(client, selected).unwrap();
+        assert_eq!(tuple(area.apply(client)), tuple(selected));
+        // The same window moved to a negative-coordinate monitor at 150% and 200%.
+        for (scale, origin) in [(1.5, (-2400, -300)), (2.0, (-3000, 100)), (1.25, (0, 0))] {
+            let w = (1000.0 * scale) as i32;
+            let h = (600.0 * scale) as i32;
+            let moved = rect(origin.0, origin.1, origin.0 + w, origin.1 + h);
+            let r = area.apply(moved);
+            let expect = |frac: f64, base: i32, len: i32| base + (frac * len as f64).round() as i32;
+            assert_eq!(r.left, expect(0.25, moved.left, w));
+            assert_eq!(r.top, expect(0.25, moved.top, h));
+            assert_eq!(r.right, expect(0.75, moved.left, w));
+            assert_eq!(r.bottom, expect(0.75, moved.top, h));
+        }
+        assert_eq!(tuple(NormRect::FULL.apply(client)), tuple(client));
+    }
+    #[test]
+    fn normalized_selection_is_clipped_and_validated() {
+        let client = rect(0, 0, 400, 200);
+        let area = NormRect::from_screen(client, rect(-50, -50, 200, 100)).unwrap();
+        assert_eq!(
+            area,
+            NormRect {
+                left: 0.0,
+                top: 0.0,
+                right: 0.5,
+                bottom: 0.5
+            }
+        );
+        assert!(NormRect::from_screen(client, rect(500, 0, 600, 100)).is_err());
+        assert!(NormRect::from_screen(rect(0, 0, 1, 1), client).is_err());
+        for bad in [
+            NormRect {
+                left: 0.5,
+                top: 0.0,
+                right: 0.5,
+                bottom: 1.0,
+            },
+            NormRect {
+                left: -0.1,
+                top: 0.0,
+                right: 0.5,
+                bottom: 1.0,
+            },
+            NormRect {
+                left: 0.0,
+                top: 0.0,
+                right: f64::NAN,
+                bottom: 1.0,
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+    }
+    #[test]
+    fn hit_policies_allow_children_only_for_application_targets() {
+        assert!(HitPolicy::Exact(5).accepts(5, 1));
+        assert!(!HitPolicy::Exact(5).accepts(6, 5));
+        assert!(!HitPolicy::Exact(5).accepts(0, 0));
+        assert!(HitPolicy::SameRoot(9).accepts(9, 9));
+        assert!(HitPolicy::SameRoot(9).accepts(42, 9));
+        assert!(!HitPolicy::SameRoot(9).accepts(42, 7));
+        assert!(!HitPolicy::SameRoot(9).accepts(0, 0));
+        assert!(HitPolicy::Any.accepts(0, 0));
+        assert!(HitPolicy::Any.accepts(3, 4));
+    }
+    #[test]
+    fn sample_grid_covers_corners_and_center_of_negative_rectangles() {
+        let r = rect(-1001, -501, -1, -1);
+        let p = sample_points(r, 3);
+        assert_eq!(p.len(), 9);
+        assert_eq!((p[0].x, p[0].y), (-1001, -501));
+        assert_eq!((p[4].x, p[4].y), (-502, -252));
+        assert_eq!((p[8].x, p[8].y), (-2, -2));
+        assert!(p
+            .iter()
+            .all(|q| q.x >= r.left && q.x < r.right && q.y >= r.top && q.y < r.bottom));
+        assert!(sample_points(rect(0, 0, 0, 10), 3).is_empty());
+    }
+    #[test]
+    fn tracker_retargets_pauses_resumes_and_stops() {
+        let a = rect(0, 0, 160, 100);
+        let b = rect(40, 30, 200, 130);
+        let mut t = Tracker::new(a);
+        assert_eq!(t.observe(Observation::Ready(a)), Decision::Keep);
+        assert_eq!(t.observe(Observation::Ready(b)), Decision::Retarget(b));
+        assert_eq!(tuple(t.bounds()), tuple(b));
+        assert_eq!(
+            t.observe(Observation::Paused("minimized".into())),
+            Decision::Pause("minimized".into())
+        );
+        assert!(t.paused());
+        // Repeated pause observations do not cause repeated releases.
+        assert_eq!(
+            t.observe(Observation::Paused("hidden".into())),
+            Decision::Keep
+        );
+        // Restoration resumes even at unchanged bounds, requiring a clear frame.
+        assert_eq!(t.observe(Observation::Ready(b)), Decision::Resume(b));
+        assert!(!t.paused());
+        assert_eq!(
+            t.observe(Observation::Gone("closed".into())),
+            Decision::Stop("closed".into())
+        );
     }
 }

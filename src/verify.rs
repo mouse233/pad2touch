@@ -24,6 +24,9 @@ pub struct Audit {
     pub received_lifetimes: usize,
     pub received_points: usize,
     pub received_peak: usize,
+    /// False for external targets: their receiver is another application.
+    pub receiver_audited: bool,
+    pub target_updates: usize,
     pub errors: Vec<String>,
 }
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -46,6 +49,16 @@ fn position(line: &str) -> Result<Point, String> {
             .parse()
             .map_err(|_| "invalid y")?,
     })
+}
+/// Target bounds from FIXED_RECT / TARGET* records (exclusive right/bottom).
+fn bounds(line: &str) -> Result<(i32, i32, i32, i32), String> {
+    let get = |key: &str| -> Result<i32, String> {
+        field(line, key)
+            .ok_or_else(|| format!("missing {key}"))?
+            .parse()
+            .map_err(|_| format!("invalid {key}"))
+    };
+    Ok((get("left=")?, get("top=")?, get("right=")?, get("bottom=")?))
 }
 fn compatible(expected: &Life, actual: &Life) -> bool {
     if expected.events.first() != actual.events.first()
@@ -100,12 +113,29 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
     if !(1..=5).contains(&capacity) {
         return Err("invalid log capacity".into());
     }
-    let mut audit = Audit::default();
+    let mut audit = Audit {
+        receiver_audited: true,
+        ..Default::default()
+    };
+    let mut target: Option<(i32, i32, i32, i32)> = None;
     let mut batches = BTreeMap::<u32, Batch>::new();
     let mut received = Vec::<Life>::new();
     let mut receiver_active = BTreeMap::<u32, usize>::new();
     let mut ended = false;
     for (line_index, line) in text.lines().enumerate() {
+        let target_record = line.contains(" TARGET ")
+            || line.contains(" TARGET_UPDATE ")
+            || line.contains(" TARGET_RESUME ");
+        if line.contains(" FIXED_RECT ") || target_record {
+            let b = bounds(line)?;
+            target = (b.2 > b.0 && b.3 > b.1).then_some(b);
+            if line.contains(" TARGET ") && line.contains("receiver=external") {
+                audit.receiver_audited = false;
+            }
+            if line.contains(" TARGET_UPDATE ") || line.contains(" TARGET_RESUME ") {
+                audit.target_updates += 1;
+            }
+        }
         if line.contains(" INJECT_BATCH ") {
             let id = number(line, "batch=")?;
             if batches
@@ -136,13 +166,19 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
             let Some(b) = batches.get_mut(&batch) else {
                 return Err("pointer without batch header".into());
             };
+            let point = position(line)?;
+            if let Some((left, top, right, bottom)) = target {
+                if point.x < left || point.x >= right || point.y < top || point.y >= bottom {
+                    audit.errors.push(format!(
+                        "injected point outside current target at line {}",
+                        line_index + 1
+                    ));
+                }
+            }
             b.pointers.push((
                 number(line, "slot=")?,
                 number(line, "raw_id=")?,
-                Event {
-                    action,
-                    point: position(line)?,
-                },
+                Event { action, point },
             ));
         } else if line.contains(" RECEIVE_PT_TOUCH ") {
             let id = number(line, "id=")?;
@@ -298,6 +334,14 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
     }
     audit.injected_lifetimes = expected.len();
     audit.received_lifetimes = received.len();
+    if !audit.receiver_audited {
+        // External applications receive the touches; only injection-side
+        // consistency and target bounds are auditable from this log.
+        if expected.is_empty() {
+            audit.errors.push("no complete injected lifetimes".into());
+        }
+        return Ok(audit);
+    }
     if expected.is_empty() || received.len() != expected.len() {
         audit
             .errors
@@ -337,7 +381,7 @@ impl Audit {
             .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect::<Vec<_>>()
             .join(",");
-        format!("{{\n  \"passed\": {},\n  \"injected_batches\": {},\n  \"injected_pointer_events\": {},\n  \"injected_lifetimes\": {},\n  \"received_lifetimes\": {},\n  \"received_pointer_events\": {},\n  \"receiver_peak_contacts\": {},\n  \"errors\": [{}],\n  \"validation\": \"Log consistency only; hardware acceptance remains manual.\"\n}}",self.passed(),self.batches,self.injected_points,self.injected_lifetimes,self.received_lifetimes,self.received_points,self.received_peak,errors)
+        format!("{{\n  \"passed\": {},\n  \"injected_batches\": {},\n  \"injected_pointer_events\": {},\n  \"injected_lifetimes\": {},\n  \"received_lifetimes\": {},\n  \"received_pointer_events\": {},\n  \"receiver_peak_contacts\": {},\n  \"receiver_audited\": {},\n  \"target_updates\": {},\n  \"errors\": [{}],\n  \"validation\": \"Log consistency only; hardware acceptance remains manual.\"\n}}",self.passed(),self.batches,self.injected_points,self.injected_lifetimes,self.received_lifetimes,self.received_points,self.received_peak,self.receiver_audited,self.target_updates,errors)
     }
 }
 
@@ -373,6 +417,59 @@ mod tests {
         assert!(a.passed(), "{:?}", a.errors);
         assert_eq!(a.received_peak, 2);
         assert_eq!(a.batches, 4);
+    }
+    fn external(log: &str, rect: &str) -> String {
+        log.lines()
+            .filter(|l| !l.contains("RECEIVE_PT_TOUCH"))
+            .map(|l| {
+                if l.contains(" RUN ") {
+                    format!("{l}\nt_us=0 TARGET mode=window window=0x1234 receiver=external {rect}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn external_target_audits_injection_without_embedded_receiver() {
+        let a = analyze(&external(&log(), "left=0 top=0 right=100 bottom=10")).unwrap();
+        assert!(a.passed(), "{:?}", a.errors);
+        assert!(!a.receiver_audited);
+        assert!(a.json().contains("\"receiver_audited\": false"));
+        // Points beyond the target rectangle are reported.
+        let a = analyze(&external(&log(), "left=0 top=0 right=25 bottom=10")).unwrap();
+        assert!(a
+            .errors
+            .iter()
+            .any(|e| e.starts_with("injected point outside current target")));
+        // No injected lifetime is still not a successful external audit.
+        let empty: String = external(&log(), "left=0 top=0 right=100 bottom=10")
+            .lines()
+            .filter(|l| !l.contains("INJECT_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!analyze(&empty).unwrap().passed());
+    }
+    #[test]
+    fn target_updates_change_the_audited_bounds() {
+        let mut l = external(&log(), "left=0 top=0 right=15 bottom=10");
+        // Batches 2-4 (x=20/30) follow a retarget to a wider rectangle.
+        l = l.replacen(
+            "t_us=1 INJECT_BATCH batch=2",
+            "t_us=1 TARGET_UPDATE mode=window window=0x1234 receiver=external left=15 top=0 right=40 bottom=10\nt_us=1 INJECT_BATCH batch=2",
+            1,
+        );
+        let a = analyze(&l).unwrap();
+        assert!(a.passed(), "{:?}", a.errors);
+        assert_eq!(a.target_updates, 1);
+        // Embedded-receiver logs with a FIXED_RECT are bounds-checked too.
+        let fixed = log().replacen(
+            "capacity=2\n",
+            "capacity=2\nt_us=0 FIXED_RECT left=0 top=0 right=12 bottom=10\n",
+            1,
+        );
+        assert!(!analyze(&fixed).unwrap().passed());
     }
     #[test]
     fn absent_receiver_is_not_success() {

@@ -3,7 +3,8 @@ use crate::{
     control::{Controller, TakeoverMode},
     experiment::{self, wide, Session, Shared, Stats},
     hid::{self, winerr, Device},
-    mapping::MappingTarget,
+    mapping::{self, MappingTarget, NormRect, WindowEntry},
+    overlay,
 };
 use std::{
     cell::RefCell,
@@ -35,8 +36,12 @@ const DIAGNOSTICS_GROUP: usize = 111;
 const LOG_PATH: usize = 112;
 const STATUS: usize = 113;
 const STOP_HINT: usize = 114;
-const DEFAULT_CLIENT: (i32, i32) = (820, 512);
-const MIN_CLIENT: (i32, i32) = (760, 504);
+const WINDOW: usize = 115;
+const AREA: usize = 116;
+const TARGET_INFO: usize = 117;
+const DEFAULT_CLIENT: (i32, i32) = (820, 564);
+const MIN_CLIENT: (i32, i32) = (760, 556);
+const PREVIEW_MS: u32 = 1500;
 const PANEL_LEFT: i32 = 274;
 const PANEL_TOP: i32 = 28;
 
@@ -76,6 +81,17 @@ struct Gui {
     closing: bool,
     restart_blocked: bool,
     last_status: String,
+    windows: Vec<WindowEntry>,
+    screen_rect: Option<RECT>,
+    window_area: Option<NormRect>,
+    pending_selection: Option<Pending>,
+    session_diagnostic: bool,
+}
+/// What an in-progress overlay selection will configure.
+#[derive(Clone, Copy)]
+enum Pending {
+    Screen,
+    WindowArea { handle: usize, client: RECT },
 }
 thread_local! { static GUI: RefCell<Option<Gui>> = const { RefCell::new(None) }; }
 
@@ -240,6 +256,11 @@ impl Gui {
             closing: false,
             restart_blocked: false,
             last_status: "Choose a device to get started.".into(),
+            windows: Vec::new(),
+            screen_rect: None,
+            window_area: None,
+            pending_selection: None,
+            session_diagnostic: true,
         };
         g.add(
             "BUTTON",
@@ -356,7 +377,7 @@ impl Gui {
             "Mapping target",
             0,
             BS_GROUPBOX as u32,
-            [8, 328, 250, 56],
+            [8, 328, 250, 112],
         )?;
         g.add(
             "COMBOBOX",
@@ -369,27 +390,43 @@ impl Gui {
             TARGET,
             &[
                 "Diagnostic area",
-                "Screen rectangle (planned)",
-                "Application window (planned)",
-                "Window rectangle (planned)",
+                "Screen rectangle",
+                "Application window",
+                "Window rectangle",
             ],
         );
+        SendMessageW(g.item(TARGET), CB_SETCURSEL, 0, 0);
+        g.add(
+            "COMBOBOX",
+            "",
+            WINDOW,
+            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
+            [18, 378, 230, 240],
+        )?;
+        g.add(
+            "BUTTON",
+            "Select area…",
+            AREA,
+            WS_TABSTOP,
+            [18, 407, 96, 25],
+        )?;
+        g.add("STATIC", "", TARGET_INFO, 0x4000, [120, 412, 128, 16])?;
         g.add(
             "BUTTON",
             "Start capture",
             START,
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            [8, 396, 122, 26],
+            [8, 448, 122, 26],
         )?;
         g.add(
             "BUTTON",
             "Stop / disarm",
             STOP,
             WS_TABSTOP,
-            [136, 396, 122, 26],
+            [136, 448, 122, 26],
         )?;
         // Four lines: the state plus up to three wrapped lines of detail.
-        g.status = g.add("STATIC", "", STATUS, 0, [8, 432, 250, 64])?;
+        g.status = g.add("STATIC", "", STATUS, 0, [8, 484, 250, 64])?;
         let emergency_label = g.add(
             "STATIC",
             "Emergency stop: Ctrl + Alt + Esc (or Esc here)",
@@ -569,14 +606,20 @@ impl Gui {
     }
     unsafe fn refresh_preview_rect(&mut self) {
         // This is only the displayed canvas. Session keeps its own immutable target.
-        if let Some(target) = self
-            .geometry
-            .and_then(|g| g.aspect().ok())
-            .and_then(|aspect| {
-                MappingTarget::Diagnostics
-                    .resolve_with_aspect(self.panel, aspect)
-                    .ok()
-            })
+        let diagnostic = match &self.session {
+            Some(_) => self.session_diagnostic,
+            None => self.target_mode() == 0,
+        };
+        if !diagnostic {
+            self.rect = RECT::default();
+        } else if let Some(target) =
+            self.geometry
+                .and_then(|g| g.aspect().ok())
+                .and_then(|aspect| {
+                    MappingTarget::Diagnostics
+                        .resolve_with_aspect(self.panel, aspect)
+                        .ok()
+                })
         {
             self.rect = target.bounds;
         } else {
@@ -708,30 +751,205 @@ impl Gui {
         }
         self.refresh_preview_rect();
     }
-    fn target(&self, index: usize) -> MappingTarget {
-        match index {
-            1 => MappingTarget::ScreenRectangle {
-                bounds: RECT::default(),
-            },
-            2 => MappingTarget::Window { handle: 0 },
-            3 => MappingTarget::WindowRectangle {
-                handle: 0,
-                client_bounds: RECT::default(),
-            },
-            _ => MappingTarget::Diagnostics,
+    /// 0 = diagnostic, 1 = screen rectangle, 2 = window, 3 = window rectangle.
+    /// No selection (CB_ERR) is the diagnostic default.
+    unsafe fn target_mode(&self) -> usize {
+        match self.selection(TARGET) {
+            mode @ 1..=3 => mode,
+            _ => 0,
+        }
+    }
+    unsafe fn selected_window(&self) -> Option<usize> {
+        // No selection (CB_ERR) must never fall back to the first listed window.
+        let index = SendMessageW(self.item(WINDOW), CB_GETCURSEL, 0, 0);
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.windows.get(i))
+            .map(|w| w.handle)
+    }
+    /// The configured target, or why it cannot be used yet.
+    unsafe fn target(&self) -> Result<MappingTarget, String> {
+        match self.target_mode() {
+            1 => self
+                .screen_rect
+                .map(|bounds| MappingTarget::ScreenRectangle { bounds })
+                .ok_or_else(|| "Click Select area… and drag a screen rectangle.".into()),
+            2 => self
+                .selected_window()
+                .map(|handle| MappingTarget::Window { handle })
+                .ok_or_else(|| "Choose an application window from the list.".into()),
+            3 => {
+                let handle = self
+                    .selected_window()
+                    .ok_or("Choose an application window from the list.")?;
+                let area = self
+                    .window_area
+                    .ok_or("Click Select area… and drag inside the window.")?;
+                Ok(MappingTarget::WindowRectangle { handle, area })
+            }
+            _ => Ok(MappingTarget::Diagnostics),
+        }
+    }
+    /// Resolve the configured target exactly as a session would.
+    unsafe fn resolve_target(&self) -> Result<mapping::ResolvedTarget, String> {
+        let target = self.target()?;
+        match self.geometry.and_then(|g| g.aspect().ok()) {
+            Some(aspect) => target.resolve_with_aspect(self.panel, aspect),
+            None if self.checked(INJECT) => {
+                Err("Cannot preserve the physical touchpad aspect: geometry unavailable.".into())
+            }
+            None => target.resolve(self.panel),
+        }
+    }
+    unsafe fn refresh_windows(&mut self) {
+        let previous = self.selected_window();
+        self.windows = mapping::list_windows();
+        let combo = self.item(WINDOW);
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        for w in &self.windows {
+            let mut title: String = w.title.chars().take(70).collect();
+            if w.minimized {
+                title.push_str(" (minimized)");
+            }
+            SendMessageW(combo, CB_ADDSTRING, 0, wide(&title).as_ptr() as LPARAM);
+        }
+        match self.windows.iter().position(|w| Some(w.handle) == previous) {
+            Some(index) => {
+                SendMessageW(combo, CB_SETCURSEL, index, 0);
+            }
+            None => {
+                SendMessageW(combo, CB_SETCURSEL, usize::MAX, 0);
+                if previous.is_some() {
+                    self.window_area = None;
+                    self.last_status = "The selected window closed. Choose another.".into();
+                }
+            }
+        }
+    }
+    /// Select area… / Show area. Selection completes later via WM_SELECTION_DONE,
+    /// so no nested message loop runs while GUI state is borrowed.
+    unsafe fn area_action(&mut self) {
+        if self.session.is_some() || self.controller.enabled || overlay::active() {
+            return;
+        }
+        let result = match self.target_mode() {
+            1 => overlay::begin(
+                self.hwnd,
+                mapping::virtual_screen(),
+                "Drag to select the screen area to map. Esc or right-click cancels.",
+            )
+            .map(|_| self.pending_selection = Some(Pending::Screen)),
+            3 => self
+                .selected_window()
+                .ok_or("Choose an application window first.".to_string())
+                .and_then(|handle| mapping::window_client(handle).map(|client| (handle, client)))
+                .and_then(|(handle, client)| {
+                    SetForegroundWindow(handle as HWND);
+                    overlay::begin(
+                        self.hwnd,
+                        client,
+                        "Drag inside the window to select the mapped area. Esc or right-click cancels.",
+                    )
+                    .map(|_| {
+                        self.pending_selection = Some(Pending::WindowArea { handle, client })
+                    })
+                }),
+            _ => self.show_target_preview(),
+        };
+        if let Err(e) = result {
+            self.pending_selection = None;
+            self.last_status = e;
+        } else if self.pending_selection.is_some() {
+            self.last_status = "Selecting area…".into();
+        }
+    }
+    unsafe fn selection_done(&mut self) {
+        let Some(result) = overlay::take_result() else {
+            return;
+        };
+        let pending = self.pending_selection.take();
+        SetForegroundWindow(self.hwnd);
+        let Some(selected) = result else {
+            self.last_status = "Area selection cancelled.".into();
+            return;
+        };
+        let applied = match pending {
+            Some(Pending::Screen) => {
+                mapping::validate_screen_rect(selected, mapping::virtual_screen())
+                    .map(|r| self.screen_rect = Some(r))
+            }
+            Some(Pending::WindowArea { handle, client }) => {
+                if self.selected_window() != Some(handle) {
+                    Err("The window selection changed during area selection.".into())
+                } else {
+                    NormRect::from_screen(client, selected).and_then(|area| {
+                        let (w, h) = mapping::size(area.apply(client));
+                        if w < mapping::MIN_TARGET_PX as i64 || h < mapping::MIN_TARGET_PX as i64 {
+                            return Err("Selected area is too small.".into());
+                        }
+                        self.window_area = Some(area);
+                        Ok(())
+                    })
+                }
+            }
+            None => Ok(()),
+        };
+        if let Err(e) = applied.and_then(|_| self.show_target_preview()) {
+            self.last_status = e;
+        }
+    }
+    /// Flash the resolved (aspect-fitted) injection bounds on the desktop.
+    unsafe fn show_target_preview(&mut self) -> Result<(), String> {
+        if self.target_mode() == 0 {
+            return Ok(());
+        }
+        let target = self.resolve_target()?;
+        overlay::flash(target.bounds, PREVIEW_MS)?;
+        self.last_status = format!("Mapped region: {}.", mapping::describe(target.bounds));
+        Ok(())
+    }
+    unsafe fn target_info(&self) -> String {
+        match self.target_mode() {
+            0 => "Inside this window".into(),
+            1 => self.screen_rect.map_or("Not selected".into(), |r| {
+                let (w, h) = mapping::size(r);
+                format!("{w}×{h} at {},{}", r.left, r.top)
+            }),
+            2 => "Whole client area".into(),
+            _ => self.window_area.map_or("Not selected".into(), |a| {
+                format!(
+                    "{:.0}–{:.0}% × {:.0}–{:.0}%",
+                    a.left * 100.0,
+                    a.right * 100.0,
+                    a.top * 100.0,
+                    a.bottom * 100.0
+                )
+            }),
         }
     }
     unsafe fn enable(&mut self) {
         if self.restart_blocked || self.closing {
             return;
         }
-        if self.selection(TARGET) != 0 {
-            self.last_status = "This mapping is planned. Choose Diagnostic area to capture.".into();
-            return;
-        }
         if self.devices.is_empty() {
             self.last_status = "No touchpad available. Refresh the device list.".into();
             return;
+        }
+        // Validate the target before arming a shortcut.
+        match self.resolve_target() {
+            Ok(target) => {
+                if let Some(warning) = target
+                    .spec
+                    .window_handle()
+                    .and_then(mapping::integrity_warning)
+                {
+                    self.last_status = warning;
+                }
+            }
+            Err(e) => {
+                self.last_status = e;
+                return;
+            }
         }
         self.controller.mode = match self.selection(MODE) {
             1 => TakeoverMode::Toggle,
@@ -767,6 +985,7 @@ impl Gui {
     }
     unsafe fn disarm(&mut self, reason: &str) {
         self.controller.disarm();
+        overlay::cancel();
         if self.hotkey_registered {
             UnregisterHotKey(self.hwnd, HOTKEY);
             self.hotkey_registered = false;
@@ -778,7 +997,11 @@ impl Gui {
         self.update_controls();
     }
     unsafe fn start_session(&mut self) -> Result<(), String> {
-        if self.checked(INJECT) && (IsIconic(self.hwnd) != 0 || IsWindowVisible(self.hwnd) == 0) {
+        let spec = self.target()?;
+        if spec.is_diagnostic()
+            && self.checked(INJECT)
+            && (IsIconic(self.hwnd) != 0 || IsWindowVisible(self.hwnd) == 0)
+        {
             return Err("Restore and show the window before starting touch injection.".into());
         }
         let selected = self
@@ -792,16 +1015,15 @@ impl Gui {
             .ok_or("The selected device disconnected. Refresh the list.")?;
         let geometry = device.geometry();
         let target = match geometry {
-            Ok(g) => self
-                .target(self.selection(TARGET))
-                .resolve_with_aspect(self.panel, g.aspect()?)?,
+            Ok(g) => spec.resolve_with_aspect(self.panel, g.aspect()?)?,
             Err(error) if self.checked(INJECT) => {
                 return Err(format!(
                     "Cannot preserve the physical touchpad aspect: {error}"
                 ))
             }
-            Err(_) => self.target(self.selection(TARGET)).resolve(self.panel)?,
+            Err(_) => spec.resolve(self.panel)?,
         };
+        overlay::hide_outline();
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -817,14 +1039,27 @@ impl Gui {
             out.clone(),
         )?;
         self.geometry = geometry.ok();
-        self.refresh_preview_rect();
         self.shared = session.shared.clone();
         self.session = Some(session);
+        self.session_diagnostic = spec.is_diagnostic();
+        self.refresh_preview_rect();
         SetWindowTextW(
             self.log_path,
             wide(&format!("Logs: {}", out.display())).as_ptr(),
         );
-        self.last_status = "Starting. Touch the pad, then lift all fingers to arm.".into();
+        self.last_status = if spec.is_diagnostic() {
+            "Starting. Touch the pad, then lift all fingers to arm.".into()
+        } else {
+            let warning = spec
+                .window_handle()
+                .and_then(mapping::integrity_warning)
+                .map(|w| format!(" {w}"))
+                .unwrap_or_default();
+            format!(
+                "Mapping to {}. Lift all fingers to arm.{warning}",
+                mapping::describe(target.bounds)
+            )
+        };
         Ok(())
     }
     unsafe fn tick(&mut self) {
@@ -901,10 +1136,37 @@ impl Gui {
         SetFocus(next);
     }
     unsafe fn update_controls(&self) {
-        let locked = self.session.is_some() || self.controller.enabled || self.closing;
+        let locked =
+            self.session.is_some() || self.controller.enabled || self.closing || overlay::active();
         for id in [DEVICE, REFRESH, MODE, CONTACTS, INJECT, GUARD, TARGET] {
             EnableWindow(self.item(id), i32::from(!locked));
         }
+        let target_mode = self.target_mode();
+        EnableWindow(
+            self.item(WINDOW),
+            i32::from(!locked && matches!(target_mode, 2 | 3)),
+        );
+        EnableWindow(
+            self.item(AREA),
+            i32::from(
+                !locked
+                    && match target_mode {
+                        1 => true,
+                        2 | 3 => self.selected_window().is_some(),
+                        _ => false,
+                    },
+            ),
+        );
+        set_text(
+            self.item(AREA),
+            if target_mode == 2 {
+                "Show area"
+            } else {
+                "Select area…"
+            },
+        );
+        set_text(self.item(TARGET_INFO), &self.target_info());
+        let target_error = self.target().err();
         EnableWindow(
             self.item(KEY),
             i32::from(!locked && self.selection(MODE) != 0),
@@ -916,7 +1178,7 @@ impl Gui {
                     && !self.restart_blocked
                     && !self.devices.is_empty()
                     && (!self.checked(INJECT) || self.geometry.is_some())
-                    && self.selection(TARGET) == 0,
+                    && target_error.is_none(),
             ),
         );
         EnableWindow(
@@ -950,10 +1212,9 @@ impl Gui {
         } else {
             "Ready"
         };
-        let info = if self.selection(TARGET) != 0 {
-            "This mapping is planned. Choose Diagnostic area."
-        } else {
-            &self.last_status
+        let info = match &target_error {
+            Some(e) if self.session.is_none() && !self.controller.enabled => e,
+            _ => &self.last_status,
         };
         set_text(self.status, &format!("{state}\r\n{info}"));
     }
@@ -983,6 +1244,8 @@ impl Drop for Gui {
         if let Some(session) = &self.session {
             session.request_stop("GUI closed unexpectedly");
         }
+        overlay::cancel();
+        overlay::hide_outline();
         unsafe {
             if self.hotkey_registered {
                 UnregisterHotKey(self.hwnd, HOTKEY);
@@ -1017,8 +1280,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             FillRect(w as HDC, &rc, (COLOR_BTNFACE + 1) as HBRUSH);
             return 0;
         }
-        WM_COMMAND | WM_HOTKEY | WM_TIMER | WM_CLOSE | WM_SIZE | WM_MOVE | WM_ENTERSIZEMOVE
-        | WM_EXITSIZEMOVE | WM_DISPLAYCHANGE | WM_DPICHANGED => {
+        WM_COMMAND
+        | WM_HOTKEY
+        | WM_TIMER
+        | WM_CLOSE
+        | WM_SIZE
+        | WM_MOVE
+        | WM_ENTERSIZEMOVE
+        | WM_EXITSIZEMOVE
+        | WM_DISPLAYCHANGE
+        | WM_DPICHANGED
+        | overlay::WM_SELECTION_DONE => {
             let mut destroy = false;
             GUI.with(|slot| {
                 let Ok(mut slot) = slot.try_borrow_mut() else {
@@ -1043,7 +1315,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             DEVICE if notification == CBN_SELCHANGE => {
                                 g.select_device_info();
                             }
-                            MODE | TARGET | KEY if notification == CBN_SELCHANGE => {}
+                            TARGET if notification == CBN_SELCHANGE => {
+                                if matches!(g.target_mode(), 2 | 3) {
+                                    g.refresh_windows();
+                                }
+                                g.refresh_preview_rect();
+                            }
+                            WINDOW if notification == CBN_DROPDOWN => g.refresh_windows(),
+                            WINDOW if notification == CBN_SELCHANGE => g.window_area = None,
+                            AREA if notification == BN_CLICKED => g.area_action(),
+                            MODE | KEY if notification == CBN_SELCHANGE => {}
                             _ => {}
                         }
                         g.update_controls();
@@ -1064,8 +1345,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             destroy = true;
                         }
                     }
-                    WM_ENTERSIZEMOVE | WM_DISPLAYCHANGE => {
+                    overlay::WM_SELECTION_DONE => {
+                        g.selection_done();
+                        g.update_controls();
+                    }
+                    WM_DISPLAYCHANGE => {
                         if g.session.is_some() && g.checked(INJECT) {
+                            g.disarm("Display configuration changed. Capture stopped.");
+                        }
+                    }
+                    WM_ENTERSIZEMOVE => {
+                        // External targets do not depend on PadBridge's own window.
+                        if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
                             g.disarm("Window or display changed. Capture stopped.");
                         }
                     }
@@ -1076,13 +1367,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         g.layout();
                     }
                     WM_SIZE => {
-                        if g.session.is_some() && g.checked(INJECT) {
+                        if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
                             g.disarm("Window resized. Capture stopped.");
                         }
                         g.layout();
                     }
                     WM_DPICHANGED => {
-                        if g.session.is_some() && g.checked(INJECT) {
+                        if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
                             g.disarm("Display scale changed. Capture stopped.");
                         }
                         g.dpi = (w & 0xffff) as u32;
@@ -1290,6 +1581,202 @@ mod tests {
         }
     }
 
+    /// Phase 3 target configuration through real controls and the real
+    /// selection overlay, against a window of another process. No device,
+    /// capture session, hotkey registration or touch injection is involved.
+    #[test]
+    #[ignore = "creates native windows and a helper process; run on an interactive Windows desktop"]
+    fn native_gui_phase3_target_selection_without_capture() {
+        use crate::{mapping::tuple, target_tests::Host};
+        unsafe fn with<R>(f: impl FnOnce(&mut Gui) -> R) -> R {
+            GUI.with(|slot| f(slot.borrow_mut().as_mut().unwrap()))
+        }
+        unsafe fn choose(hwnd: HWND, combo: usize, index: usize) {
+            let item = GetDlgItem(hwnd, combo as i32);
+            SendMessageW(item, CB_SETCURSEL, index, 0);
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                (CBN_SELCHANGE as usize) << 16 | combo,
+                item as LPARAM,
+            );
+        }
+        unsafe fn click(hwnd: HWND, id: usize) {
+            SendMessageW(hwnd, WM_COMMAND, id, GetDlgItem(hwnd, id as i32) as LPARAM);
+        }
+        /// Drag inside the live overlay using client coordinates.
+        unsafe fn drag(from: (i32, i32), to: (i32, i32)) {
+            let overlay = FindWindowW(wide("PadBridgeSelectionOverlay").as_ptr(), null());
+            assert!(!overlay.is_null(), "selection overlay not shown");
+            let pack = |(x, y): (i32, i32)| ((y as isize) << 16 | x as isize) as LPARAM;
+            SendMessageW(overlay, WM_LBUTTONDOWN, 1, pack(from));
+            SendMessageW(overlay, WM_MOUSEMOVE, 1, pack(to));
+            SendMessageW(overlay, WM_LBUTTONUP, 0, pack(to));
+            pump_for(Duration::from_millis(100));
+        }
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            register("PadBridgeGui", Some(window_proc)).unwrap();
+            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            let hwnd = CreateWindowExW(
+                0,
+                wide("PadBridgeGui").as_ptr(),
+                wide("PadBridge Phase 3 GUI check").as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                40,
+                40,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            let g = Gui::new(hwnd).unwrap();
+            // Raw-only: previews need no physical geometry.
+            SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            GUI.with(|slot| *slot.borrow_mut() = Some(g));
+            with(|g| {
+                g.layout();
+                g.update_controls();
+            });
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            pump_for(Duration::from_millis(100));
+            with(|g| {
+                assert_eq!(g.target_mode(), 0, "diagnostic target is the default");
+                assert_eq!(g.target().unwrap(), MappingTarget::Diagnostics);
+                assert_eq!(IsWindowEnabled(g.item(WINDOW)), 0);
+                assert_eq!(IsWindowEnabled(g.item(AREA)), 0);
+            });
+
+            let host = Host::spawn("pmv2");
+            host.place(900, 120, 760, 520);
+
+            // Application window: list, select, preview outline.
+            choose(hwnd, TARGET, 2);
+            let index = with(|g| {
+                assert!(g.target().is_err(), "no window chosen yet");
+                assert_eq!(tuple(g.rect), (0, 0, 0, 0), "no diagnostic canvas");
+                assert_ne!(IsWindowEnabled(g.item(WINDOW)), 0);
+                g.windows
+                    .iter()
+                    .position(|w| w.handle == host.hwnd)
+                    .expect("host offered in window list")
+            });
+            choose(hwnd, WINDOW, index);
+            with(|g| {
+                assert_eq!(
+                    g.target().unwrap(),
+                    MappingTarget::Window { handle: host.hwnd }
+                );
+                assert_ne!(IsWindowEnabled(g.item(AREA)), 0);
+            });
+            click(hwnd, AREA);
+            with(|g| {
+                assert!(
+                    g.last_status.starts_with("Mapped region"),
+                    "{}",
+                    g.last_status
+                );
+                assert!(crate::overlay::outline_visible());
+            });
+
+            // Window rectangle: drag the central half of the client area.
+            choose(hwnd, TARGET, 3);
+            with(|g| assert!(g.target().is_err(), "area not selected yet"));
+            click(hwnd, AREA);
+            with(|g| {
+                assert!(g.pending_selection.is_some());
+                // Controls stay locked while the overlay is active.
+                assert_eq!(IsWindowEnabled(g.item(TARGET)), 0);
+            });
+            let client = mapping::window_client(host.hwnd).unwrap();
+            let (w, h) = mapping::size(client);
+            let (w, h) = (w as i32, h as i32);
+            drag((w / 4, h / 4), (w * 3 / 4 - 1, h * 3 / 4 - 1));
+            with(|g| {
+                let area = g.window_area.expect("window area selected");
+                for (value, expected) in [
+                    (area.left, 0.25),
+                    (area.top, 0.25),
+                    (area.right, 0.75),
+                    (area.bottom, 0.75),
+                ] {
+                    assert!((value - expected).abs() < 0.01, "{area:?}");
+                }
+                assert_eq!(
+                    g.target().unwrap(),
+                    MappingTarget::WindowRectangle {
+                        handle: host.hwnd,
+                        area
+                    }
+                );
+                assert_ne!(IsWindowEnabled(g.item(TARGET)), 0);
+                assert!(g.target_info().contains('%'));
+            });
+
+            // Emergency stop also cancels an in-progress selection.
+            click(hwnd, AREA);
+            SendMessageW(hwnd, WM_HOTKEY, EMERGENCY as usize, 0);
+            pump_for(Duration::from_millis(100));
+            with(|g| {
+                assert!(!crate::overlay::active());
+                assert!(g.pending_selection.is_none());
+                assert!(g.window_area.is_some(), "cancel keeps the previous area");
+            });
+
+            // Screen rectangle: drag in virtual-desktop coordinates.
+            choose(hwnd, TARGET, 1);
+            with(|g| assert!(g.target().is_err()));
+            click(hwnd, AREA);
+            drag((100, 80), (419, 279));
+            with(|g| {
+                let screen = mapping::virtual_screen();
+                let r = g.screen_rect.expect("screen area selected");
+                assert_eq!(
+                    tuple(r),
+                    (
+                        screen.left + 100,
+                        screen.top + 80,
+                        screen.left + 420,
+                        screen.top + 280
+                    )
+                );
+                assert!(g.target().is_ok());
+            });
+            // A too-small screen selection is rejected and keeps the old one.
+            click(hwnd, AREA);
+            drag((10, 10), (12, 12));
+            with(|g| {
+                assert!(g.screen_rect.is_some());
+                assert!(g.last_status.contains("at least"), "{}", g.last_status);
+            });
+
+            // A closed target window is dropped from the selection.
+            choose(hwnd, TARGET, 3);
+            host.close();
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                (CBN_DROPDOWN as usize) << 16 | WINDOW,
+                g_item(hwnd, WINDOW) as LPARAM,
+            );
+            with(|g| {
+                assert!(g.selected_window().is_none());
+                assert!(g.window_area.is_none());
+                assert!(g.target().is_err());
+            });
+            crate::overlay::hide_outline();
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            GUI.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    unsafe fn g_item(hwnd: HWND, id: usize) -> HWND {
+        GetDlgItem(hwnd, id as i32)
+    }
+
     unsafe fn assert_live_layout(hwnd: HWND) {
         GUI.with(|slot| {
             let slot = slot.borrow();
@@ -1301,7 +1788,7 @@ mod tests {
                 (244, 87),
                 (250, 214),
                 (240, 314),
-                (240, 378),
+                (252, 378),
                 (260, 230),
                 (600, 12),
             ] {

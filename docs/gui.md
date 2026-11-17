@@ -1,6 +1,6 @@
 # Native GUI
 
-Version 0.3.2 integrates the diagnostic receiver into a persistent native Windows application. This advances the core capture-management GUI work from Phase 4 before arbitrary-window mapping in Phase 3. It does not mark full Phase 2 hardware acceptance, Phase 3, or all of Phase 4 complete.
+Version 0.4.0 adds Phase 3 window and rectangle mapping to the native GUI. Application-window, window-rectangle and screen-rectangle targets are implemented and covered by automated synthetic tests; physical-touchpad acceptance against third-party applications remains a manual step. This does not mark full Phase 2 hardware acceptance or all of Phase 4 complete.
 
 ## Launch and devices
 
@@ -24,7 +24,7 @@ Chords are Ctrl+Alt+F8, F9, F10, or F11. Registration uses `RegisterHotKey` with
 
 Stop waits for the worker, then processes receiver messages for at least 300 ms before finalizing logs. Another session waits for that drain. Diagnostics and trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
 
-Moving, resizing, minimizing, or changing the display stops active touch injection. Raw-only sessions can remain active while minimized or behind another application. Restore/place the GUI before starting injection. Mapping stays fixed during each session. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
+With the Diagnostic area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the PadBridge window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
 
 ## Diagnostics and system gestures
 
@@ -44,16 +44,32 @@ The input worker starts only after the settings snapshot, independent watchdog, 
 
 The option changes user-wide settings during its interval; native pointer movement remains active. The adapter's apply/restore and a complete raw-only GUI session have been checked separately from physical gesture behavior. Simultaneous physical native-injection acceptance and forced-termination recovery remain separate tests. There is no startup recovery service and no guarantee against machine shutdown or killing all recovery processes.
 
-## Mapping extension points
+## Mapping targets (Phase 3)
 
-`mapping::MappingTarget` separates target configuration from capture intent and native controls:
+The **Mapping target** group selects where touches go:
 
-- `Diagnostics`: resolves the embedded receiver's physical-pixel rectangle for a new session.
-- `ScreenRectangle { bounds }`: reserved screen-space bounds.
-- `Window { handle }`: reserved target window identity.
-- `WindowRectangle { handle, client_bounds }`: reserved client-relative bounds.
+| Target | Configure | Bounds | Hit test |
+|---|---|---|---|
+| Diagnostic area | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
+| Screen rectangle | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None (whatever is on screen receives it) |
+| Application window | Choose a window from the list; **Show area** flashes the mapped region | Whole client area (title bar and borders excluded) | Target window or its child windows |
+| Window rectangle | Choose a window, **Select area…**, drag inside its client area | Normalized client-relative rectangle | Target window or its child windows |
 
-`ResolvedTarget` carries the receiver identity and physical bounds into `experiment::Session`. Reserved modes return explicit errors and cannot start from the GUI. They do not silently fall back to diagnostics. Phase 3 still needs target selection, window-lifetime validation, coordinate resolution, dynamic bounds updates, and updated hit-testing rules; the enum alone does not implement third-party injection.
+The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. PadBridge's own windows cannot be application targets. Selections are not persisted across launches.
+
+Selection uses a topmost dimmed overlay in physical pixels; Esc, right-click, the emergency stop or Stop cancels it and keeps the previous selection. Screen rectangles must be at least 16×16 pixels, lie inside the virtual desktop and have their corners and center on a display; negative secondary-monitor coordinates are supported. Window rectangles are stored as fractions of the client area, so they scale with the window. After a selection, a click-through outline drawn just outside the mapped region shows it for 1.5 seconds; the outline is never shown during a session. All targets are letterboxed to the touchpad's physical aspect, as before.
+
+During a session the worker re-resolves window targets every 16 ms:
+
+- Moved or resized: active contacts are cancelled at their last positions, the new bounds apply, and a new all-fingers-up frame is required (`TARGET_UPDATE`).
+- Minimized, hidden or cloaked (another virtual desktop): contacts are released and frames are ignored until the window returns (`TARGET_PAUSE` / `TARGET_RESUME`).
+- Closed: the session stops (`TARGET_LOST`) and activation is disarmed.
+
+Because Windows routes injected touch by screen position, every non-cleanup DOWN/UPDATE point is hit-tested first; a point covered by another window cancels the sequence (`INJECT_BLOCKED`) instead of touching the wrong application. The diagnostics line also samples a 3×3 grid every 250 ms and reports `COVERED at n/9 sample points` as an early warning. Starting or enabling a shortcut warns if the target runs at a higher integrity level, because UIPI may reject injected input there.
+
+The Foreground guard only applies while PadBridge itself is foreground, so it is normally inactive while you work in a target application; Background guard is the relevant option there.
+
+`mapping::MappingTarget` carries the configuration; `ResolvedTarget` adds physical bounds, the hit policy and the physical aspect so the worker can re-resolve. `mapping::Tracker` is the pure state machine behind retarget/pause/resume/stop decisions.
 
 `control::Controller` owns activation intent independently of native controls. `experiment::Session` owns worker lifecycle and logging. The GUI owns the persistent window and receiver dispatch, reusing the CLI's parser, injector, pointer handling, and diagnostic renderer.
 

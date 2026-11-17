@@ -347,6 +347,15 @@ impl<T: Transport> Engine<T> {
         self.cleanup_pending = false;
         Ok(())
     }
+    /// Move the mapping rectangle. Active contacts are cancelled at their cached
+    /// positions first, and a new all-fingers-up frame is required afterward,
+    /// so no lifetime spans two different mappings.
+    pub fn retarget(&mut self, rect: Rectangle) -> Result<(), String> {
+        let rect = rect.validate()?;
+        let released = self.cancel();
+        self.planner.rect = rect;
+        released
+    }
     fn fail(&mut self, cause: String) -> String {
         match self.cancel() {
             Ok(()) => cause,
@@ -817,6 +826,70 @@ pub mod tests {
             e.cancel().unwrap();
             assert!(e.transport.state.is_empty());
         }
+    }
+    #[test]
+    fn retarget_cancels_at_old_position_and_maps_into_new_rectangle() {
+        let mut e = armed(2);
+        e.apply(&[contact(7, 1000, 1000)]).unwrap();
+        e.apply(&[contact(7, 1000, 1000)]).unwrap();
+        let last = e.transport.accepted.last().unwrap().pointers[0].point;
+        assert_eq!(last, Point { x: 1100, y: 1200 });
+        e.retarget(Rectangle {
+            left: -800,
+            top: -600,
+            right: -399,
+            bottom: -399,
+        })
+        .unwrap();
+        let tail = &e.transport.accepted[e.transport.accepted.len() - 2..];
+        assert!(tail
+            .iter()
+            .all(|f| f.cleanup && f.pointers[0].point == last));
+        assert_eq!(tail[1].pointers[0].action, Action::Cancel);
+        assert_eq!(e.active_count(), 0);
+        assert!(!e.is_armed());
+        // A finger still down after retargeting must not start a new lifetime.
+        let sent = e.transport.accepted.len();
+        e.apply(&[contact(7, 0, 0)]).unwrap();
+        assert_eq!(e.transport.accepted.len(), sent);
+        e.apply(&[]).unwrap();
+        e.apply(&[contact(9, 0, 0)]).unwrap();
+        e.apply(&[contact(9, 1000, 1000)]).unwrap();
+        let points: Vec<_> = e.transport.accepted[sent..]
+            .iter()
+            .map(|f| f.pointers[0].point)
+            .collect();
+        assert_eq!(
+            points,
+            [Point { x: -800, y: -600 }, Point { x: -400, y: -400 }]
+        );
+        assert!(e
+            .retarget(Rectangle {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 5
+            })
+            .is_err());
+    }
+    #[test]
+    fn retarget_failure_keeps_cleanup_pending_and_new_rectangle() {
+        let mut e = armed(1);
+        e.apply(&[contact(1, 0, 0)]).unwrap();
+        e.transport.errors.push_back(Some(Failure::Win32(5)));
+        let r = Rectangle {
+            left: 10,
+            top: 10,
+            right: 20,
+            bottom: 20,
+        };
+        assert!(e.retarget(r).is_err());
+        assert!(e.cleanup_pending);
+        assert_eq!(e.active_count(), 1);
+        // Recovery still ends the old contact before any new DOWN.
+        assert!(e.apply(&[]).is_err());
+        assert!(!e.cleanup_pending);
+        assert_eq!(e.active_count(), 0);
     }
     #[test]
     fn keepalive_and_target_failures_cancel_all() {

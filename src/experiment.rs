@@ -91,6 +91,11 @@ pub struct Stats {
     pub foreground_losses: u64,
     pub minimizations: u64,
     pub capture: crate::capture::Counters,
+    pub target_label: String,
+    pub target_state: String,
+    pub target_updates: u64,
+    pub target_pauses: u64,
+    pub injection_blocked: u64,
 }
 pub(crate) type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -328,7 +333,13 @@ pub fn run(opt: Options) -> Result<(), String> {
         let worker_shared = shared.clone();
         let worker_log = log.clone();
         let worker_stop = stop.clone();
-        let target = hwnd as usize;
+        let target = crate::mapping::ResolvedTarget {
+            spec: crate::mapping::MappingTarget::Diagnostics,
+            window: hwnd as usize,
+            bounds: rect,
+            hit: crate::mapping::HitPolicy::Exact(hwnd as usize),
+            aspect: None,
+        };
         let mode = opt.mode.clone();
         let inject = opt.inject || mode == "self-test";
         let capacity = opt.contacts;
@@ -338,7 +349,7 @@ pub fn run(opt: Options) -> Result<(), String> {
             let result = worker_loop(
                 device,
                 (mode, inject, capacity, suppress_gestures),
-                (target, rect),
+                target,
                 worker_shared.clone(),
                 worker_log.clone(),
                 worker_stop,
@@ -431,7 +442,45 @@ fn percentile(v: &[u128], p: usize) -> u128 {
 }
 fn summary(s: &Stats, dropped: u64, seconds: u64) -> String {
     let report = format!("phase=1+2\nvalidation_status=PENDING_MANUAL_HARDWARE_TEST\nmode={}\nsource={}\nrequested_duration_s={seconds}\ndevice={}\ncapacity={}\nraw_reports={}\ncomplete_frames={}\npeak_active_contacts={}\nparse_errors={}\nincomplete_frames={}\ninjected_frames={}\ninjection_errors={}\nnot_ready_retries={}\ninjected_contacts_remaining={}\ncleanup_pending={}\nreceiver_PT_TOUCH_down={}\nreceiver_PT_TOUCH_update={}\nreceiver_PT_TOUCH_up={}\nreceiver_GetPointerTouchInfo_ok={}\nreceiver_peak_contacts={}\nreceiver_contacts_remaining={}\nreceiver_lifecycle_errors={}\nlog_dropped={}\ninject_api_p95_us={}\nraw_to_inject_call_p95_us={}\nlatency_note=host software only; excludes firmware, OS delivery and physical input latency\nlast_error={}\n",s.mode,if s.mode=="self-test"{"SYNTHETIC_API_TEST_NOT_HARDWARE"}else{"PHYSICAL_RAW_INPUT"},s.device,s.capacity,s.raw,s.frames,s.peak,s.parse_errors,s.incomplete,s.injected,s.inject_errors,s.retries,s.injected_active,s.cleanup_pending,s.down,s.update,s.up,s.touch_info,s.received_peak,s.received_active.len(),s.receive_errors,dropped,percentile(&s.api_us,95),percentile(&s.capture_us,95),s.error);
-    format!("{report}device_geometry={}\nobserved_rate_snapshot={}\nrate_note=observed host delivery and PTP scan cadence, not nominal bus polling\n", s.device_label.replace('\n', " | "), s.report_rate.label())
+    format!("{report}device_geometry={}\nobserved_rate_snapshot={}\nrate_note=observed host delivery and PTP scan cadence, not nominal bus polling\ntarget={}\ntarget_updates={}\ntarget_pauses={}\ninjection_blocked={}\n", s.device_label.replace('\n', " | "), s.report_rate.label(), if s.target_label.is_empty() { "diagnostic receiver" } else { &s.target_label }, s.target_updates, s.target_pauses, s.injection_blocked)
+}
+
+/// Machine-readable target record. Window titles are deliberately omitted.
+pub(crate) fn target_record(
+    kind: &str,
+    target: &crate::mapping::ResolvedTarget,
+    r: RECT,
+) -> String {
+    format!(
+        "{kind} mode={} window=0x{:X} receiver={} left={} top={} right={} bottom={}",
+        target.spec.label(),
+        target.window,
+        if target.spec.is_diagnostic() {
+            "embedded"
+        } else {
+            "external"
+        },
+        r.left,
+        r.top,
+        r.right,
+        r.bottom
+    )
+}
+pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
+    match target.spec {
+        crate::mapping::MappingTarget::Diagnostics => "diagnostic receiver".into(),
+        crate::mapping::MappingTarget::ScreenRectangle { .. } => "screen rectangle".into(),
+        crate::mapping::MappingTarget::Window { handle } => {
+            format!("window 0x{handle:X} client area")
+        }
+        crate::mapping::MappingTarget::WindowRectangle { handle, area } => format!(
+            "window 0x{handle:X} area {:.0}-{:.0}% × {:.0}-{:.0}%",
+            area.left * 100.0,
+            area.right * 100.0,
+            area.top * 100.0,
+            area.bottom * 100.0
+        ),
+    }
 }
 
 /// A GUI-owned session. The caller keeps pumping receiver messages during stop
@@ -492,6 +541,12 @@ impl Session {
             "FIXED_RECT left={} top={} right={} bottom={}",
             r.left, r.top, r.right, r.bottom
         ));
+        log.event(target_record("TARGET", &target, r));
+        {
+            let mut s = shared.lock().unwrap();
+            s.target_label = target_label(&target);
+            s.target_state = format!("mapped {}", crate::mapping::describe(r));
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let worker_shared = shared.clone();
@@ -518,7 +573,7 @@ impl Session {
                     worker_loop(
                         Some(device),
                         ("capture".into(), inject, capacity, suppress_gestures),
-                        (target.window, target.bounds),
+                        target,
                         worker_shared.clone(),
                         worker_log.clone(),
                         worker_stop,
@@ -866,6 +921,11 @@ unsafe fn paint(hwnd: HWND) {
 pub(crate) fn diagnostic_text(s: &Stats) -> String {
     let text = format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} / events {}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if !s.gesture_guard || s.capture_stopped{"OFF"}else if s.foreground{"ACTIVE (foreground)"}else{"INACTIVE (background)"},s.gesture_events,if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
     let text = format!("{text}\n{}", s.report_rate.label());
+    let text = if s.target_label.is_empty() {
+        text
+    } else {
+        format!("{text}\nTarget: {} | {}", s.target_label, s.target_state)
+    };
     if s.guard_status.is_empty() {
         text
     } else {
@@ -1020,9 +1080,12 @@ struct Worker {
     start: Instant,
     last_raw: Instant,
     mode: String,
-    target: usize,
+    target: crate::mapping::ResolvedTarget,
     target_origin: POINT,
     target_size: (i32, i32),
+    tracker: Option<crate::mapping::Tracker>,
+    last_occlusion_check: Instant,
+    last_occlusion: Option<(usize, usize)>,
     synthetic_step: u32,
     capacity: usize,
     pending_since: Option<Instant>,
@@ -1035,12 +1098,14 @@ struct Worker {
 fn worker_loop(
     device: Option<Device>,
     settings: (String, bool, usize, bool),
-    fixed_target: (usize, RECT),
+    target: crate::mapping::ResolvedTarget,
     shared: Shared,
     log: Log,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let (target, rect) = fixed_target;
+    // Target resolution needs physical pixels on this thread as well.
+    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let rect = target.bounds;
     let (mode, inject, capacity, suppress_gestures) = settings;
     let fields = device
         .as_ref()
@@ -1048,17 +1113,19 @@ fn worker_loop(
         .transpose()?
         .unwrap_or_default();
     let injector = if inject {
-        Some(Injector::new(target, rect, capacity, log.clone())?)
+        Some(Injector::new(target.hit, rect, capacity, log.clone())?)
     } else {
         None
     };
     let mut target_origin = POINT::default();
     let mut target_client = RECT::default();
-    unsafe {
-        if ClientToScreen(target as HWND, &mut target_origin) == 0
-            || GetClientRect(target as HWND, &mut target_client) == 0
-        {
-            return Err(winerr("resolve diagnostic target"));
+    if target.spec.is_diagnostic() {
+        unsafe {
+            if ClientToScreen(target.window as HWND, &mut target_origin) == 0
+                || GetClientRect(target.window as HWND, &mut target_client) == 0
+            {
+                return Err(winerr("resolve diagnostic target"));
+            }
         }
     }
     let mut worker = Worker {
@@ -1075,6 +1142,9 @@ fn worker_loop(
         target,
         target_origin,
         target_size: (target_client.right, target_client.bottom),
+        tracker: target.dynamic().then(|| crate::mapping::Tracker::new(rect)),
+        last_occlusion_check: Instant::now(),
+        last_occlusion: None,
         synthetic_step: 0,
         capacity,
         pending_since: None,
@@ -1195,7 +1265,8 @@ impl Worker {
                 .collect::<Vec<_>>()
                 .join("; ");
         }
-        if let Some(i) = &mut self.injector {
+        let paused = self.tracker.as_ref().is_some_and(|t| t.paused());
+        if let Some(i) = self.injector.as_mut().filter(|_| !paused) {
             let before = i.successes();
             if let Err(e) = i.frame(&contacts) {
                 self.error(e);
@@ -1228,6 +1299,7 @@ impl Worker {
             s.injected_active = i.active_count();
             s.armed = i.is_armed();
             s.cleanup_pending = i.cleanup_pending();
+            s.injection_blocked = i.blocked();
         }
     }
     fn sample_scope(&mut self) -> crate::capture::Scope {
@@ -1316,19 +1388,24 @@ impl Worker {
             unsafe { PostQuitMessage(0) };
             return;
         }
-        if self.injector.is_some() {
+        if self.tracker.is_some() {
+            if !self.follow_target() {
+                return;
+            }
+        } else if self.injector.is_some() && self.target.spec.is_diagnostic() {
             unsafe {
+                let target = self.target.window;
                 let mut origin = POINT::default();
                 let mut client = RECT::default();
-                let reason = if IsWindow(self.target as HWND) == 0 {
+                let reason = if IsWindow(target as HWND) == 0 {
                     Some("receiver closed; fixed mapping stopped")
-                } else if IsIconic(GetAncestor(self.target as HWND, GA_ROOT)) != 0 {
+                } else if IsIconic(GetAncestor(target as HWND, GA_ROOT)) != 0 {
                     Some("receiver minimized (possible Windows system gesture); injection stopped")
-                } else if ClientToScreen(self.target as HWND, &mut origin) == 0 {
+                } else if ClientToScreen(target as HWND, &mut origin) == 0 {
                     Some("receiver position unavailable; fixed mapping stopped")
                 } else if origin.x != self.target_origin.x || origin.y != self.target_origin.y {
                     Some("receiver moved; fixed mapping stopped")
-                } else if GetClientRect(self.target as HWND, &mut client) == 0
+                } else if GetClientRect(target as HWND, &mut client) == 0
                     || (client.right, client.bottom) != self.target_size
                 {
                     Some("receiver resized; fixed mapping stopped")
@@ -1382,6 +1459,107 @@ impl Worker {
             }
         }
         self.sync_stats();
+    }
+    /// Follow a window target. Returns false when the session must stop.
+    fn follow_target(&mut self) -> bool {
+        use crate::mapping::Decision;
+        let observation = self.target.observe();
+        let decision = self.tracker.as_mut().unwrap().observe(observation);
+        match decision {
+            Decision::Keep => {}
+            Decision::Retarget(r) | Decision::Resume(r) => {
+                let resumed = matches!(decision, Decision::Resume(_));
+                let result = self.injector.as_mut().map_or(Ok(()), |i| i.retarget(r));
+                self.target.bounds = r;
+                self.log.event(crate::experiment::target_record(
+                    if resumed {
+                        "TARGET_RESUME"
+                    } else {
+                        "TARGET_UPDATE"
+                    },
+                    &self.target,
+                    r,
+                ));
+                {
+                    let mut s = self.shared.lock().unwrap();
+                    s.target_updates += 1;
+                    s.target_state = format!(
+                        "{} {}; lift all fingers to continue",
+                        if resumed { "resumed at" } else { "moved to" },
+                        crate::mapping::describe(r)
+                    );
+                }
+                self.last_occlusion = None;
+                if let Err(e) = result {
+                    self.error(e);
+                }
+            }
+            Decision::Pause(reason) => {
+                self.log.event(format!("TARGET_PAUSE reason={reason}"));
+                {
+                    let mut s = self.shared.lock().unwrap();
+                    s.target_pauses += 1;
+                    s.target_state = format!("paused: {reason}; contacts released");
+                }
+                if let Some(i) = &mut self.injector {
+                    if let Err(e) = i.release(true) {
+                        self.error(e);
+                    }
+                }
+                self.assembler.reset();
+                self.pending_since = None;
+            }
+            Decision::Stop(reason) => {
+                let reason = format!("{reason}; injection stopped");
+                self.log.event(format!("TARGET_LOST reason={reason}"));
+                self.error(reason.clone());
+                self.shared.lock().unwrap().stop_reason = reason;
+                self.stop.store(true, Ordering::Relaxed);
+                unsafe { PostQuitMessage(0) };
+                return false;
+            }
+        }
+        self.sample_occlusion();
+        true
+    }
+    /// Proactive warning only: per-pointer hit tests decide actual injection.
+    fn sample_occlusion(&mut self) {
+        if self.tracker.as_ref().is_some_and(|t| t.paused())
+            || self.last_occlusion_check.elapsed() < Duration::from_millis(250)
+        {
+            return;
+        }
+        self.last_occlusion_check = Instant::now();
+        let points = crate::mapping::sample_points(self.target.bounds, 3);
+        let covered = points
+            .iter()
+            .filter(|&&p| unsafe {
+                let hit = WindowFromPoint(p);
+                let root = if hit.is_null() {
+                    null_mut()
+                } else {
+                    GetAncestor(hit, GA_ROOT)
+                };
+                !self.target.hit.accepts(hit as usize, root as usize)
+            })
+            .count();
+        let sample = (covered, points.len());
+        if self.last_occlusion != Some(sample) {
+            self.last_occlusion = Some(sample);
+            self.log.event(format!(
+                "TARGET_OCCLUSION covered={covered} samples={}",
+                points.len()
+            ));
+            let r = crate::mapping::describe(self.target.bounds);
+            self.shared.lock().unwrap().target_state = if covered == 0 {
+                format!("visible, {r}")
+            } else {
+                format!(
+                    "COVERED at {covered}/{} sample points, {r}; touches there are blocked",
+                    points.len()
+                )
+            };
+        }
     }
     fn finish(&mut self) -> Result<(), String> {
         let mut result = Ok(());

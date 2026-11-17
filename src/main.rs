@@ -10,9 +10,12 @@ mod hid;
 mod injection;
 mod logging;
 mod mapping;
+mod overlay;
 mod render;
 mod report_rate;
 mod scenarios;
+#[cfg(test)]
+mod target_tests;
 mod touch;
 mod verify;
 fn main() {

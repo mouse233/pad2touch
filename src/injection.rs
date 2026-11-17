@@ -3,9 +3,11 @@ use crate::{
     decode::Contact,
     hid::winerr,
     logging::Log,
+    mapping::HitPolicy,
     touch::{Action, Engine, Failure, Frame, Rectangle, Transport},
 };
 use std::{
+    ptr::null_mut,
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +16,14 @@ use windows_sys::Win32::{
     UI::{Input::Pointer::*, WindowsAndMessaging::*},
 };
 
+fn rectangle(rect: RECT) -> Rectangle {
+    Rectangle {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
+}
 pub fn flags(action: Action) -> u32 {
     match action {
         Action::Down => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
@@ -23,24 +33,52 @@ pub fn flags(action: Action) -> u32 {
     }
 }
 struct WindowsTransport {
-    target: usize,
+    hit: HitPolicy,
     log: Log,
     batch: u64,
+    blocked: u64,
+}
+impl WindowsTransport {
+    /// Windows routes injected touch by screen hit testing. Non-cleanup DOWN and
+    /// UPDATE events are only submitted where the target owns the point.
+    unsafe fn owner(&self, point: POINT) -> Result<(), (usize, usize)> {
+        let hit = WindowFromPoint(point);
+        let root = if hit.is_null() {
+            null_mut()
+        } else {
+            GetAncestor(hit, GA_ROOT)
+        };
+        if self.hit.accepts(hit as usize, root as usize) {
+            Ok(())
+        } else {
+            Err((hit as usize, root as usize))
+        }
+    }
 }
 impl Transport for WindowsTransport {
     fn inject(&mut self, frame: &Frame) -> Result<(), Failure> {
         if !frame.cleanup {
             for p in &frame.pointers {
-                if matches!(p.action, Action::Down | Action::Update)
-                    && unsafe {
-                        WindowFromPoint(POINT {
-                            x: p.point.x,
-                            y: p.point.y,
-                        })
-                    } as usize
-                        != self.target
-                {
-                    self.log.event(format!("INJECT_BLOCKED fixed target unavailable or occluded minimized={} foreground={} x={} y={}", unsafe {IsIconic(self.target as HWND) != 0}, unsafe {GetForegroundWindow() as usize == self.target},p.point.x,p.point.y));
+                if !matches!(p.action, Action::Down | Action::Update) {
+                    continue;
+                }
+                let point = POINT {
+                    x: p.point.x,
+                    y: p.point.y,
+                };
+                if let Err((hit, root)) = unsafe { self.owner(point) } {
+                    self.blocked += 1;
+                    let target = match self.hit {
+                        HitPolicy::Exact(w) | HitPolicy::SameRoot(w) => w,
+                        HitPolicy::Any => 0,
+                    };
+                    self.log.event(format!(
+                        "INJECT_BLOCKED target unavailable or occluded target=0x{target:X} hit=0x{hit:X} hit_root=0x{root:X} minimized={} foreground={} x={} y={}",
+                        unsafe { IsIconic(target as HWND) != 0 },
+                        unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) as usize == target },
+                        p.point.x,
+                        p.point.y
+                    ));
                     return Err(Failure::TargetUnavailable);
                 }
             }
@@ -101,22 +139,14 @@ pub struct Injector {
     log: Log,
 }
 impl Injector {
-    pub fn new(target: usize, rect: RECT, capacity: usize, log: Log) -> Result<Self, String> {
+    pub fn new(hit: HitPolicy, rect: RECT, capacity: usize, log: Log) -> Result<Self, String> {
         let transport = WindowsTransport {
-            target,
+            hit,
             log: log.clone(),
             batch: 0,
+            blocked: 0,
         };
-        let engine = Engine::new(
-            capacity,
-            Rectangle {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            transport,
-        )?;
+        let engine = Engine::new(capacity, rectangle(rect), transport)?;
         if unsafe { InitializeTouchInjection(capacity as u32, TOUCH_FEEDBACK_NONE) } == 0 {
             return Err(winerr("InitializeTouchInjection"));
         }
@@ -139,6 +169,13 @@ impl Injector {
     }
     pub fn release(&mut self, _cancel: bool) -> Result<(), String> {
         self.engine.cancel()
+    }
+    /// Release active contacts, then map subsequent frames into `rect`.
+    pub fn retarget(&mut self, rect: RECT) -> Result<(), String> {
+        self.engine.retarget(rectangle(rect))
+    }
+    pub fn blocked(&self) -> u64 {
+        self.engine.transport.blocked
     }
     pub fn keepalive(&mut self) -> Result<(), String> {
         if self.last_sent.elapsed() >= Duration::from_millis(16) {

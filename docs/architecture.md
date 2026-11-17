@@ -1,6 +1,6 @@
 # Architecture
 
-PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and a fixed per-session rectangle. Application-window targeting, persistent configuration, and release-level recovery remain outside this implementation. The CLI receiver remains available.
+PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and Phase 3 targets: application windows, rectangles inside windows, and desktop rectangles. Persistent configuration and release-level recovery remain outside this implementation. The CLI receiver remains available.
 
 ## Modules
 
@@ -9,7 +9,8 @@ PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | `main.rs` | Validate command-line options and dispatch capture or offline log verification. |
 | `gui.rs` | Own native controls, device selection, global shortcuts, the embedded receiver, and repeated capture sessions. |
 | `control.rs` | Track manual, Toggle, and Hold intent independently of asynchronous worker startup/shutdown. |
-| `mapping.rs` | Resolve the diagnostic target and define explicit future screen/window mapping configurations. |
+| `mapping.rs` | Resolve diagnostic, window, window-rectangle and screen-rectangle targets in physical pixels; hit policies; the dynamic target tracker. |
+| `overlay.rs` | Desktop rectangle selection overlay and click-through target outline. |
 | `device_info.rs` | Interpret declared HID length units, physical shape, logical ranges and coordinate density. |
 | `report_rate.rs` | Distinguish observed raw delivery, complete frame delivery and PTP scan cadence. |
 | `background_guard.rs` | Adapt the validated bounded settings-cache transaction to GUI sessions, retain recovery assets, and wait for restoration. |
@@ -90,7 +91,15 @@ UP uses the last successfully injected position. If a contact has only received 
 
 Other failures trigger cleanup. If cleanup also fails, known contacts and `cleanup_pending` remain visible and new DOWN events are blocked. Subsequent work retries cleanup before rearming. A roughly 16 ms keepalive submits complete stationary frames.
 
-Normal DOWN/UPDATE submissions must hit the dedicated receiver according to WindowFromPoint. Cleanup bypasses this check so an existing sequence can still be ended after occlusion. Window movement, minimization, device removal, and display changes trigger cancellation or stopping; automatic retargeting and reconnection are not implemented.
+Normal DOWN/UPDATE submissions are hit-tested with WindowFromPoint against the session's hit policy: exactly the diagnostic receiver, the target's top-level window or its children (`GA_ROOT`), or any window for screen rectangles. Cleanup bypasses this check so an existing sequence can still be ended after occlusion. For the diagnostic receiver, movement and minimization stop the session. Window targets are followed instead (next section). Device removal and display changes stop; reconnection is not implemented.
+
+## Window and rectangle targets
+
+All coordinates are physical desktop pixels. The process and the input worker thread run with Per-Monitor DPI Awareness V2, and target resolution refuses to run on any thread without it. A window's client rectangle is obtained by passing both client corners through ClientToScreen, so a DPI-virtualized (unaware or system-aware) window is converted consistently. Window rectangles are stored as fractions of the client area and scaled on every resolution.
+
+The worker re-resolves window targets on its 16 ms timer and feeds `mapping::Tracker`: changed bounds produce Retarget, unavailable windows (minimized, hidden, DWM-cloaked, too small for the aspect) produce one Pause, the next available observation produces Resume, and a destroyed window produces Stop. `Engine::retarget` cancels active contacts at their cached coordinates before replacing the mapping rectangle and requires a clear frame, so no pointer lifetime spans two mappings. Frames are not injected while paused.
+
+The input log records `TARGET` (mode, handle, receiver=embedded/external, bounds), `TARGET_UPDATE`, `TARGET_RESUME`, `TARGET_PAUSE`, `TARGET_LOST` and `TARGET_OCCLUSION`. The offline verifier checks every injected point against the current bounds. For external targets it cannot see the receiving application, so it audits injection-side lifetimes only and reports `receiver_audited=false`.
 
 ## Receiver and shutdown
 
