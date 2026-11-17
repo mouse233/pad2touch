@@ -11,6 +11,8 @@ cargo fmt -- --check
 cargo build --release --locked
 ```
 
+GitHub Actions runs the same checks on `windows-latest` for every push to `main` and every pull request (`.github/workflows/ci.yml`). Each run uploads the Release executable as a workflow artifact (kept for 7 days). CI skips all `#[ignore]` tests; the native GUI, injection and physical-touchpad checks below remain manual.
+
 Default tests do not open a receiver window or call the native touch-injection APIs. They exercise decoding, report assembly, mapping, complete contact frames, stable IDs, partial releases, slot replacement, retries, cancellation, and log verification through a fake transport.
 
 Optional private recording tests are documented in [the fixture directory](../tests/fixtures/README.md). A clean checkout must build and run default tests without these recordings.
