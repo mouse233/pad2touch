@@ -11,7 +11,10 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     ptr::{null, null_mut},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
@@ -42,10 +45,14 @@ const AREA: usize = 116;
 const TARGET_INFO: usize = 117;
 const PAD_FIT: usize = 118;
 const DEFAULT_CLIENT: (i32, i32) = (820, 594);
-const MIN_CLIENT: (i32, i32) = (760, 586);
 const PREVIEW_MS: u32 = 1500;
 const PANEL_LEFT: i32 = 274;
 const PANEL_TOP: i32 = 28;
+/// Fixed-size window: no sizing border and no maximize. The layout is designed
+/// for DEFAULT_CLIENT and only rescales with DPI. WS_CLIPCHILDREN keeps the
+/// dialog background from being painted under the controls.
+const MAIN_STYLE: WINDOW_STYLE =
+    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 
 #[derive(Clone, Copy)]
 enum Anchor {
@@ -57,6 +64,7 @@ enum Anchor {
 
 struct Control {
     hwnd: HWND,
+    group: bool,
     x: i32,
     y: i32,
     width: i32,
@@ -167,17 +175,20 @@ unsafe fn outer_size(width: i32, height: i32, dpi: u32) -> POINT {
         right: width * dpi as i32 / 96,
         bottom: height * dpi as i32 / 96,
     };
-    AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+    AdjustWindowRectExForDpi(&mut rect, MAIN_STYLE, 0, 0, dpi);
     POINT {
         x: rect.right - rect.left,
         y: rect.bottom - rect.top,
     }
 }
 
-unsafe fn register(class: &str, proc: WNDPROC) -> Result<(), String> {
+/// The main window registers without CS_HREDRAW/CS_VREDRAW: `layout` invalidates
+/// only what moved, so fixed controls are not erased and repainted on every
+/// resize step. The diagnostic panel keeps them; it paints through a back buffer.
+unsafe fn register(class: &str, proc: WNDPROC, style: WNDCLASS_STYLES) -> Result<(), String> {
     let name = wide(class);
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        style,
         lpfnWndProc: proc,
         hInstance: GetModuleHandleW(null()),
         lpszClassName: name.as_ptr(),
@@ -216,13 +227,17 @@ fn run_window() -> Result<(), String> {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
             return Err(winerr("SetProcessDpiAwarenessContext(GUI)"));
         }
-        register("PadBridgeGui", Some(window_proc))?;
-        register("PadBridgeDiagnosticPanel", Some(panel_proc))?;
+        register("PadBridgeGui", Some(window_proc), 0)?;
+        register(
+            "PadBridgeDiagnosticPanel",
+            Some(panel_proc),
+            CS_HREDRAW | CS_VREDRAW,
+        )?;
         let hwnd = CreateWindowExW(
             0,
             wide("PadBridgeGui").as_ptr(),
             wide("PadBridge Control Panel").as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            MAIN_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
@@ -294,6 +309,19 @@ fn run_window() -> Result<(), String> {
 
 impl Gui {
     unsafe fn new(hwnd: HWND) -> Result<Self, String> {
+        // Flicker is an intermediate paint state reaching the screen: the dialog
+        // background erased in one paint, the control drawn over it in a later
+        // one. The background is therefore never painted under child windows;
+        // every child paints its whole rectangle itself (group boxes included,
+        // see `group_proc`). WS_EX_COMPOSITED is not an alternative: with DWM
+        // it leaves controls blank while the window changes size.
+        // Applied here as well as at creation so every caller gets the fixed frame.
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_STYLE,
+            ((style & !(WS_THICKFRAME | WS_MAXIMIZEBOX)) | MAIN_STYLE) as isize,
+        );
         let dpi = GetDpiForWindow(hwnd).max(96);
         let mut g = Self {
             hwnd,
@@ -557,20 +585,34 @@ impl Gui {
                 "Global emergency shortcut unavailable; use Stop / disarm or Esc in this window.",
             );
         }
+        // Group boxes are opaque (`group_proc`) and must stay below every
+        // control and the panel: WS_CLIPSIBLINGS then clips those out of the
+        // group box's own paint, so it never draws over them.
+        for c in g.controls.iter().filter(|c| c.group) {
+            SetWindowPos(
+                c.hwnd,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
+        }
         g.set_font();
         let mut work = RECT::default();
         SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
+        // The window cannot be resized, so it is never made smaller than its
+        // layout; SWP_FRAMECHANGED applies the fixed frame set above.
         let size = outer_size(DEFAULT_CLIENT.0, DEFAULT_CLIENT.1, g.dpi);
-        let w = size.x.min((work.right - work.left - 32).max(1));
-        let h = size.y.min((work.bottom - work.top - 32).max(1));
         SetWindowPos(
             hwnd,
             null_mut(),
             work.left + 20,
             work.top + 20,
-            w,
-            h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            size.x,
+            size.y,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
         Ok(g)
     }
@@ -585,12 +627,9 @@ impl Gui {
         style: u32,
         bounds: [i32; 4],
     ) -> Result<HWND, String> {
+        let group = class == "BUTTON" && style & 0xF == BS_GROUPBOX as u32;
         let hwnd = CreateWindowExW(
-            if class == "BUTTON" && style & 0xF == BS_GROUPBOX as u32 {
-                WS_EX_TRANSPARENT
-            } else {
-                0
-            },
+            0,
             wide(class).as_ptr(),
             wide(text).as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
@@ -606,7 +645,12 @@ impl Gui {
         if hwnd.is_null() {
             return Err(winerr("CreateWindowExW(control)"));
         }
+        if group {
+            let original = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, group_proc as *const () as isize);
+            GROUP_PROC.store(original as usize, Ordering::Relaxed);
+        }
         self.controls.push(Control {
+            group,
             hwnd,
             x: bounds[0],
             y: bounds[1],
@@ -715,7 +759,12 @@ impl Gui {
         if rc.right <= 0 || rc.bottom <= 0 {
             return;
         }
-        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+        // Only controls whose bounds change are moved, and Windows' own
+        // invalidation is used: a moved control's pixels are copied to the new
+        // position, only the uncovered background is erased (WS_CLIPCHILDREN),
+        // and resized group boxes and the panel repaint from back buffers. Fixed
+        // controls, i.e. the whole left column, are not repainted at all.
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE;
         let mut placements = Vec::with_capacity(self.controls.len() + 1);
         for c in &self.controls {
             let (x, y, w, h) = match c.anchor {
@@ -755,7 +804,20 @@ impl Gui {
             (rc.right - x - self.px(10)).max(1),
             (rc.bottom - y - self.px(76)).max(1),
         ));
-        let mut batch = BeginDeferWindowPos(placements.len() as i32);
+        placements.retain(|&(hwnd, x, y, w, h)| {
+            let old = child_rect(self.hwnd, hwnd);
+            (
+                old.left,
+                old.top,
+                old.right - old.left,
+                old.bottom - old.top,
+            ) != (x, y, w, h)
+        });
+        let mut batch = if placements.is_empty() {
+            null_mut()
+        } else {
+            BeginDeferWindowPos(placements.len() as i32)
+        };
         for &(hwnd, x, y, w, h) in &placements {
             if batch.is_null() {
                 break;
@@ -768,14 +830,9 @@ impl Gui {
                 SetWindowPos(hwnd, null_mut(), x, y, w, h, flags);
             }
         }
+        // Painting stays queued: a synchronous WM_PAINT here would find GUI's
+        // RefCell borrowed. See WM_SIZE in `window_proc` for the immediate update.
         self.refresh_preview_rect();
-        // Queued redraw avoids reentrant WM_PAINT while GUI's RefCell is borrowed.
-        RedrawWindow(
-            self.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-        );
     }
     unsafe fn refresh_devices(&mut self) {
         let previous = self
@@ -1476,6 +1533,68 @@ fn is_plain_escape(msg: &MSG) -> bool {
             || (msg.message == WM_SYSKEYDOWN && msg.lParam & (1 << 29) == 0))
 }
 
+/// The system Button procedure that group boxes were subclassed from.
+static GROUP_PROC: AtomicUsize = AtomicUsize::new(0);
+
+/// Group boxes do not paint their interior; they rely on the parent erasing
+/// under them first, which shows as a blank frame between the two paints. This
+/// paints the dialog background and the system-drawn frame and caption into a
+/// back buffer and presents them together in a single paint.
+unsafe extern "system" fn group_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // SAFETY: set from SetWindowLongPtrW(GWLP_WNDPROC) before any subclassed message.
+    let original: WNDPROC = std::mem::transmute(GROUP_PROC.load(Ordering::Relaxed));
+    match msg {
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            GetClientRect(hwnd, &mut rc);
+            if !dc.is_null() && rc.right > 0 && rc.bottom > 0 {
+                match crate::render::BackBuffer::new(dc, rc.right, rc.bottom) {
+                    Ok(buffer) => {
+                        FillRect(buffer.dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+                        CallWindowProcW(
+                            original,
+                            hwnd,
+                            WM_PRINTCLIENT,
+                            buffer.dc as WPARAM,
+                            PRF_CLIENT as LPARAM,
+                        );
+                        let _ = buffer.present(dc);
+                    }
+                    Err(_) => {
+                        FillRect(dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+                        CallWindowProcW(
+                            original,
+                            hwnd,
+                            WM_PRINTCLIENT,
+                            dc as WPARAM,
+                            PRF_CLIENT as LPARAM,
+                        );
+                    }
+                }
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        // The frame follows the size, so the whole box repaints.
+        WM_SIZE => {
+            InvalidateRect(hwnd, null(), 0);
+        }
+        _ => {}
+    }
+    CallWindowProcW(original, hwnd, msg, w, l)
+}
+
+/// A child window's bounds in its parent's client coordinates.
+unsafe fn child_rect(parent: HWND, child: HWND) -> RECT {
+    let mut rect = RECT::default();
+    GetWindowRect(child, &mut rect);
+    MapWindowPoints(null_mut(), parent, (&mut rect as *mut RECT).cast(), 2);
+    rect
+}
+
 unsafe fn set_text(hwnd: HWND, text: &str) -> bool {
     let mut current = vec![0u16; GetWindowTextLengthW(hwnd).max(0) as usize + 1];
     let len = GetWindowTextW(hwnd, current.as_mut_ptr(), current.len() as i32);
@@ -1551,6 +1670,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         | WM_DPICHANGED
         | overlay::WM_SELECTION_DONE => {
             let mut destroy = false;
+            let mut laid_out = false;
             GUI.with(|slot| {
                 let Ok(mut slot) = slot.try_borrow_mut() else {
                     return;
@@ -1642,12 +1762,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     WM_EXITSIZEMOVE => {
                         g.layout();
+                        laid_out = true;
                     }
                     WM_SIZE => {
                         if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
                             g.disarm("Window resized. Capture stopped.");
                         }
                         g.layout();
+                        laid_out = true;
                     }
                     WM_DPICHANGED => {
                         if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
@@ -1655,30 +1777,34 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         }
                         g.dpi = (w & 0xffff) as u32;
                         g.set_font();
+                        // Keep the suggested position, but size the fixed
+                        // client area exactly for the new DPI.
                         let r = &*(l as *const RECT);
+                        let size = outer_size(DEFAULT_CLIENT.0, DEFAULT_CLIENT.1, g.dpi);
                         SetWindowPos(
                             hwnd,
                             null_mut(),
                             r.left,
                             r.top,
-                            r.right - r.left,
-                            r.bottom - r.top,
+                            size.x,
+                            size.y,
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         );
                         g.layout();
+                        laid_out = true;
                     }
                     _ => {}
                 }
             });
+            if laid_out {
+                // Paint the new layout now rather than when the message queue
+                // next goes idle. The RefCell is released here, so the panel can
+                // paint.
+                RedrawWindow(hwnd, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+            }
             if destroy {
                 DestroyWindow(hwnd);
             }
-            return 0;
-        }
-        WM_GETMINMAXINFO => {
-            let info = &mut *(l as *mut MINMAXINFO);
-            info.ptMinTrackSize =
-                outer_size(MIN_CLIENT.0, MIN_CLIENT.1, GetDpiForWindow(hwnd).max(96));
             return 0;
         }
         WM_DESTROY => {
@@ -1788,8 +1914,13 @@ mod tests {
     fn native_gui_focus_moves_off_disabled_controls() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),
@@ -1895,8 +2026,13 @@ mod tests {
         }
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),
@@ -2171,8 +2307,13 @@ mod tests {
         const RED: u32 = 0x002020E0;
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),
@@ -2348,7 +2489,9 @@ mod tests {
         GUI.with(|slot| {
             let slot = slot.borrow();
             let g = slot.as_ref().unwrap();
-            let dc = GetDC(hwnd);
+            // Without DCX_CLIPCHILDREN: some sample points lie inside group
+            // boxes, which are child windows that paint the same background.
+            let dc = GetDCEx(hwnd, null_mut(), DCX_CACHE);
             let background = GetSysColor(COLOR_BTNFACE);
             for (x, y) in [
                 (140, 67),
@@ -2366,29 +2509,33 @@ mod tests {
                 );
             }
             ReleaseDC(hwnd, dc);
-            let panel_dc = GetDC(g.panel);
-            let mut canvas = POINT {
-                x: g.rect.left,
-                y: g.rect.top,
-            };
-            ScreenToClient(g.panel, &mut canvas);
-            assert_eq!(
-                GetPixel(panel_dc, canvas.x, canvas.y + 1),
-                0x00808080,
-                "canvas border moved or was not repainted"
-            );
-            ReleaseDC(g.panel, panel_dc);
-            let mut origin = POINT::default();
-            ClientToScreen(g.panel, &mut origin);
-            assert!(g.rect.left - origin.x >= g.px(16));
-            assert!(g.rect.top - origin.y >= g.px(190));
-            let aspect = g.geometry.unwrap().aspect().unwrap();
-            assert!(
-                ((g.rect.right - g.rect.left) as f64
-                    - (g.rect.bottom - g.rect.top) as f64 * aspect)
-                    .abs()
-                    <= aspect.max(1.0)
-            );
+            // The receiver canvas exists only for the test area with a known
+            // touchpad shape; without a touchpad only the dialog is checked.
+            if let Some(geometry) = g.geometry.filter(|_| g.rect.right > g.rect.left) {
+                let panel_dc = GetDC(g.panel);
+                let mut canvas = POINT {
+                    x: g.rect.left,
+                    y: g.rect.top,
+                };
+                ScreenToClient(g.panel, &mut canvas);
+                assert_eq!(
+                    GetPixel(panel_dc, canvas.x, canvas.y + 1),
+                    0x00808080,
+                    "canvas border moved or was not repainted"
+                );
+                ReleaseDC(g.panel, panel_dc);
+                let mut origin = POINT::default();
+                ClientToScreen(g.panel, &mut origin);
+                assert!(g.rect.left - origin.x >= g.px(16));
+                assert!(g.rect.top - origin.y >= g.px(190));
+                let aspect = geometry.aspect().unwrap();
+                assert!(
+                    ((g.rect.right - g.rect.left) as f64
+                        - (g.rect.bottom - g.rect.top) as f64 * aspect)
+                        .abs()
+                        <= aspect.max(1.0)
+                );
+            }
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client);
             for c in &g.controls {
@@ -2420,16 +2567,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "shows an idle native window briefly and checks actual displayed pixels after resizing/moving/maximizing; no capture or settings changes"]
-    fn native_gui_live_resize_repaints_background_and_canvas() {
+    #[ignore = "shows an idle native window briefly and checks actual displayed pixels after moving/minimizing/restoring; no capture or settings changes"]
+    fn native_gui_fixed_size_repaints_background_and_canvas() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge resize regression").as_ptr(),
+                wide("PadBridge fixed-size regression").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 20,
                 20,
@@ -2443,13 +2595,34 @@ mod tests {
             let mut gui = Gui::new(hwnd).unwrap();
             gui.refresh_devices();
             let dpi = gui.dpi;
+            let expected = (gui.px(DEFAULT_CLIENT.0), gui.px(DEFAULT_CLIENT.1));
             GUI.with(|slot| *slot.borrow_mut() = Some(gui));
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
+                let test_area = g.choices.iter().position(|&c| c == Choice::Diagnostic);
+                SendMessageW(g.item(TARGET), CB_SETCURSEL, test_area.unwrap(), 0);
                 g.layout();
                 g.update_controls();
             });
+            // Even when created with a sizable frame, the window becomes fixed.
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            assert_eq!(
+                style & (WS_THICKFRAME | WS_MAXIMIZEBOX),
+                0,
+                "window is resizable"
+            );
+            assert_ne!(
+                style & WS_CLIPCHILDREN,
+                0,
+                "background paints under controls"
+            );
+            let client = || {
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc);
+                (rc.right, rc.bottom)
+            };
+            assert_eq!(client(), expected, "client size");
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             SetWindowPos(
@@ -2464,44 +2637,7 @@ mod tests {
             pump_for(Duration::from_millis(150));
             assert_live_layout(hwnd);
             save_client_preview(hwnd);
-            for (index, (width, height)) in [(1000, 620), MIN_CLIENT, (900, 550), DEFAULT_CLIENT]
-                .into_iter()
-                .enumerate()
-            {
-                let size = outer_size(width, height, dpi);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    30 + index as i32 * 12,
-                    30 + index as i32 * 8,
-                    size.x,
-                    size.y,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                pump_for(Duration::from_millis(100));
-                assert_live_layout(hwnd);
-            }
             let mut before = RECT::default();
-            // Coalesce several resize invalidations before dispatching WM_PAINT,
-            // as happens while dragging an edge quickly.
-            for step in 0..12 {
-                let size = outer_size(
-                    DEFAULT_CLIENT.0 + step * 8,
-                    DEFAULT_CLIENT.1 + step * 4,
-                    dpi,
-                );
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    40,
-                    40,
-                    size.x,
-                    size.y,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            pump_for(Duration::from_millis(100));
-            assert_live_layout(hwnd);
             GetWindowRect(hwnd, &mut before);
             SetWindowPos(
                 hwnd,
@@ -2514,18 +2650,18 @@ mod tests {
             );
             pump_for(Duration::from_millis(100));
             assert_live_layout(hwnd);
-            ShowWindow(hwnd, SW_MAXIMIZE);
+            ShowWindow(hwnd, SW_MINIMIZE);
             pump_for(Duration::from_millis(100));
-            assert_live_layout(hwnd);
             ShowWindow(hwnd, SW_RESTORE);
-            pump_for(Duration::from_millis(100));
+            pump_for(Duration::from_millis(150));
+            assert_eq!(client(), expected, "client size after restore");
             assert_live_layout(hwnd);
             save_client_preview(hwnd);
             SendMessageW(hwnd, WM_CLOSE, 0, 0);
             GUI.with(|slot| {
                 slot.borrow_mut().take();
             });
-            println!("native_live_resize_sequences=8 background_and_canvas=passed dpi={dpi}");
+            println!("native_fixed_size=passed client={expected:?} dpi={dpi}");
         }
     }
 
@@ -2534,8 +2670,13 @@ mod tests {
     fn native_gui_background_guard_session_restores() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),
@@ -2678,8 +2819,13 @@ mod tests {
     fn native_gui_sessions_restart_and_hotkey_messages_stop_cleanly() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc)).unwrap();
-            register("PadBridgeDiagnosticPanel", Some(panel_proc)).unwrap();
+            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register(
+                "PadBridgeDiagnosticPanel",
+                Some(panel_proc),
+                CS_HREDRAW | CS_VREDRAW,
+            )
+            .unwrap();
             let hwnd = CreateWindowExW(
                 0,
                 wide("PadBridgeGui").as_ptr(),

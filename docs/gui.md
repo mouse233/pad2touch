@@ -71,7 +71,7 @@ For every choice except the test area, the right panel shows a mapping diagram b
 
 While idle, the region is re-resolved every 250 ms, so moving a target window updates the diagram. During a session the diagram shows the session's current bounds, including retargets. If the target is not configured or not available, the diagram shows the reason instead of a region. The thumbnail is drawn only in this panel; it is never logged or written to disk.
 
-The thumbnail is captured on demand rather than continuously: when the screen area or window selection changes, after an area selection, when the display configuration changes, and when PadBridge is activated again. Reading the composed desktop back from Windows takes about 33 ms (about 7 ms of CPU) on the GUI thread, so periodic capture would make the window hitch; ordinary repaints and window resizing reuse the existing image at about 0.07 ms per repaint. No capture happens during a session. The image can therefore be slightly out of date, and switching back to PadBridge refreshes it.
+The thumbnail is captured on demand rather than continuously: when the screen area or window selection changes, after an area selection, when the display configuration changes, and when PadBridge is activated again. Reading the composed desktop back from Windows takes about 33 ms (about 7 ms of CPU) on the GUI thread, so periodic capture would make the window hitch; ordinary repaints reuse the existing image at about 0.07 ms per repaint. No capture happens during a session. The image can therefore be slightly out of date, and switching back to PadBridge refreshes it.
 
 The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. PadBridge's own windows cannot be application targets. Selections are not persisted across launches.
 
@@ -109,11 +109,13 @@ The Foreground guard only applies while PadBridge itself is foreground, so it is
 
 ## Window layout and repainting
 
-The default client area is 820 by 512 logical pixels, scaled using the monitor DPI; minimum client size is 760 by 504. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint stretch or anchor to the client bounds; controls are not vertically compressed.
+The window has a fixed size: no sizing border and no maximize button (it can still be moved and minimized). The client area is 820 by 594 logical pixels, scaled using the monitor DPI and resized only when the DPI changes. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint are placed relative to the client bounds; controls are not vertically compressed.
 
-Native labels, group boxes and read-only status fields use the system COLOR_BTNFACE brush through the control-color messages. Editable/selectable input surfaces retain their system theme. Transparent group boxes and sibling clipping preserve overlapping control ordering. The parent paints its background under group boxes, with no blanket WS_CLIPCHILDREN exclusion.
+Native labels, group boxes and read-only status fields use the system COLOR_BTNFACE brush through the control-color messages. Editable/selectable input surfaces retain their system theme.
 
-Layout batches positions with DeferWindowPos, disables copying stale client pixels, and queues invalidation/erasure for the parent and all children. Screen-coordinate changes refresh the displayed diagnostic rectangle; each running injection session retains its own immutable target and existing movement/resize stop behavior. The message font comes from system non-client metrics for the current DPI.
+The window avoids flicker by never showing a half-painted state. The main window uses WS_CLIPCHILDREN, so the dialog background is never erased under a control that then has to repaint itself. Group boxes, which do not paint their own interior, are opaque, sit at the bottom of the sibling Z-order and paint the background, frame and caption together through a back buffer; sibling clipping keeps them off the controls inside them. The receiver paints through its own back buffer. WS_EX_COMPOSITED was tried and rejected: under DWM it left controls blank while the window changed size.
+
+Layout batches positions with DeferWindowPos and only moves windows whose bounds change, using Windows' normal invalidation. Unchanged controls are not repainted. Screen-coordinate changes refresh the displayed diagnostic rectangle; each running injection session retains its own immutable target and existing movement/resize stop behavior. The message font comes from system non-client metrics for the current DPI.
 
 ## Physical shape and device information
 
