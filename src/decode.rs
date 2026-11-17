@@ -177,6 +177,7 @@ impl Assembler {
         self.expected != 0
     }
 }
+#[cfg(test)]
 pub fn map_axis(raw: i32, min: i32, max: i32, start: i32, length: i32) -> Result<i32, String> {
     if max <= min || length <= 0 {
         return Err("invalid mapping range".into());

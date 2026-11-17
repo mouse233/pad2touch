@@ -1,5 +1,5 @@
 //! Transactional contact planning and injection orchestration. No Windows APIs.
-use crate::decode::{map_axis, Contact};
+use crate::{decode::Contact, mapping::NormRect};
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Instant,
@@ -26,11 +26,42 @@ impl Rectangle {
         }
         Ok(self)
     }
-    fn map(self, c: &Contact) -> Result<Point, String> {
-        Ok(Point {
-            x: map_axis(c.x, c.xmin, c.xmax, self.left, self.right - self.left)?,
-            y: map_axis(c.y, c.ymin, c.ymax, self.top, self.bottom - self.top)?,
-        })
+    /// Map a contact inside the used touchpad region; None if it lies outside.
+    /// With the full region this equals `decode::map_axis` on both axes.
+    fn map(self, c: &Contact, input: NormRect) -> Result<Option<Point>, String> {
+        let axis = |raw: i32, min: i32, max: i32, lo: f64, hi: f64, start: i32, len: i32| {
+            if max <= min || len <= 0 {
+                return Err("invalid mapping range".to_string());
+            }
+            let t = ((raw as f64 - min as f64) / (max as f64 - min as f64)).clamp(0.0, 1.0);
+            let u = (t - lo) / (hi - lo);
+            const EDGE: f64 = 1e-9;
+            if !(-EDGE..=1.0 + EDGE).contains(&u) {
+                return Ok(None);
+            }
+            Ok(Some(
+                (start as f64 + u.clamp(0.0, 1.0) * (len - 1) as f64).round() as i32,
+            ))
+        };
+        let x = axis(
+            c.x,
+            c.xmin,
+            c.xmax,
+            input.left,
+            input.right,
+            self.left,
+            self.right - self.left,
+        )?;
+        let y = axis(
+            c.y,
+            c.ymin,
+            c.ymax,
+            input.top,
+            input.bottom,
+            self.top,
+            self.bottom - self.top,
+        )?;
+        Ok(x.zip(y).map(|(x, y)| Point { x, y }))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +98,7 @@ struct Submission {
 pub struct Planner {
     limit: usize,
     rect: Rectangle,
+    input: NormRect,
     active: Contacts,
     armed: bool,
 }
@@ -78,6 +110,7 @@ impl Planner {
         Ok(Self {
             limit,
             rect: rect.validate()?,
+            input: NormRect::FULL,
             active: Contacts::new(),
             armed: false,
         })
@@ -184,7 +217,18 @@ impl Planner {
         if !self.armed && self.active.is_empty() {
             return Ok((vec![], physically_empty));
         }
-        let live: Vec<_> = input.iter().filter(|c| c.tip && c.confidence).collect();
+        // Contacts outside the used touchpad region are ignored like
+        // low-confidence ones; they still count as physically down.
+        let mut mapped = BTreeMap::new();
+        for c in input.iter().filter(|c| c.tip && c.confidence) {
+            if let Some(p) = self.rect.map(c, self.input)? {
+                mapped.insert(c.id, p);
+            }
+        }
+        let live: Vec<_> = input
+            .iter()
+            .filter(|c| mapped.contains_key(&c.id))
+            .collect();
         if self.limit > 1 && live.len() > self.limit {
             return Err(format!(
                 "{} confident contacts exceed capacity {}",
@@ -204,7 +248,7 @@ impl Planner {
         };
         let mut desired = BTreeMap::new();
         for c in selected {
-            desired.insert(c.id, self.rect.map(c)?);
+            desired.insert(c.id, mapped[&c.id]);
         }
         let mut state = self.active.clone();
         let mut plan = Vec::new();
@@ -350,10 +394,12 @@ impl<T: Transport> Engine<T> {
     /// Move the mapping rectangle. Active contacts are cancelled at their cached
     /// positions first, and a new all-fingers-up frame is required afterward,
     /// so no lifetime spans two different mappings.
-    pub fn retarget(&mut self, rect: Rectangle) -> Result<(), String> {
+    pub fn retarget(&mut self, rect: Rectangle, input: NormRect) -> Result<(), String> {
         let rect = rect.validate()?;
+        let input = input.validate()?;
         let released = self.cancel();
         self.planner.rect = rect;
+        self.planner.input = input;
         released
     }
     fn fail(&mut self, cause: String) -> String {
@@ -834,12 +880,15 @@ pub mod tests {
         e.apply(&[contact(7, 1000, 1000)]).unwrap();
         let last = e.transport.accepted.last().unwrap().pointers[0].point;
         assert_eq!(last, Point { x: 1100, y: 1200 });
-        e.retarget(Rectangle {
-            left: -800,
-            top: -600,
-            right: -399,
-            bottom: -399,
-        })
+        e.retarget(
+            Rectangle {
+                left: -800,
+                top: -600,
+                right: -399,
+                bottom: -399,
+            },
+            NormRect::FULL,
+        )
         .unwrap();
         let tail = &e.transport.accepted[e.transport.accepted.len() - 2..];
         assert!(tail
@@ -864,12 +913,15 @@ pub mod tests {
             [Point { x: -800, y: -600 }, Point { x: -400, y: -400 }]
         );
         assert!(e
-            .retarget(Rectangle {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 5
-            })
+            .retarget(
+                Rectangle {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 5
+                },
+                NormRect::FULL
+            )
             .is_err());
     }
     #[test]
@@ -883,13 +935,73 @@ pub mod tests {
             right: 20,
             bottom: 20,
         };
-        assert!(e.retarget(r).is_err());
+        assert!(e.retarget(r, NormRect::FULL).is_err());
         assert!(e.cleanup_pending);
         assert_eq!(e.active_count(), 1);
         // Recovery still ends the old contact before any new DOWN.
         assert!(e.apply(&[]).is_err());
         assert!(!e.cleanup_pending);
         assert_eq!(e.active_count(), 0);
+    }
+    #[test]
+    fn used_touchpad_region_maps_inside_and_ignores_outside() {
+        let mut e = engine(2);
+        // Use the central half horizontally (Touchpad area: fill area).
+        let half = NormRect {
+            left: 0.25,
+            top: 0.0,
+            right: 0.75,
+            bottom: 1.0,
+        };
+        e.retarget(
+            Rectangle {
+                left: 0,
+                top: 0,
+                right: 101,
+                bottom: 101,
+            },
+            half,
+        )
+        .unwrap();
+        // A finger resting outside the used region still blocks arming.
+        e.apply(&[contact(1, 50, 500)]).unwrap();
+        assert!(!e.is_armed());
+        e.apply(&[]).unwrap();
+        e.apply(&[contact(1, 250, 0), contact(2, 900, 500)])
+            .unwrap();
+        let down = e.transport.accepted.last().unwrap().clone();
+        assert_eq!(down.pointers.len(), 1, "outside contact ignored");
+        assert_eq!(down.pointers[0].point, Point { x: 0, y: 0 });
+        e.apply(&[contact(1, 750, 1000)]).unwrap();
+        let p = e.transport.accepted.last().unwrap().pointers[0];
+        assert_eq!(
+            (p.point, p.action),
+            (Point { x: 100, y: 100 }, Action::Update)
+        );
+        e.apply(&[contact(1, 500, 500)]).unwrap();
+        let p = e.transport.accepted.last().unwrap().pointers[0].point;
+        assert_eq!(p, Point { x: 50, y: 50 });
+        // Sliding out of the used region releases that contact.
+        e.apply(&[contact(1, 800, 500)]).unwrap();
+        let last = e.transport.accepted.last().unwrap();
+        assert_eq!(last.pointers[0].action, Action::Up);
+        assert_eq!(e.active_count(), 0);
+        // The full region reproduces decode::map_axis exactly.
+        let r = Rectangle {
+            left: -500,
+            top: 0,
+            right: -99,
+            bottom: 10,
+        };
+        for raw in [0, 1, 333, 999, 1000, 1500] {
+            let c = contact(9, raw, raw);
+            let p = r.map(&c, NormRect::FULL).unwrap().unwrap();
+            assert_eq!(
+                p.x,
+                crate::decode::map_axis(raw, 0, 1000, -500, 401).unwrap()
+            );
+            assert_eq!(p.y, crate::decode::map_axis(raw, 0, 1000, 0, 10).unwrap());
+        }
     }
     #[test]
     fn keepalive_and_target_failures_cancel_all() {

@@ -46,18 +46,51 @@ The option changes user-wide settings during its interval; native pointer moveme
 
 ## Mapping targets (Phase 3)
 
-The **Mapping target** group selects where touches go:
+The **Screen area** group selects where touches go. The list follows the familiar pen-tablet layout: presets first, then custom portions.
 
-| Target | Configure | Bounds | Hit test |
+| Choice | Configure | Bounds | Hit test |
 |---|---|---|---|
-| Diagnostic area | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
-| Screen rectangle | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None (whatever is on screen receives it) |
+| Diagnostic area (test) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
+| Full desktop | Nothing; **Show area** flashes it | The whole virtual desktop | None (whatever is on screen receives it) |
+| Monitor N · W×H | Nothing; one entry per connected display, main display first | That monitor | None |
+| Portion of screen… | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None |
 | Application window | Choose a window from the list; **Show area** flashes the mapped region | Whole client area (title bar and borders excluded) | Target window or its child windows |
-| Window rectangle | Choose a window, **Select area…**, drag inside its client area | Normalized client-relative rectangle | Target window or its child windows |
+| Portion of window… | Choose a window, **Select area…**, drag inside its client area | Normalized client-relative rectangle | Target window or its child windows |
+
+The monitor list is rebuilt when the display configuration changes. A selected monitor is matched by its display device name; if it disappears, the choice falls back to the diagnostic area. Full desktop requires a rectangular arrangement: if monitors of different sizes leave uncovered corners, it is rejected with an explanation (use a monitor or a portion instead).
+
+### Mapping diagram
+
+For every choice except the diagnostic area, the right panel shows a mapping diagram below the diagnostic text, similar to pen-tablet control panels:
+
+- **Top:** each monitor drawn in its real arrangement and proportions, with a bezel, a stand under monitors on the bottom row, and a desktop thumbnail.
+- **Bottom:** the touchpad at its declared physical aspect. If the device geometry is unavailable, a 1.6 placeholder is shown and labeled as such. In fill-area mode the unused part of the touchpad is darker.
+- **Red:** the mapped region on the screens (the bounds a session would use), the used part of the touchpad, and four connectors between their corners. In keep-shape mode a thin gray frame shows the selected area, so its unreachable margins are visible.
+- **During capture:** each live finger is drawn as a colored dot on the touchpad and, when it is inside the used part, at its mapped position on the screen.
+
+While idle, the region is re-resolved every 250 ms, so moving a target window updates the diagram. During a session the diagram shows the session's current bounds, including retargets. If the target is not configured or not available, the diagram shows the reason instead of a region. The thumbnail is drawn only in this panel; it is never logged or written to disk.
+
+The thumbnail is captured on demand rather than continuously: when the screen area or window selection changes, after an area selection, when the display configuration changes, and when PadBridge is activated again. Reading the composed desktop back from Windows takes about 33 ms (about 7 ms of CPU) on the GUI thread, so periodic capture would make the window hitch; ordinary repaints and window resizing reuse the existing image at about 0.07 ms per repaint. No capture happens during a session. The image can therefore be slightly out of date, and switching back to PadBridge refreshes it.
 
 The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. PadBridge's own windows cannot be application targets. Selections are not persisted across launches.
 
-Selection uses a topmost dimmed overlay in physical pixels; Esc, right-click, the emergency stop or Stop cancels it and keeps the previous selection. Screen rectangles must be at least 16×16 pixels, lie inside the virtual desktop and have their corners and center on a display; negative secondary-monitor coordinates are supported. Window rectangles are stored as fractions of the client area, so they scale with the window. After a selection, a click-through outline drawn just outside the mapped region shows it for 1.5 seconds; the outline is never shown during a session. All targets are letterboxed to the touchpad's physical aspect, as before.
+### Touchpad area
+
+The **Touchpad** list decides what happens when the touchpad's physical shape differs from the screen area's shape:
+
+| Choice | Touchpad used | Screen area used | Shape | Needs physical geometry |
+|---|---|---|---|---|
+| Whole pad · keep shape (default) | All | A centered region with the pad's shape | Undistorted | Yes |
+| Whole pad · stretch | All | All | Scaled independently on X and Y | No |
+| Part of pad · fill area | A centered part with the area's shape | All | Undistorted | Yes |
+
+In fill-area mode, contacts outside the used part are ignored the same way as low-confidence contacts: they are not injected, a finger sliding out is released, and they still count as physically down, so arming still needs all fingers lifted. When a window target is resized, the used part is recomputed for its new shape together with the retarget. Stretch is the only mode that can inject when the device declares no usable physical size; the others refuse with an explanation. The diagnostic area honors the same setting.
+
+The used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
+
+### Selection
+
+Selection uses a topmost dimmed overlay in physical pixels; Esc, right-click, the emergency stop or Stop cancels it and keeps the previous selection. Screen rectangles must be at least 16×16 pixels, lie inside the virtual desktop and have their corners and center on a display; negative secondary-monitor coordinates are supported. Window rectangles are stored as fractions of the client area, so they scale with the window. After a selection, a click-through outline drawn just outside the mapped region shows it for 1.5 seconds; the outline is never shown during a session. The Touchpad setting below decides how the touchpad's shape fits the area.
 
 During a session the worker re-resolves window targets every 16 ms:
 

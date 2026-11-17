@@ -96,6 +96,12 @@ pub struct Stats {
     pub target_updates: u64,
     pub target_pauses: u64,
     pub injection_blocked: u64,
+    /// Current mapped bounds in physical desktop pixels (empty if none).
+    pub mapped: RECT,
+    /// Used touchpad region of the current mapping.
+    pub mapped_input: Option<crate::mapping::NormRect>,
+    /// Live confident contacts, normalized to the touchpad's logical range.
+    pub live: Vec<(f64, f64)>,
 }
 pub(crate) type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -339,6 +345,9 @@ pub fn run(opt: Options) -> Result<(), String> {
             bounds: rect,
             hit: crate::mapping::HitPolicy::Exact(hwnd as usize),
             aspect: None,
+            // The CLI receiver keeps the physical shape (fit_aspect above).
+            fit: crate::mapping::PadFit::KeepShape,
+            input: crate::mapping::NormRect::FULL,
         };
         let mode = opt.mode.clone();
         let inject = opt.inject || mode == "self-test";
@@ -452,7 +461,7 @@ pub(crate) fn target_record(
     r: RECT,
 ) -> String {
     format!(
-        "{kind} mode={} window=0x{:X} receiver={} left={} top={} right={} bottom={}",
+        "{kind} mode={} window=0x{:X} receiver={} left={} top={} right={} bottom={} pad_fit={} pad_input={:.4},{:.4},{:.4},{:.4}",
         target.spec.label(),
         target.window,
         if target.spec.is_diagnostic() {
@@ -463,11 +472,21 @@ pub(crate) fn target_record(
         r.left,
         r.top,
         r.right,
-        r.bottom
+        r.bottom,
+        target.fit.label(),
+        target.input.left,
+        target.input.top,
+        target.input.right,
+        target.input.bottom
     )
 }
 pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
-    match target.spec {
+    let fit = match target.fit {
+        crate::mapping::PadFit::KeepShape => "whole pad, keep shape",
+        crate::mapping::PadFit::Stretch => "whole pad, stretched",
+        crate::mapping::PadFit::FillArea => "part of pad, fill area",
+    };
+    let place: String = match target.spec {
         crate::mapping::MappingTarget::Diagnostics => "diagnostic receiver".into(),
         crate::mapping::MappingTarget::ScreenRectangle { .. } => "screen rectangle".into(),
         crate::mapping::MappingTarget::Window { handle } => {
@@ -480,7 +499,8 @@ pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
             area.top * 100.0,
             area.bottom * 100.0
         ),
-    }
+    };
+    format!("{place} ({fit})")
 }
 
 /// A GUI-owned session. The caller keeps pumping receiver messages during stop
@@ -512,8 +532,12 @@ impl Session {
         }
         // Resolve parser support before starting either thread.
         device.fields()?;
-        if inject {
-            let ratio = device.geometry()?.aspect()?;
+        if inject && target.fit.needs_shape() {
+            // The used part of the pad must have the target's physical shape;
+            // only Stretch deliberately distorts.
+            let pad = device.geometry()?.aspect()?;
+            let i = target.input;
+            let ratio = pad * (i.right - i.left) / (i.bottom - i.top);
             let width = target.bounds.right as f64 - target.bounds.left as f64;
             let height = target.bounds.bottom as f64 - target.bounds.top as f64;
             if width < 2.0 || height < 2.0 || (width - height * ratio).abs() > ratio.max(1.0) {
@@ -546,6 +570,8 @@ impl Session {
             let mut s = shared.lock().unwrap();
             s.target_label = target_label(&target);
             s.target_state = format!("mapped {}", crate::mapping::describe(r));
+            s.mapped = r;
+            s.mapped_input = Some(target.input);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -911,7 +937,7 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
         let buffer = ui.back_buffer.as_ref().unwrap();
-        paint_diagnostics(hwnd, buffer.dc, &rc, &ui.shared, ui.rect, 96);
+        paint_diagnostics(hwnd, buffer.dc, &rc, &ui.shared, ui.rect, 96, true);
         if let Err(error) = buffer.present(screen) {
             ui.log.event(format!("RENDER_ERROR {error}"));
         }
@@ -940,6 +966,7 @@ pub(crate) unsafe fn paint_diagnostics(
     shared: &Shared,
     rect: RECT,
     dpi: u32,
+    canvas: bool,
 ) {
     let px = |n: i32| n * dpi as i32 / 96;
     FillRect(dc, rc, (COLOR_BTNFACE + 1) as HBRUSH);
@@ -1007,6 +1034,8 @@ pub(crate) unsafe fn paint_diagnostics(
         right: rect.right - org.x,
         bottom: rect.bottom - org.y,
     };
+    // Without a canvas, `rect` only limits the text (e.g. above a diagram).
+    let boxrect = if canvas { boxrect } else { RECT::default() };
     if boxrect.right > boxrect.left && boxrect.bottom > boxrect.top {
         FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
     }
@@ -1113,7 +1142,13 @@ fn worker_loop(
         .transpose()?
         .unwrap_or_default();
     let injector = if inject {
-        Some(Injector::new(target.hit, rect, capacity, log.clone())?)
+        Some(Injector::new(
+            target.hit,
+            rect,
+            target.input,
+            capacity,
+            log.clone(),
+        )?)
     } else {
         None
     };
@@ -1254,6 +1289,16 @@ impl Worker {
             let mut s = self.shared.lock().unwrap();
             s.frames += 1;
             s.peak = s.peak.max(live);
+            s.live = contacts
+                .iter()
+                .filter(|c| c.tip && c.confidence)
+                .map(|c| {
+                    let norm = |v: i32, min: i32, max: i32| {
+                        (v as f64 - min as f64) / (max as f64 - min as f64).max(1.0)
+                    };
+                    (norm(c.x, c.xmin, c.xmax), norm(c.y, c.ymin, c.ymax))
+                })
+                .collect();
             s.last = contacts
                 .iter()
                 .map(|c| {
@@ -1469,8 +1514,15 @@ impl Worker {
             Decision::Keep => {}
             Decision::Retarget(r) | Decision::Resume(r) => {
                 let resumed = matches!(decision, Decision::Resume(_));
-                let result = self.injector.as_mut().map_or(Ok(()), |i| i.retarget(r));
+                // Fill-area mode re-crops the pad when the window's shape changes.
+                let input = self.target.input_for(r);
+                let result = self
+                    .injector
+                    .as_mut()
+                    .map_or(Ok(()), |i| i.retarget(r, input));
                 self.target.bounds = r;
+                self.target.input = input;
+                self.shared.lock().unwrap().mapped_input = Some(input);
                 self.log.event(crate::experiment::target_record(
                     if resumed {
                         "TARGET_RESUME"
@@ -1483,6 +1535,7 @@ impl Worker {
                 {
                     let mut s = self.shared.lock().unwrap();
                     s.target_updates += 1;
+                    s.mapped = r;
                     s.target_state = format!(
                         "{} {}; lift all fingers to continue",
                         if resumed { "resumed at" } else { "moved to" },
@@ -1574,7 +1627,11 @@ impl Worker {
             self.shared.lock().unwrap().api_us = i.durations().to_vec();
         }
         self.sync_stats();
-        self.shared.lock().unwrap().capture_stopped = true;
+        {
+            let mut s = self.shared.lock().unwrap();
+            s.capture_stopped = true;
+            s.live.clear();
+        }
         self.log.event(format!(
             "WORKER_STOP active_contacts={} cleanup_pending={}",
             self.injector.as_ref().map_or(0, |i| i.active_count()),
