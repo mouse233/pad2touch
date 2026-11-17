@@ -27,6 +27,22 @@ Some hardware reserves special regions for vendor controls. Record such coverage
 
 ## System-gesture conflicts and rendering
 
+### Isolate background Raw Input
+
+```powershell
+.\scripts\Run-PadBridge.ps1 -Mode capture -Background -Contacts 5 -Seconds 75
+```
+
+This raw-only diagnostic starts the receiver minimized without requesting foreground. Do not add `-Inject`. Keep another ordinary application foreground, touch and lift all fingers once, then repeat single-finger movement, two-finger movement/pinch, three-/four-/five-contact sequences, partial lifts, and complete release. Leave all fingers lifted at the end. Windows mouse and shell gestures remain enabled; this test measures receipt only. A visible receiver without focus is also a valid background condition; minimization is a convenient way to maintain that condition.
+
+Each selected-device raw report records `foreground_scope` from the actual foreground process and `delivery_code` from WM_INPUT. Code 1 means RIM_INPUTSINK. Full frames are classified from all contributing fragments; mixed or unknown focus frames are not background evidence. `CAPTURE_FOCUS` records transitions without storing other applications' titles or paths.
+
+Review the background counters in `summary.txt`: raw reports, RIM_INPUTSINK reports, complete frames, peak contacts, coordinate changes, contact starts/ends, clear frames, interruptions, and contacts remaining. Lifetime counting requires an all-fingers-up baseline in the same background interval. Contacts crossing a foreground transition or parse failure are classified as interrupted rather than counted as complete background lifetimes. Peak count alone does not establish release delivery. Compare the recorded cases with the operator's actual actions and inspect parse errors, incomplete frames, and log loss. These counters are observations, not an automatic hardware acceptance verdict.
+
+See [background gesture feasibility](background-gesture-feasibility.md) for the separate suppression investigation and a settings-assisted experiment. Background receipt does not establish exclusive capture.
+
+### Foreground gesture ownership
+
 To temporarily claim three-/four-finger touchpad gestures while the PadBridge receiver is foreground:
 
 ```powershell

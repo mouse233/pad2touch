@@ -2,6 +2,7 @@ param(
     [ValidateSet('probe','capture','self-test')][string]$Mode='probe',
     [switch]$Inject,
     [switch]$SuppressSystemGestures,
+    [switch]$Background,
     [ValidateRange(1,5)][int]$Contacts=5,
     [ValidateRange(1,86400)][int]$Seconds=120,
     [ValidateRange(0,65535)][int]$Device=0,
@@ -15,11 +16,13 @@ Push-Location -LiteralPath $repoPath
 try {
     if($Mode -eq 'probe'){& $exePath --probe;if($LASTEXITCODE -ne 0){throw 'Device discovery failed'};return}
     if($Inject -and $Mode -ne 'capture'){throw '-Inject is only used with capture; self-test injects automatically'}
+    if($Background -and ($Mode -ne 'capture' -or $Inject)){throw '-Background requires raw-only -Mode capture; omit -Inject'}
     $stamp=Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $runPath=Join-Path $repoPath "artifacts\phase12-$Mode-$Contacts-$stamp"
     $runArgs=@("--$Mode",'--contacts',"$Contacts",'--seconds',"$Seconds",'--out',$runPath)
     if($Mode -eq 'capture'){$runArgs+=@('--device',"$Device");if($Inject){$runArgs+='--inject'}}
     if($SuppressSystemGestures){$runArgs+='--suppress-system-gestures'}
+    if($Background){$runArgs+='--background'}
     & $exePath @runArgs
     $experimentCode=$LASTEXITCODE
     Write-Output "Local results: $runPath"

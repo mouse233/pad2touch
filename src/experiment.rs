@@ -37,6 +37,7 @@ pub struct Options {
     pub inject: bool,
     pub contacts: usize,
     pub suppress_gestures: bool,
+    pub background: bool,
 }
 #[derive(Clone, Copy)]
 pub struct TracePoint {
@@ -86,6 +87,7 @@ pub struct Stats {
     pub foreground: bool,
     pub foreground_losses: u64,
     pub minimizations: u64,
+    pub capture: crate::capture::Counters,
 }
 type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -292,11 +294,19 @@ pub fn run(opt: Options) -> Result<(), String> {
         });
         // A second call also handles a launcher specifying SW_HIDE for the
         // console. This small receiver must remain visible for hit testing.
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-        if SetForegroundWindow(hwnd) == 0 {
-            log.event("SetForegroundWindow denied; receiver remains topmost");
+        if opt.background {
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+            log.event(
+                "BACKGROUND_DIAGNOSTIC raw_only=true start_minimized=true settings_changed=false",
+            );
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+            if SetForegroundWindow(hwnd) == 0 {
+                log.event("SetForegroundWindow denied; receiver remains topmost");
+            }
         }
         if SetTimer(hwnd, 1, 50, None) == 0 {
             return Err(winerr("SetTimer(receiver)"));
@@ -376,8 +386,9 @@ pub fn run(opt: Options) -> Result<(), String> {
             },
         );
         let summary = format!(
-            "{}actual_duration_ms={}\nforeground_gesture_guard_used={}\ngesture_events_received={}\nforeground_losses={}\nwindow_minimizations={}\nrun_status={}\nstop_reason={}\n",
+            "{}{}actual_duration_ms={}\nforeground_gesture_guard_used={}\ngesture_events_received={}\nforeground_losses={}\nwindow_minimizations={}\nrun_status={}\nstop_reason={}\n",
             summary(&s, dropped, opt.seconds),
+            s.capture.summary(),
             experiment_start.elapsed().as_millis(),
             s.gesture_guard,
             s.gesture_events,
@@ -701,6 +712,8 @@ struct Worker {
     pending_since: Option<Instant>,
     scenarios: Vec<crate::scenarios::Step>,
     gesture_events: Option<Arc<AtomicU64>>,
+    capture: crate::capture::Evidence,
+    last_scope: Option<crate::capture::Scope>,
 }
 fn worker_loop(
     device: Option<Device>,
@@ -740,6 +753,8 @@ fn worker_loop(
         pending_since: None,
         scenarios: crate::scenarios::steps(capacity),
         gesture_events: None,
+        capture: crate::capture::Evidence::default(),
+        last_scope: None,
     };
     unsafe {
         let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
@@ -819,12 +834,15 @@ impl Worker {
         }
         self.assembler.reset();
         self.pending_since = None;
+        self.capture.reset_fragments();
     }
     fn accept(&mut self, contacts: Vec<Contact>, start: Instant) {
+        let scope = self.capture.frame(&contacts);
         let live = contacts.iter().filter(|c| c.tip && c.confidence).count();
         self.log.event(format!(
-            "FRAME active={live} records={} contacts={contacts:?}",
-            contacts.len()
+            "FRAME active={live} records={} contacts={contacts:?} foreground_scope={}",
+            contacts.len(),
+            scope.label()
         ));
         {
             let mut s = self.shared.lock().unwrap();
@@ -861,6 +879,7 @@ impl Worker {
         self.sync_stats();
     }
     fn sync_stats(&self) {
+        self.shared.lock().unwrap().capture = self.capture.counts.clone();
         if let Some(events) = &self.gesture_events {
             self.shared.lock().unwrap().gesture_events = events.load(Ordering::Relaxed);
         }
@@ -874,7 +893,28 @@ impl Worker {
             s.cleanup_pending = i.cleanup_pending();
         }
     }
-    fn raw(&mut self, raw: HRAWINPUT) {
+    fn sample_scope(&mut self) -> crate::capture::Scope {
+        use crate::capture::Scope;
+        let scope = unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0;
+            if hwnd.is_null() || GetWindowThreadProcessId(hwnd, &mut pid) == 0 || pid == 0 {
+                Scope::Unknown
+            } else if pid == GetCurrentProcessId() {
+                Scope::Foreground
+            } else {
+                Scope::Background
+            }
+        };
+        self.capture.focus(scope);
+        if self.last_scope != Some(scope) {
+            self.log
+                .event(format!("CAPTURE_FOCUS scope={}", scope.label()));
+            self.last_scope = Some(scope);
+        }
+        scope
+    }
+    fn raw(&mut self, raw: HRAWINPUT, delivery_code: usize) {
         let start = Instant::now();
         let (handle, reports) = match hid::raw_reports(raw) {
             Ok(r) => r,
@@ -886,11 +926,15 @@ impl Worker {
         if self.mode != "capture" || self.device.as_ref().is_none_or(|d| d.handle != handle) {
             return;
         }
+        let scope = self.sample_scope();
         for report in reports {
+            self.capture
+                .raw(scope, delivery_code == RIM_INPUTSINK as usize);
             self.last_raw = Instant::now();
             self.shared.lock().unwrap().raw += 1;
             self.log.event(format!(
-                "RAW handle=0x{handle:X} hex={}",
+                "RAW handle=0x{handle:X} foreground_scope={} delivery_code={delivery_code} hex={}",
+                scope.label(),
                 report
                     .iter()
                     .map(|b| format!("{b:02X}"))
@@ -898,6 +942,7 @@ impl Worker {
             ));
             match self.device.as_ref().unwrap().parse(&self.fields, &report) {
                 Ok(Some(r)) => {
+                    self.capture.fragment(scope);
                     if let Some(scan) = r.scan {
                         let mut s = self.shared.lock().unwrap();
                         if s.scans.len() < 100000 {
@@ -927,6 +972,7 @@ impl Worker {
         }
     }
     fn tick(&mut self) {
+        self.sample_scope();
         if self.stop.load(Ordering::Relaxed) || EXIT.load(Ordering::Relaxed) {
             unsafe { PostQuitMessage(0) };
             return;
@@ -1020,7 +1066,7 @@ unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_INPUT => {
             INPUT.with(|i| {
                 if let Some(worker) = i.borrow_mut().as_mut() {
-                    worker.raw(l as HRAWINPUT);
+                    worker.raw(l as HRAWINPUT, w & 0xFF);
                 }
             }); /* DefWindowProc required for foreground RAWINPUT cleanup. */
         }

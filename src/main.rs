@@ -1,3 +1,4 @@
+mod capture;
 mod decode;
 mod experiment;
 mod gestures;
@@ -41,7 +42,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.is_empty() || args == ["--help"] {
-        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
+        println!("PadBridge Phase 1+2 (hardware validation pending)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--background] [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--background starts raw-only capture minimized without requesting foreground.\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
         return Ok(());
     }
     if args == ["--probe"] {
@@ -59,6 +60,7 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
         inject: false,
         contacts: 5,
         suppress_gestures: false,
+        background: false,
         device: 0,
         seconds: 60,
         out: format!("artifacts/run-{stamp}").into(),
@@ -74,6 +76,7 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
             }
             "--inject" => opt.inject = true,
             "--suppress-system-gestures" => opt.suppress_gestures = true,
+            "--background" => opt.background = true,
             "--device" | "--seconds" | "--out" | "--contacts" => {
                 let key = &args[i];
                 i += 1;
@@ -104,6 +107,9 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
             "--inject is only used with --capture; --self-test injects automatically".into(),
         );
     }
+    if opt.background && (opt.mode != "capture" || opt.inject) {
+        return Err("--background is a raw-only --capture diagnostic; omit --inject".into());
+    }
     Ok(opt)
 }
 
@@ -122,6 +128,8 @@ mod cli_tests {
             vec!["--capture", "--seconds", "0"],
             vec!["--capture", "--device"],
             vec!["--self-test", "--inject"],
+            vec!["--self-test", "--background"],
+            vec!["--capture", "--inject", "--background"],
         ] {
             assert!(parse_options(&args(&a)).is_err());
         }
@@ -155,6 +163,8 @@ mod cli_tests {
         let raw = parse_options(&args(&["--capture", "--suppress-system-gestures"])).unwrap();
         assert!(raw.suppress_gestures);
         assert!(!raw.inject);
+        let background = parse_options(&args(&["--capture", "--background"])).unwrap();
+        assert!(background.background);
         let synthetic =
             parse_options(&args(&["--self-test", "--suppress-system-gestures"])).unwrap();
         assert!(synthetic.suppress_gestures);

@@ -1,6 +1,6 @@
 [package]
 name = "padbridge-phase0"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Phase 1+2 MVP: fixed-rectangle Precision Touchpad input and synchronized native touch injection"
 license = "MIT"

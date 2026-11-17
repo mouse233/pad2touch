@@ -48,6 +48,9 @@ Run from the repository directory in a normal PowerShell session. Basic operatio
 # Capture raw input without injecting touch.
 .\scripts\Run-PadBridge.ps1 -Mode capture -Contacts 5 -Seconds 120
 
+# Verify raw receipt while another app stays foreground; start minimized.
+.\scripts\Run-PadBridge.ps1 -Mode capture -Background -Contacts 5 -Seconds 75
+
 # Single-contact mode.
 .\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 1 -Seconds 120
 
@@ -114,6 +117,7 @@ See the [testing guide](docs/testing.md) for procedures and interpretation. Mach
 - [Technical whitepaper and development specification (Chinese)](docs/PadBridge.md)
 - [Architecture and implementation decisions](docs/architecture.md)
 - [Testing guide](docs/testing.md)
+- [Background capture and gesture-suppression feasibility](docs/background-gesture-feasibility.md)
 - [Third-party notices](docs/third-party-notices.md)
 
 ## License and privacy

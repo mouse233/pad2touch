@@ -7,6 +7,7 @@ PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | Module | Responsibility |
 |---|---|
 | `main.rs` | Validate command-line options and dispatch capture or offline log verification. |
+| `capture.rs` | Attribute raw reports and complete frames to foreground/background intervals and count conservative background contact evidence. |
 | `hid.rs` | Discover Raw Input collections, retrieve HidP capabilities and values, and validate aligned RAWHID buffers. |
 | `decode.rs` | Interpret fields, assemble complete reports, and map absolute coordinates without Windows API dependencies. |
 | `touch.rs` | Plan complete contact frames, assign stable slots, commit successful state, retry, and cancel through an abstract transport. |
@@ -37,6 +38,10 @@ Touchpad gesture ownership is distinct from Windows' touchscreen gesture handlin
 Discovery selects Digitizers / Touch Pad collections (`0D:05`). The selected raw device handle identifies the source throughout capture. `RIDI_PREPARSEDDATA` is cached, and HidP supplies report IDs, data indices, link collections, button capabilities, and logical coordinate ranges. Device-specific bit offsets are not hardcoded.
 
 RAWHID buffers use aligned storage and checked sizes. Every report in `dwSizeHid * dwCount` is processed. Foreground WM_INPUT messages still pass through DefWindowProc for cleanup.
+
+Registration uses RIDEV_INPUTSINK for background receipt. Each selected-device report records its WM_INPUT delivery code and a foreground-process comparison with the current process. A null/unavailable foreground is unknown, not assumed background. Hybrid frames inherit the merged scope of every contributing fragment; mixed frames are excluded from background evidence. A worker timer also samples focus while idle. No foreign window title, executable path, or ordinary keyboard input is collected for this attribution.
+
+The raw-only `--background` diagnostic starts the receiver minimized without requesting activation. It is rejected with injection or self-test, since the existing fixed receiver must remain available for injection. Background evidence counts require a clear frame before tracking complete contact lifetimes. Focus transitions and parser failures invalidate active evidence instead of manufacturing successful releases; observed peaks and raw reports remain distinct from verified within-interval lifetimes. This does not confer exclusive touchpad ownership. See [the feasibility analysis](background-gesture-feasibility.md) for documented suppression boundaries.
 
 The decoder groups contact fields by link collection. It rejects unsupported value arrays or layouts instead of manufacturing coordinates. Confidence=false contacts are retained in the input representation but excluded from injection.
 
