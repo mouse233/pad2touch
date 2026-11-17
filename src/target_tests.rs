@@ -522,7 +522,8 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 &target,
                 target.bounds,
             ));
-            let mut injector = Injector::new(target.hit, target.bounds, 2, log.clone()).unwrap();
+            let mut injector =
+                Injector::new(target.hit, target.bounds, NormRect::FULL, 2, log.clone()).unwrap();
             injector.frame(&[]).unwrap();
             let c = target.bounds;
             let (w, h) = (c.right - c.left, c.bottom - c.top);
@@ -553,7 +554,7 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
             let Decision::Retarget(moved) = tracker.observe(target.observe()) else {
                 panic!("{dpi}: move not detected");
             };
-            injector.retarget(moved).unwrap();
+            injector.retarget(moved, NormRect::FULL).unwrap();
             log.event(crate::experiment::target_record(
                 "TARGET_UPDATE",
                 &target,
@@ -601,8 +602,14 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 &rect_target,
                 rect_target.bounds,
             ));
-            let mut injector =
-                Injector::new(rect_target.hit, rect_target.bounds, 2, log.clone()).unwrap();
+            let mut injector = Injector::new(
+                rect_target.hit,
+                rect_target.bounds,
+                NormRect::FULL,
+                2,
+                log.clone(),
+            )
+            .unwrap();
             injector.frame(&[]).unwrap();
             taps(&mut injector, 5, &[(0, 0), (1000, 1000)]);
             let touches = host.touches(Duration::from_millis(400));
@@ -659,7 +666,8 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 &screen,
                 screen.bounds,
             ));
-            let mut injector = Injector::new(screen.hit, screen.bounds, 1, log.clone()).unwrap();
+            let mut injector =
+                Injector::new(screen.hit, screen.bounds, NormRect::FULL, 1, log.clone()).unwrap();
             injector.frame(&[]).unwrap();
             taps(&mut injector, 7, &[(500, 500)]);
             drop(injector);
@@ -675,6 +683,56 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
             let a = audit(rx.try_iter().collect());
             assert!(a.passed(), "{dpi}: {:?}", a.errors);
             assert_eq!(log.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            // 6. Touchpad area "part of pad · fill area": a tall, narrow
+            //    window strip uses only a centered part of a 1.6:1 touchpad.
+            let (log, rx) = Log::memory();
+            let strip = MappingTarget::WindowRectangle {
+                handle: host.hwnd,
+                area: NormRect {
+                    left: 0.4,
+                    top: 0.0,
+                    right: 0.6,
+                    bottom: 1.0,
+                },
+            }
+            .resolve_fitted(null_mut(), Some(1.6), crate::mapping::PadFit::FillArea)
+            .unwrap();
+            let input = strip.input;
+            assert!(input.left > 0.2 && input.right < 0.8, "{input:?}");
+            assert_eq!((input.top, input.bottom), (0.0, 1.0));
+            log.event(crate::experiment::target_record(
+                "TARGET",
+                &strip,
+                strip.bounds,
+            ));
+            let mut injector =
+                Injector::new(strip.hit, strip.bounds, input, 2, log.clone()).unwrap();
+            injector.frame(&[]).unwrap();
+            // Outside the used part of the pad: ignored, nothing delivered.
+            taps(&mut injector, 8, &[(0, 500), (1000, 500)]);
+            assert!(host.touches(Duration::from_millis(250)).is_empty());
+            // The used part's left edge and center reach the strip's left
+            // edge and center: the whole area is used, undistorted.
+            let edge = (input.left * 1000.0).ceil() as i32;
+            taps(&mut injector, 9, &[(edge, 0), (500, 500)]);
+            drop(injector);
+            let touches = host.touches(Duration::from_millis(400));
+            let downs: Vec<_> = touches.iter().filter(|t| t.action == "DOWN").collect();
+            assert_eq!(downs.len(), 2, "{dpi}: {touches:?}");
+            assert!(
+                near(downs[0].fx, 0.4, tol) && near(downs[0].fy, 0.0, tol),
+                "{dpi}: {:?}",
+                downs[0]
+            );
+            assert!(
+                near(downs[1].fx, 0.5, tol) && near(downs[1].fy, 0.5, tol),
+                "{dpi}: {:?}",
+                downs[1]
+            );
+            let a = audit(rx.try_iter().collect());
+            assert!(a.passed(), "{dpi}: {:?}", a.errors);
+            assert_eq!(a.injected_lifetimes, 2);
             host.close();
         }
     }

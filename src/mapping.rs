@@ -9,7 +9,10 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
-        Gdi::{ClientToScreen, MonitorFromPoint, MONITOR_DEFAULTTONULL},
+        Gdi::{
+            ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR,
+            MONITORINFOEXW, MONITOR_DEFAULTTONULL,
+        },
     },
     Security::*,
     System::Threading::{
@@ -178,6 +181,76 @@ pub fn fit_aspect(area: RECT, aspect: f64) -> Result<RECT, String> {
     })
 }
 
+/// How the touchpad's shape is reconciled with the screen area's shape
+/// (the "Touchpad area" setting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PadFit {
+    /// Whole touchpad, undistorted: the screen area is letterboxed.
+    #[default]
+    KeepShape,
+    /// Whole touchpad stretched over the whole screen area (distorts).
+    Stretch,
+    /// Whole screen area, undistorted: only a centered part of the touchpad
+    /// with the area's shape is used; touches outside it are ignored.
+    FillArea,
+}
+impl PadFit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::KeepShape => "keep-shape",
+            Self::Stretch => "stretch",
+            Self::FillArea => "fill-area",
+        }
+    }
+    /// Whether the touchpad's physical shape is needed to map undistorted.
+    pub fn needs_shape(self) -> bool {
+        self != Self::Stretch
+    }
+}
+
+/// Centered part of a touchpad (physical aspect `pad`) whose physical shape
+/// matches `area`.
+pub fn pad_crop(pad: f64, area: RECT) -> Result<NormRect, String> {
+    let (w, h) = size(area);
+    if !pad.is_finite() || pad <= 0.0 || w < 2 || h < 2 {
+        return Err("invalid touchpad aspect or screen area".into());
+    }
+    let r = w as f64 / h as f64;
+    if r < pad {
+        let f = r / pad;
+        NormRect {
+            left: (1.0 - f) / 2.0,
+            top: 0.0,
+            right: (1.0 + f) / 2.0,
+            bottom: 1.0,
+        }
+    } else {
+        let f = pad / r;
+        NormRect {
+            left: 0.0,
+            top: (1.0 - f) / 2.0,
+            right: 1.0,
+            bottom: (1.0 + f) / 2.0,
+        }
+    }
+    .validate()
+}
+
+/// Apply a Touchpad area mode to a screen area. Returns the mapped bounds and
+/// the used (normalized) touchpad region. Without physical geometry no shape
+/// can be preserved, so the area and the whole touchpad are used.
+pub fn fit_pad(area: RECT, aspect: Option<f64>, fit: PadFit) -> Result<(RECT, NormRect), String> {
+    let (w, h) = size(area);
+    if w < 2 || h < 2 {
+        return Err("screen area is empty".into());
+    }
+    match (fit, aspect) {
+        (PadFit::KeepShape, Some(a)) => Ok((fit_aspect(area, a)?, NormRect::FULL)),
+        (PadFit::FillArea, Some(a)) => Ok((area, pad_crop(a, area)?)),
+        _ => Ok((area, NormRect::FULL)),
+    }
+}
+
 /// Which window may receive a non-cleanup injected DOWN/UPDATE at a point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitPolicy {
@@ -223,6 +296,9 @@ pub struct ResolvedTarget {
     pub hit: HitPolicy,
     /// Physical touchpad aspect used when the target is re-resolved.
     pub aspect: Option<f64>,
+    pub fit: PadFit,
+    /// Used part of the touchpad, normalized to its logical range.
+    pub input: NormRect,
 }
 
 /// Current availability of a dynamic target.
@@ -381,10 +457,23 @@ impl MappingTarget {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub fn resolve_with_aspect(self, window: HWND, aspect: f64) -> Result<ResolvedTarget, String> {
+        self.resolve_fitted(window, Some(aspect), PadFit::KeepShape)
+    }
+    /// Resolve and apply a Touchpad area mode.
+    pub fn resolve_fitted(
+        self,
+        window: HWND,
+        aspect: Option<f64>,
+        fit: PadFit,
+    ) -> Result<ResolvedTarget, String> {
         let mut target = self.resolve(window)?;
-        target.bounds = fit_aspect(target.bounds, aspect)?;
-        target.aspect = Some(aspect);
+        let (bounds, input) = fit_pad(target.bounds, aspect, fit)?;
+        target.bounds = bounds;
+        target.input = input;
+        target.aspect = aspect;
+        target.fit = fit;
         Ok(target)
     }
     pub fn resolve(self, diagnostic_window: HWND) -> Result<ResolvedTarget, String> {
@@ -416,6 +505,8 @@ impl MappingTarget {
                     },
                     hit: HitPolicy::Exact(diagnostic_window as usize),
                     aspect: None,
+                    fit: PadFit::Stretch,
+                    input: NormRect::FULL,
                 })
             },
             Self::ScreenRectangle { bounds } => {
@@ -435,6 +526,8 @@ impl MappingTarget {
                     bounds,
                     hit: HitPolicy::Any,
                     aspect: None,
+                    fit: PadFit::Stretch,
+                    input: NormRect::FULL,
                 })
             }
             Self::Window { handle } | Self::WindowRectangle { handle, .. } => {
@@ -447,6 +540,8 @@ impl MappingTarget {
                         bounds,
                         hit: HitPolicy::SameRoot(handle),
                         aspect: None,
+                        fit: PadFit::Stretch,
+                        input: NormRect::FULL,
                     }),
                     Observation::Paused(reason) | Observation::Gone(reason) => Err(format!(
                         "Target window unavailable: {reason}. Restore it before capturing."
@@ -480,15 +575,19 @@ impl ResolvedTarget {
     /// Re-resolve a window target, applying the session's physical aspect.
     pub fn observe(&self) -> Observation {
         match self.spec.observe_bounds() {
-            Observation::Ready(r) => match self.aspect {
-                Some(aspect) => match fit_aspect(r, aspect) {
-                    Ok(fitted) => Observation::Ready(fitted),
-                    Err(_) => Observation::Paused("target area cannot fit touchpad aspect".into()),
-                },
-                None => Observation::Ready(r),
+            Observation::Ready(r) => match fit_pad(r, self.aspect, self.fit) {
+                Ok((fitted, _)) => Observation::Ready(fitted),
+                Err(_) => Observation::Paused("target area cannot fit touchpad aspect".into()),
             },
             other => other,
         }
+    }
+    /// Used touchpad region for (already fitted) bounds; FillArea follows the
+    /// window's current shape.
+    pub fn input_for(&self, bounds: RECT) -> NormRect {
+        fit_pad(bounds, self.aspect, self.fit)
+            .map(|(_, input)| input)
+            .unwrap_or(NormRect::FULL)
     }
     pub fn dynamic(&self) -> bool {
         self.spec.window_handle().is_some()
@@ -600,12 +699,64 @@ fn check_foreign_window(handle: usize) -> Result<(), String> {
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid == GetCurrentProcessId() {
             return Err(
-                "PadBridge's own window cannot be an application target; use Diagnostic area."
-                    .into(),
+                "PadBridge's own window cannot be an application target; use Test area.".into(),
             );
         }
     }
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct MonitorEntry {
+    /// Full monitor rectangle in physical desktop pixels.
+    pub rect: RECT,
+    pub primary: bool,
+    /// Display device name, stable across refreshes (e.g. \\.\DISPLAY2).
+    pub device: String,
+}
+
+/// Order monitors as users number them: primary first, then left to right,
+/// top to bottom.
+pub fn order_monitors(monitors: &mut [MonitorEntry]) {
+    monitors.sort_by_key(|m| (!m.primary, m.rect.left, m.rect.top));
+}
+
+/// Connected display monitors in physical pixels.
+pub fn monitors() -> Vec<MonitorEntry> {
+    unsafe extern "system" fn each(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        l: LPARAM,
+    ) -> windows_sys::core::BOOL {
+        let out = &mut *(l as *mut Vec<MonitorEntry>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, (&mut info as *mut MONITORINFOEXW).cast()) != 0 {
+            let len = info
+                .szDevice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.szDevice.len());
+            out.push(MonitorEntry {
+                rect: info.monitorInfo.rcMonitor,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                device: String::from_utf16_lossy(&info.szDevice[..len]),
+            });
+        }
+        1
+    }
+    let mut out = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(each),
+            &mut out as *mut _ as LPARAM,
+        );
+    }
+    order_monitors(&mut out);
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -874,6 +1025,59 @@ mod tests {
             .iter()
             .all(|q| q.x >= r.left && q.x < r.right && q.y >= r.top && q.y < r.bottom));
         assert!(sample_points(rect(0, 0, 0, 10), 3).is_empty());
+    }
+    #[test]
+    fn touchpad_area_modes_reconcile_pad_and_screen_shapes() {
+        let pad = 1.6;
+        let monitor = rect(-1920, 0, 0, 1080); // 16:9, wider than the pad
+        let phone = rect(100, 100, 460, 900); // 0.45, narrower than the pad
+                                              // Keep shape: whole pad, area letterboxed to the pad's shape.
+        let (b, input) = fit_pad(monitor, Some(pad), PadFit::KeepShape).unwrap();
+        assert_eq!(input, NormRect::FULL);
+        assert_eq!(tuple(b), (-1824, 0, -96, 1080));
+        // Stretch: whole pad over the whole area, even without geometry.
+        for aspect in [Some(pad), None] {
+            let (b, input) = fit_pad(phone, aspect, PadFit::Stretch).unwrap();
+            assert_eq!((tuple(b), input), (tuple(phone), NormRect::FULL));
+        }
+        // Fill area: whole area, centered pad part with the area's shape.
+        let (b, input) = fit_pad(phone, Some(pad), PadFit::FillArea).unwrap();
+        assert_eq!(tuple(b), tuple(phone));
+        let used = (input.right - input.left) * pad / (input.bottom - input.top);
+        assert!(
+            (used - 360.0 / 800.0).abs() < 1e-9,
+            "used pad shape = area shape"
+        );
+        assert!((input.left + input.right - 1.0).abs() < 1e-9, "centered");
+        let (_, input) = fit_pad(monitor, Some(pad), PadFit::FillArea).unwrap();
+        assert_eq!((input.left, input.right), (0.0, 1.0));
+        assert!((input.bottom - input.top - pad / (16.0 / 9.0)).abs() < 1e-9);
+        // Without physical geometry, shapes cannot be preserved.
+        for fit in [PadFit::KeepShape, PadFit::FillArea] {
+            let (b, input) = fit_pad(phone, None, fit).unwrap();
+            assert_eq!((tuple(b), input), (tuple(phone), NormRect::FULL));
+            assert!(fit.needs_shape());
+        }
+        assert!(!PadFit::Stretch.needs_shape());
+        assert!(fit_pad(rect(0, 0, 1, 100), Some(pad), PadFit::Stretch).is_err());
+        assert!(pad_crop(f64::NAN, phone).is_err());
+    }
+    #[test]
+    fn monitors_are_numbered_primary_first_then_left_to_right() {
+        let m = |left: i32, top: i32, primary: bool, device: &str| MonitorEntry {
+            rect: rect(left, top, left + 100, top + 100),
+            primary,
+            device: device.into(),
+        };
+        let mut list = vec![
+            m(100, 0, false, "C"),
+            m(-100, 50, false, "B"),
+            m(0, 0, true, "A"),
+            m(-100, -50, false, "D"),
+        ];
+        order_monitors(&mut list);
+        let names: Vec<_> = list.iter().map(|m| m.device.as_str()).collect();
+        assert_eq!(names, ["A", "D", "B", "C"]);
     }
     #[test]
     fn tracker_retargets_pauses_resumes_and_stops() {
