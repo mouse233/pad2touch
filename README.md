@@ -4,7 +4,7 @@
 
 PadBridge reads absolute finger coordinates through Windows Raw Input, maps them to a screen rectangle, and submits native touch frames through `InjectTouchInput`. It runs in user mode, without installing a driver or modifying another application.
 
-The current implementation is an experimental single-touch and multitouch MVP with a native Windows GUI. The GUI integrates device selection, manual and hotkey capture controls, and the touch diagnostic receiver. Mapping to arbitrary application windows, persistent configuration, and production reliability work remain future stages.
+The current implementation is an experimental single-touch and multitouch MVP with a native Windows GUI. The GUI integrates device selection, manual and hotkey capture controls, and the touch diagnostic receiver. Phase 3 adds mapping to an application window's client area, a sub-rectangle of a window, or any desktop rectangle, following window movement and resizing. Persistent configuration and production reliability work remain future stages.
 
 ## Features
 
@@ -13,7 +13,8 @@ The current implementation is an experimental single-touch and multitouch MVP wi
 - Start/stop manually, toggle with a global shortcut, or capture while holding a shortcut.
 - Parse Contact ID, Tip Switch, Confidence, and X/Y using Windows HID descriptor information.
 - Assemble parallel and hybrid reports into complete contact frames.
-- Map absolute touchpad coordinates to a fixed rectangle in physical screen pixels, preserving the device-declared physical aspect.
+- Map absolute touchpad coordinates into the diagnostic receiver, an application window's client area, a selected rectangle inside a window, or a selected desktop rectangle (including negative multi-monitor coordinates), in physical screen pixels and preserving the device-declared physical aspect.
+- Follow a target window as it moves or resizes, pause and release contacts while it is minimized, hidden or cloaked, stop when it closes, and block touches where another window covers the target.
 - Inspect physical dimensions, logical X/Y ranges, coordinate density/DPI and observed report/frame/scan cadence.
 - Track a single finger or inject synchronized frames containing up to five contacts.
 - Preserve contact identity across report reordering, partial lifts, and finger replacement.
@@ -118,7 +119,7 @@ See the [testing guide](docs/testing.md) for procedures and interpretation. Mach
 
 ## Current limitations
 
-- Injection targets the receiver's fixed rectangle. Arbitrary target windows, dynamic rectangle tracking, and persistent GUI configuration are not implemented.
+- `InjectTouchInput` has no window parameter: Windows delivers touches by hit testing. PadBridge blocks DOWN/UPDATE points that another window covers, but the target must remain visible. Targets at a higher integrity level (for example, running as administrator) may reject injected input; the GUI warns but cannot bypass this. Target selection is not persisted across launches.
 - Raw Input does not provide exclusive touchpad capture. Native mouse behavior remains active; optional foreground gesture ownership has the scope and availability limits described above.
 - Moving, minimizing, or covering the receiver may pause or cancel output. Display changes and device removal stop the experiment rather than automatically reconnecting.
 - A runtime safety stop keeps the receiver available for inspection until Esc, close, or the original duration expires. If Windows minimizes it, restore it from the taskbar to read the reason. It does not resume injection automatically.
