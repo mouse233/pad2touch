@@ -19,10 +19,10 @@ Optional private recording tests are documented in [the fixture directory](../te
 
 ## GUI lifecycle and manual checks
 
-The resize regression test shows an idle native window briefly and reads its actual displayed pixels. It checks system-background consistency, the diagnostic border and control bounds after growing, shrinking to minimum size, moving, maximizing and restoring. It performs no capture, touch injection or settings override:
+The fixed-size regression test shows an idle native window briefly and reads its actual displayed pixels. It checks that the window has no sizing border or maximize button, its client size, system-background consistency, the diagnostic border and control bounds after showing, moving, minimizing and restoring. It performs no capture, touch injection or settings override:
 
 ```powershell
-cargo test --locked native_gui_live_resize_repaints_background_and_canvas -- --ignored --test-threads=1 --nocapture
+cargo test --locked native_gui_fixed_size_repaints_background_and_canvas -- --ignored --test-threads=1 --nocapture
 ```
 
 An opt-in native integration check creates real controls and Raw Input workers. It does not initialize or submit touch injection. Run it alone on an ordinary interactive Windows desktop with a Precision Touchpad and Ctrl+Alt+F8 available:
@@ -42,7 +42,7 @@ cargo test --locked native_gui_background_guard_session_restores -- --ignored --
 
 The first checks the embedded transaction adapter; the second exercises GUI start, the real Raw Input worker, stop, and verified settings restoration together. Neither initializes touch injection. They do not replace physical gesture observation, 120-second timeout acceptance, or process-kill recovery tests. The native GUI lifecycle check also exports a local client-area preview using the application's print handlers; inspect it alongside actual desktop behavior, not as proof of live flicker-free rendering.
 
-For actual UI acceptance, launch the GUI and verify device refresh/selection, keyboard Tab navigation, resizing, and DPI transitions. Clear native injection first, test manual / Toggle / Hold using real keys, and confirm each stop retains diagnostics and allows a subsequent session. Check Ctrl+Alt+Esc from another foreground application, focused-window Esc, and close while active. Select each Screen area choice and confirm Start stays unavailable, with an explanation, until a window or area is chosen. Then test native injection separately: single- and multi-contact trails, scaling, active-contact stop/close, and gesture-controller scope. Idle raw-only lifecycle checks do not establish physical touch release or visual quality.
+For actual UI acceptance, launch the GUI and verify device refresh/selection, keyboard Tab navigation, the fixed window size, and DPI transitions. Clear native injection first, test manual / Toggle / Hold using real keys, and confirm each stop retains diagnostics and allows a subsequent session. Check Ctrl+Alt+Esc from another foreground application, focused-window Esc, and close while active. Select each Screen area choice and confirm Start stays unavailable, with an explanation, until a window or area is chosen. Then test native injection separately: single- and multi-contact trails, scaling, active-contact stop/close, and gesture-controller scope. Idle raw-only lifecycle checks do not establish physical touch release or visual quality.
 
 ## Phase 3 target checks
 

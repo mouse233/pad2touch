@@ -29,6 +29,33 @@ use windows_sys::Win32::{
 };
 
 pub static EXIT: AtomicBool = AtomicBool::new(false);
+/// Wakes a window when the capture worker publishes a new frame, so the live
+/// preview repaints at the touchpad's report rate instead of a UI timer's.
+/// At most one message is in flight: the window clears `pending` when it
+/// handles the message, and frames arriving before then share that repaint.
+#[derive(Clone, Copy)]
+pub struct FrameSignal {
+    hwnd: usize,
+    msg: u32,
+    pending: &'static AtomicBool,
+}
+impl FrameSignal {
+    pub fn new(hwnd: HWND, msg: u32, pending: &'static AtomicBool) -> Self {
+        Self {
+            hwnd: hwnd as usize,
+            msg,
+            pending,
+        }
+    }
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel)
+            // SAFETY: PostMessageW only queues; an invalid HWND just fails.
+            && unsafe { PostMessageW(self.hwnd as HWND, self.msg, 0, 0) } == 0
+        {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+}
 pub struct Options {
     pub mode: String,
     pub seconds: u64,
@@ -102,6 +129,8 @@ pub struct Stats {
     pub mapped_input: Option<crate::mapping::NormRect>,
     /// Live confident contacts, normalized to the touchpad's logical range.
     pub live: Vec<(f64, f64)>,
+    /// Notified after each frame updates `live`.
+    pub frame_signal: Option<FrameSignal>,
 }
 pub(crate) type Shared = Arc<Mutex<Stats>>;
 struct Ui {
@@ -357,7 +386,7 @@ pub fn run(opt: Options) -> Result<(), String> {
             let _finished = WorkerFinished(worker_done);
             let result = worker_loop(
                 device,
-                (mode, inject, capacity, suppress_gestures),
+                (mode, inject, capacity, suppress_gestures, false),
                 target,
                 worker_shared.clone(),
                 worker_log.clone(),
@@ -517,16 +546,29 @@ pub(crate) struct Session {
     started: Instant,
     explicit_stop: AtomicBool,
 }
+/// User choices for a GUI session, fixed for its lifetime.
+pub struct SessionSettings {
+    pub inject: bool,
+    pub capacity: usize,
+    pub suppress_gestures: bool,
+    pub background_guard: bool,
+    /// Draw Windows touch visuals for injected contacts.
+    pub touch_feedback: bool,
+}
 impl Session {
     pub fn start(
         device: Device,
         target: crate::mapping::ResolvedTarget,
-        inject: bool,
-        capacity: usize,
-        suppress_gestures: bool,
-        background_guard: bool,
+        settings: SessionSettings,
         out: PathBuf,
     ) -> Result<Self, String> {
+        let SessionSettings {
+            inject,
+            capacity,
+            suppress_gestures,
+            background_guard,
+            touch_feedback,
+        } = settings;
         if !(1..=5).contains(&capacity) {
             return Err("invalid GUI contact capacity".into());
         }
@@ -558,7 +600,7 @@ impl Session {
             ..Default::default()
         }));
         let (log, writer) = Log::open(&out)?;
-        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} frontend=GUI"));
+        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} touch_feedback={touch_feedback} frontend=GUI"));
         log.event(format!("DEVICE {}", device.summary()));
         let r = target.bounds;
         log.event(format!(
@@ -598,7 +640,13 @@ impl Session {
                 } else {
                     worker_loop(
                         Some(device),
-                        ("capture".into(), inject, capacity, suppress_gestures),
+                        (
+                            "capture".into(),
+                            inject,
+                            capacity,
+                            suppress_gestures,
+                            touch_feedback,
+                        ),
                         target,
                         worker_shared.clone(),
                         worker_log.clone(),
@@ -1126,7 +1174,7 @@ struct Worker {
 }
 fn worker_loop(
     device: Option<Device>,
-    settings: (String, bool, usize, bool),
+    settings: (String, bool, usize, bool, bool),
     target: crate::mapping::ResolvedTarget,
     shared: Shared,
     log: Log,
@@ -1135,7 +1183,7 @@ fn worker_loop(
     // Target resolution needs physical pixels on this thread as well.
     unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let rect = target.bounds;
-    let (mode, inject, capacity, suppress_gestures) = settings;
+    let (mode, inject, capacity, suppress_gestures, touch_feedback) = settings;
     let fields = device
         .as_ref()
         .map(|d| d.fields())
@@ -1147,6 +1195,7 @@ fn worker_loop(
             rect,
             target.input,
             capacity,
+            touch_feedback,
             log.clone(),
         )?)
     } else {
@@ -1285,7 +1334,7 @@ impl Worker {
             scan.map(|v| v.to_string())
                 .unwrap_or_else(|| "unavailable".into())
         ));
-        {
+        let signal = {
             let mut s = self.shared.lock().unwrap();
             s.frames += 1;
             s.peak = s.peak.max(live);
@@ -1309,6 +1358,10 @@ impl Worker {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
+            s.frame_signal
+        };
+        if let Some(signal) = signal {
+            signal.notify();
         }
         let paused = self.tracker.as_ref().is_some_and(|t| t.paused());
         if let Some(i) = self.injector.as_mut().filter(|_| !paused) {
@@ -1677,4 +1730,38 @@ unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         _ => {}
     }
     DefWindowProcW(hwnd, msg, w, l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_signal_keeps_one_message_in_flight() {
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        const MSG: u32 = WM_APP + 50;
+        // A null HWND posts to this thread's own queue.
+        let signal = FrameSignal::new(null_mut(), MSG, &PENDING);
+        let drain = || {
+            let mut msg = MSG::default();
+            let mut count = 0;
+            // SAFETY: PeekMessageW only reads this thread's queue.
+            while unsafe { PeekMessageW(&mut msg, null_mut(), MSG, MSG, PM_REMOVE) } != 0 {
+                count += 1;
+            }
+            count
+        };
+        drain();
+        for _ in 0..5 {
+            signal.notify();
+        }
+        assert_eq!(drain(), 1);
+        // Still pending: nothing was handled, so frames stay coalesced.
+        signal.notify();
+        assert_eq!(drain(), 0);
+        // The receiver handled it; the next frame posts again.
+        PENDING.store(false, Ordering::Release);
+        signal.notify();
+        assert_eq!(drain(), 1);
+    }
 }
