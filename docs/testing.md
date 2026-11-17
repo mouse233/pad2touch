@@ -50,9 +50,10 @@ These opt-in checks use a helper window owned by a second process (the test bina
 cargo test --locked native_selection_overlay_reports_physical_rectangle_and_cancel -- --ignored --test-threads=1
 cargo test --locked native_external_window_targets_follow_move_resize_minimize_and_close -- --ignored --test-threads=1
 cargo test --locked native_gui_phase3_target_selection_without_capture -- --ignored --test-threads=1
+cargo test --locked native_gui_mapping_diagram_draws_region_and_touchpad -- --ignored --test-threads=1
 ```
 
-They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of PadBridge's own windows, target destruction, and GUI selection of every mode. None needs a touchpad or injects touch.
+They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of PadBridge's own windows, target destruction, and GUI selection of every mode. The diagram check renders the panel and verifies the red region frame, touchpad surface and pad body at the positions computed by the pure layout, and that idle repaints and resizing reuse the desktop thumbnail while a screen area change captures exactly one new one. It also writes `artifacts/diagram-*.bmp` for visual review; these images include a desktop thumbnail, so review them before sharing. None needs a touchpad or injects touch.
 
 The following check **submits native touch input** into the helper window, once with a Per-Monitor-V2 host and once with a DPI-unaware host:
 
@@ -60,7 +61,7 @@ The following check **submits native touch input** into the helper window, once 
 cargo test --locked native_touch_injection_lands_in_external_window_at_mapped_positions -- --ignored --test-threads=1 --nocapture
 ```
 
-It verifies that corners and center arrive at the expected client-relative positions, that a moved window still receives the same relative position after retargeting, that a window rectangle maps only into its sub-area, that a covering window blocks the DOWN and nothing reaches the host, and that screen-rectangle injection is delivered by hit testing. Each injector's log must pass the offline verifier with no point outside the current target. The DPI-unaware host exercises coordinate virtualization only when display scaling is not 100%; the printed `monitor_dpi` shows which case ran. Repeat at 125%, 150% and 200% for DPI acceptance.
+It verifies that corners and center arrive at the expected client-relative positions, that a moved window still receives the same relative position after retargeting, that a window rectangle maps only into its sub-area, that a covering window blocks the DOWN and nothing reaches the host, that screen-rectangle injection is delivered by hit testing, and that fill-area mode ignores touches outside the used part of the pad while its edge and center land on the area's edge and center. Each injector's log must pass the offline verifier with no point outside the current target. The DPI-unaware host exercises coordinate virtualization only when display scaling is not 100%; the printed `monitor_dpi` shows which case ran. Repeat at 125%, 150% and 200% for DPI acceptance.
 
 Manual Phase 3 acceptance still needs a physical touchpad and real applications: map to a browser or emulator window, move/resize/minimize it during a session, cover part of it, and select screen rectangles on each monitor, including one with negative coordinates.
 

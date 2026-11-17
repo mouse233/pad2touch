@@ -11,6 +11,7 @@ PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | `control.rs` | Track manual, Toggle, and Hold intent independently of asynchronous worker startup/shutdown. |
 | `mapping.rs` | Resolve diagnostic, window, window-rectangle and screen-rectangle targets in physical pixels; hit policies; the dynamic target tracker. |
 | `overlay.rs` | Desktop rectangle selection overlay and click-through target outline. |
+| `diagram.rs` | Mapping diagram: pure monitor/touchpad layout, a live desktop thumbnail and GDI painting of region, connectors and live contacts. |
 | `device_info.rs` | Interpret declared HID length units, physical shape, logical ranges and coordinate density. |
 | `report_rate.rs` | Distinguish observed raw delivery, complete frame delivery and PTP scan cadence. |
 | `background_guard.rs` | Adapt the validated bounded settings-cache transaction to GUI sessions, retain recovery assets, and wait for restoration. |
@@ -72,7 +73,7 @@ Every submission includes all previously active slots. When one finger lifts, th
 
 UP, UPDATE, and DOWN are combined when free slots permit. If the union of departing and arriving contacts would exceed capacity, the planner first submits releases and retained-contact updates, then introduces new contacts. These two capacity-constrained submissions are not an atomic replacement.
 
-Mapping uses the descriptor's logical ranges, normalization, `(length - 1)`, rounding, and clamping into a fixed physical-pixel rectangle. The process requests Per-Monitor DPI Awareness V2 before creating windows. Rotation, smoothing, and calibration are not part of the current mapper.
+Mapping uses the descriptor's logical ranges, normalization, `(length - 1)`, rounding, and clamping into a physical-pixel rectangle. The planner also holds the used touchpad region (normalized, full by default): coordinates are renormalized inside it, and confident contacts outside it are excluded like low-confidence contacts while still counting as physical tips. `mapping::fit_pad` derives the rectangle and region from the Touchpad area mode: keep shape letterboxes the screen area to the pad's physical aspect, stretch uses both whole, and fill area crops the pad to the area's physical shape. The process requests Per-Monitor DPI Awareness V2 before creating windows. Rotation, smoothing, and calibration are not part of the current mapper.
 
 ## Native injection and recovery
 
@@ -97,7 +98,7 @@ Normal DOWN/UPDATE submissions are hit-tested with WindowFromPoint against the s
 
 All coordinates are physical desktop pixels. The process and the input worker thread run with Per-Monitor DPI Awareness V2, and target resolution refuses to run on any thread without it. A window's client rectangle is obtained by passing both client corners through ClientToScreen, so a DPI-virtualized (unaware or system-aware) window is converted consistently. Window rectangles are stored as fractions of the client area and scaled on every resolution.
 
-The worker re-resolves window targets on its 16 ms timer and feeds `mapping::Tracker`: changed bounds produce Retarget, unavailable windows (minimized, hidden, DWM-cloaked, too small for the aspect) produce one Pause, the next available observation produces Resume, and a destroyed window produces Stop. `Engine::retarget` cancels active contacts at their cached coordinates before replacing the mapping rectangle and requires a clear frame, so no pointer lifetime spans two mappings. Frames are not injected while paused.
+The worker re-resolves window targets on its 16 ms timer and feeds `mapping::Tracker`: changed bounds produce Retarget, unavailable windows (minimized, hidden, DWM-cloaked, too small for the aspect) produce one Pause, the next available observation produces Resume, and a destroyed window produces Stop. `Engine::retarget` cancels active contacts at their cached coordinates before replacing the mapping rectangle and used touchpad region (recomputed for fill-area mode) and requires a clear frame, so no pointer lifetime spans two mappings. Frames are not injected while paused.
 
 The input log records `TARGET` (mode, handle, receiver=embedded/external, bounds), `TARGET_UPDATE`, `TARGET_RESUME`, `TARGET_PAUSE`, `TARGET_LOST` and `TARGET_OCCLUSION`. The offline verifier checks every injected point against the current bounds. For external targets it cannot see the receiving application, so it audits injection-side lifetimes only and reports `receiver_audited=false`.
 

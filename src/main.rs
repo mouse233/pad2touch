@@ -3,6 +3,7 @@ mod capture;
 mod control;
 mod decode;
 mod device_info;
+mod diagram;
 mod experiment;
 mod gestures;
 mod gui;

@@ -3,7 +3,7 @@ use crate::{
     decode::Contact,
     hid::winerr,
     logging::Log,
-    mapping::HitPolicy,
+    mapping::{HitPolicy, NormRect},
     touch::{Action, Engine, Failure, Frame, Rectangle, Transport},
 };
 use std::{
@@ -139,14 +139,22 @@ pub struct Injector {
     log: Log,
 }
 impl Injector {
-    pub fn new(hit: HitPolicy, rect: RECT, capacity: usize, log: Log) -> Result<Self, String> {
+    pub fn new(
+        hit: HitPolicy,
+        rect: RECT,
+        input: NormRect,
+        capacity: usize,
+        log: Log,
+    ) -> Result<Self, String> {
         let transport = WindowsTransport {
             hit,
             log: log.clone(),
             batch: 0,
             blocked: 0,
         };
-        let engine = Engine::new(capacity, rectangle(rect), transport)?;
+        let mut engine = Engine::new(capacity, rectangle(rect), transport)?;
+        // Nothing is active yet, so this only sets the used touchpad region.
+        engine.retarget(rectangle(rect), input)?;
         if unsafe { InitializeTouchInjection(capacity as u32, TOUCH_FEEDBACK_NONE) } == 0 {
             return Err(winerr("InitializeTouchInjection"));
         }
@@ -170,9 +178,10 @@ impl Injector {
     pub fn release(&mut self, _cancel: bool) -> Result<(), String> {
         self.engine.cancel()
     }
-    /// Release active contacts, then map subsequent frames into `rect`.
-    pub fn retarget(&mut self, rect: RECT) -> Result<(), String> {
-        self.engine.retarget(rectangle(rect))
+    /// Release active contacts, then map subsequent frames into `rect` from
+    /// the used touchpad region `input`.
+    pub fn retarget(&mut self, rect: RECT, input: NormRect) -> Result<(), String> {
+        self.engine.retarget(rectangle(rect), input)
     }
     pub fn blocked(&self) -> u64 {
         self.engine.transport.blocked
