@@ -17,6 +17,7 @@ mod overlay;
 mod render;
 mod report_rate;
 mod scenarios;
+mod settings;
 #[cfg(test)]
 mod target_tests;
 mod touch;
