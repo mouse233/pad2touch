@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find the latest CI run for the tagged commit
+        id: ci
+        shell: bash
+        run: |
+          echo "Looking for main CI for $GITHUB_SHA"
+          deadline=$((SECONDS + 900))
+          while (( SECONDS < deadline )); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --branch main --event push --commit "$GITHUB_SHA" --limit 1 \
+              --json databaseId,status,conclusion \
+              --jq '.[0] // empty | [.databaseId, .status, .conclusion] | @tsv')
+            read -r run_id status conclusion <<< "$run"
+            if [[ "$status" == completed ]]; then
+              if [[ "$conclusion" != success ]]; then
+                echo "::error::CI run $run_id finished with $conclusion for $GITHUB_SHA."
+                exit 1
+              fi
+              echo "id=$run_id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::No successful main CI run finished for $GITHUB_SHA within 15 minutes."
+          exit 1
+
+      - name: Download executables and publish the release
+        shell: bash
+        env:
+          CI_RUN_ID: ${{ steps.ci.outputs.id }}
+        run: |
+          assets="$RUNNER_TEMP/pad2touch-release"
+          mkdir -p "$assets"
+          for arch in x64 arm64; do
+            gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "pad2touch-windows-$arch-$GITHUB_SHA" --dir "$assets/$arch"
+            test -s "$assets/$arch/Pad2Touch.exe"
+          done
+          mv "$assets/x64/Pad2Touch.exe" "$assets/Pad2Touch-windows-amd64.exe"
+          mv "$assets/arm64/Pad2Touch.exe" "$assets/Pad2Touch-windows-arm64.exe"
+
+          gh release create --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            -- "$GITHUB_REF_NAME" "$assets/Pad2Touch-windows-amd64.exe" "$assets/Pad2Touch-windows-arm64.exe"

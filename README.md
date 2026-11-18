@@ -25,7 +25,9 @@ Gesture blocking and restoration passed testing on **Windows 11 26H2 (build `263
 
 ### Download a build
 
-Sign in to GitHub and open a successful CI run for `main`. Under **Artifacts**, download `pad2touch-windows-x64-*` or `pad2touch-windows-arm64-*` for your PC. Extract the ZIP and run `Pad2Touch.exe`. CI builds are available for seven days. [CI builds](https://github.com/mouse233/pad2touch/actions/workflows/ci.yml?query=branch%3Amain+is%3Asuccess)
+Download `Pad2Touch-windows-amd64.exe` or `Pad2Touch-windows-arm64.exe` for your PC from GitHub Releases. [Releases](https://github.com/mouse233/pad2touch/releases)
+
+For builds between releases, sign in to GitHub and open a successful CI run for `main`. Download the matching ZIP under **Artifacts**, extract it, and run `Pad2Touch.exe`. CI artifacts are available for seven days. [CI builds](https://github.com/mouse233/pad2touch/actions/workflows/ci.yml?query=branch%3Amain+is%3Asuccess)
 
 ### Build from source
 
