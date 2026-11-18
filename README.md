@@ -6,7 +6,7 @@ Pad2Touch reads finger positions through Windows Raw Input and injects up to fiv
 
 > **Experimental.** Settings reset between launches.
 
-![Pad2Touch Control Panel showing the touchpad mapped to a screen](docs/images/pad2touch-control-panel.png)
+<img src="docs/images/pad2touch-control-panel.png" alt="Pad2Touch Control Panel showing the touchpad mapped to a screen" width="640">
 
 ## Features
 

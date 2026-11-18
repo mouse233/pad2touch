@@ -60,5 +60,28 @@ jobs:
           mv "$assets/x64/Pad2Touch.exe" "$assets/Pad2Touch-windows-amd64.exe"
           mv "$assets/arm64/Pad2Touch.exe" "$assets/Pad2Touch-windows-arm64.exe"
 
-          gh release create --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-            -- "$GITHUB_REF_NAME" "$assets/Pad2Touch-windows-amd64.exe" "$assets/Pad2Touch-windows-arm64.exe"
+          executables=("$assets/Pad2Touch-windows-amd64.exe" "$assets/Pad2Touch-windows-arm64.exe")
+          release_assets() {
+            gh release view --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[] | select(.state == "uploaded" and .size > 0) | .name' -- "$GITHUB_REF_NAME"
+          }
+          if ! existing=$(release_assets 2>/dev/null); then
+            if gh release create --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              -- "$GITHUB_REF_NAME" "${executables[@]}"; then
+              exit 0
+            fi
+            # A release made in the GitHub UI can appear while this job is running.
+            existing=$(release_assets)
+          fi
+
+          missing=()
+          for executable in "${executables[@]}"; do
+            if ! grep -Fxq -- "${executable##*/}" <<< "$existing"; then
+              missing+=("$executable")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            gh release upload --repo "$GITHUB_REPOSITORY" -- "$GITHUB_REF_NAME" "${missing[@]}"
+          else
+            echo "Both executables are already attached to $GITHUB_REF_NAME."
+          fi
