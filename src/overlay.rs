@@ -4,7 +4,7 @@
 //! Aware V2). Selection completes asynchronously: the owner receives
 //! `WM_SELECTION_DONE` and calls `take_result`, so no nested message loop runs
 //! while GUI state is borrowed.
-use crate::{experiment::wide, hid::winerr, mapping::rect_from_drag};
+use crate::{experiment::wide, hid::winerr, mapping::rect_from_drag, render::BackBuffer};
 use std::{
     cell::RefCell,
     ptr::{null, null_mut},
@@ -26,9 +26,38 @@ struct Selection {
     hwnd: HWND,
     owner: HWND,
     origin: POINT,
-    prompt: String,
+    prompt: Vec<u16>,
+    buffer: BackBuffer,
     anchor: Option<POINT>,
     current: POINT,
+}
+
+impl Selection {
+    unsafe fn paint(&self, destination: HDC) {
+        let dc = self.buffer.dc;
+        let rc = RECT {
+            right: self.buffer.width,
+            bottom: self.buffer.height,
+            ..Default::default()
+        };
+        FillRect(dc, &rc, GetStockObject(BLACK_BRUSH) as HBRUSH);
+        if let Some(anchor) = self.anchor {
+            let mut selected = rect_from_drag(anchor, self.current);
+            OffsetRect(&mut selected, -self.origin.x, -self.origin.y);
+            FillRect(dc, &selected, GetStockObject(WHITE_BRUSH) as HBRUSH);
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, 0x00FFFFFF);
+        let mut text_rect = RECT { top: 24, ..rc };
+        DrawTextW(
+            dc,
+            self.prompt.as_ptr(),
+            -1,
+            &mut text_rect,
+            DT_CENTER | DT_TOP | DT_NOPREFIX | DT_WORDBREAK,
+        );
+        let _ = self.buffer.present(destination);
+    }
 }
 
 thread_local! {
@@ -85,6 +114,19 @@ pub fn begin(owner: HWND, bounds: RECT, prompt: &str) -> Result<HWND, String> {
         if hwnd.is_null() {
             return Err(winerr("CreateWindowExW(selection overlay)"));
         }
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client);
+        let dc = GetDC(hwnd);
+        let buffer = if dc.is_null() {
+            Err(winerr("GetDC(selection overlay)"))
+        } else {
+            let buffer = BackBuffer::new(dc, client.right, client.bottom);
+            ReleaseDC(hwnd, dc);
+            buffer
+        };
+        let buffer = buffer.inspect_err(|_| {
+            DestroyWindow(hwnd);
+        })?;
         SetLayeredWindowAttributes(hwnd, 0, 120, LWA_ALPHA);
         RESULT.with(|r| r.borrow_mut().take());
         SELECTION.with(|s| {
@@ -95,7 +137,8 @@ pub fn begin(owner: HWND, bounds: RECT, prompt: &str) -> Result<HWND, String> {
                     x: bounds.left,
                     y: bounds.top,
                 },
-                prompt: prompt.into(),
+                prompt: wide(prompt),
+                buffer,
                 anchor: None,
                 current: POINT::default(),
             })
@@ -156,9 +199,10 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_MOUSEMOVE => {
             SELECTION.with(|s| {
-                if let Some(s) = s.borrow_mut().as_mut() {
-                    if s.anchor.is_some() {
-                        s.current = screen_point(l, s.origin);
+                if let Some(s) = s.borrow_mut().as_mut().filter(|s| s.anchor.is_some()) {
+                    let point = screen_point(l, s.origin);
+                    if (s.current.x, s.current.y) != (point.x, point.y) {
+                        s.current = point;
                         InvalidateRect(hwnd, null(), 0);
                     }
                 }
@@ -201,45 +245,11 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut ps);
-            let mut rc = RECT::default();
-            GetClientRect(hwnd, &mut rc);
-            FillRect(dc, &rc, GetStockObject(BLACK_BRUSH) as HBRUSH);
-            let (prompt, selected) = SELECTION.with(|s| {
-                s.borrow()
-                    .as_ref()
-                    .map(|s| {
-                        (
-                            s.prompt.clone(),
-                            s.anchor.map(|a| {
-                                let r = rect_from_drag(a, s.current);
-                                RECT {
-                                    left: r.left - s.origin.x,
-                                    top: r.top - s.origin.y,
-                                    right: r.right - s.origin.x,
-                                    bottom: r.bottom - s.origin.y,
-                                }
-                            }),
-                        )
-                    })
-                    .unwrap_or_default()
+            SELECTION.with(|slot| {
+                if let Some(s) = slot.borrow().as_ref().filter(|s| s.hwnd == hwnd) {
+                    s.paint(dc);
+                }
             });
-            if let Some(r) = selected {
-                FillRect(dc, &r, GetStockObject(WHITE_BRUSH) as HBRUSH);
-            }
-            SetBkMode(dc, TRANSPARENT as i32);
-            SetTextColor(dc, 0x00FFFFFF);
-            let mut text_rect = RECT {
-                top: rc.top + 24,
-                ..rc
-            };
-            let text = wide(&prompt);
-            DrawTextW(
-                dc,
-                text.as_ptr(),
-                -1,
-                &mut text_rect,
-                DT_CENTER | DT_TOP | DT_NOPREFIX | DT_WORDBREAK,
-            );
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -414,7 +424,15 @@ mod tests {
             assert!(begin(owner, bounds, "second").is_err());
             let pack = |x: i32, y: i32| ((y as isize) << 16 | x as isize) as LPARAM;
             SendMessageW(overlay, WM_LBUTTONDOWN, 0x0001, pack(300, 200));
+            SendMessageW(overlay, WM_MOUSEMOVE, 0x0001, pack(400, 350));
+            UpdateWindow(overlay);
+            let pixel =
+                |x, y| SELECTION.with(|s| GetPixel(s.borrow().as_ref().unwrap().buffer.dc, x, y));
+            assert_eq!(pixel(350, 250), 0x00FFFFFF);
             SendMessageW(overlay, WM_MOUSEMOVE, 0x0001, pack(100, 50));
+            UpdateWindow(overlay);
+            assert_eq!(pixel(350, 250), 0, "previous selection was cleared");
+            assert_eq!(pixel(200, 100), 0x00FFFFFF);
             SendMessageW(overlay, WM_LBUTTONUP, 0, pack(100, 50));
             assert!(!active());
             assert_eq!(IsWindow(overlay), 0);

@@ -19,7 +19,7 @@ const BEZEL: u32 = 0x00383838;
 const STAND: u32 = 0x00A0A0A0;
 const PAD_BODY: u32 = 0x00404040;
 const PAD_SURFACE: u32 = 0x00585858;
-const PAD_UNUSED: u32 = 0x00484848;
+const PAD_UNUSED: u32 = 0x002C2C2C;
 const SELECTED: u32 = 0x00C0C0C0;
 const EMPTY_SCREEN: u32 = 0x00806040;
 const CONTACT_COLORS: [u32; 5] = [0x0040C040, 0x00E09030, 0x00F060C0, 0x0040D0F0, 0x00F0F040];
@@ -168,32 +168,32 @@ pub fn used_surface(l: &Layout, input: NormRect) -> RECT {
     }
 }
 
-/// A normalized touchpad position drawn on the surface, and its mapped screen
-/// position (None when it lies outside the used part of the touchpad).
-pub fn contact_points(
+/// The touchpad and screen positions of a contact inside the active area.
+fn contact_points(
     l: &Layout,
     region: RECT,
     input: NormRect,
     fx: f64,
     fy: f64,
-) -> (POINT, Option<POINT>) {
+) -> Option<(POINT, POINT)> {
     let fx = fx.clamp(0.0, 1.0);
     let fy = fy.clamp(0.0, 1.0);
+    let u = (fx - input.left) / (input.right - input.left);
+    let v = (fy - input.top) / (input.bottom - input.top);
+    let inside = (-1e-9..=1.0 + 1e-9).contains(&u) && (-1e-9..=1.0 + 1e-9).contains(&v);
+    if !inside {
+        return None;
+    }
     let s = l.surface;
     let on_pad = POINT {
         x: s.left + (fx * (s.right - s.left - 1) as f64).round() as i32,
         y: s.top + (fy * (s.bottom - s.top - 1) as f64).round() as i32,
     };
-    let u = (fx - input.left) / (input.right - input.left);
-    let v = (fy - input.top) / (input.bottom - input.top);
-    let inside = (-1e-9..=1.0 + 1e-9).contains(&u) && (-1e-9..=1.0 + 1e-9).contains(&v);
-    let on_screen = inside.then(|| {
-        l.screen.point(
-            region.left as f64 + u.clamp(0.0, 1.0) * (region.right - region.left - 1) as f64,
-            region.top as f64 + v.clamp(0.0, 1.0) * (region.bottom - region.top - 1) as f64,
-        )
-    });
-    (on_pad, on_screen)
+    let on_screen = l.screen.point(
+        region.left as f64 + u.clamp(0.0, 1.0) * (region.right - region.left - 1) as f64,
+        region.top as f64 + v.clamp(0.0, 1.0) * (region.bottom - region.top - 1) as f64,
+    );
+    Some((on_pad, on_screen))
 }
 
 /// Downscaled copy of the virtual desktop for the monitor illustrations.
@@ -411,10 +411,13 @@ pub unsafe fn paint(
         frame(dc, r, RED, px(2));
         frame(dc, used, RED, px(2));
         for (i, &(fx, fy)) in scene.contacts.iter().enumerate() {
-            let (on_pad, on_screen) = contact_points(&l, region, scene.pad_input, fx, fy);
+            let Some((on_pad, on_screen)) = contact_points(&l, region, scene.pad_input, fx, fy)
+            else {
+                continue;
+            };
             let brush = CreateSolidBrush(CONTACT_COLORS[i % CONTACT_COLORS.len()]);
             SelectObject(dc, brush);
-            for p in std::iter::once(on_pad).chain(on_screen) {
+            for p in [on_pad, on_screen] {
                 let d = px(5);
                 Ellipse(dc, p.x - d, p.y - d, p.x + d, p.y + d);
             }
@@ -550,19 +553,17 @@ mod tests {
             "quarter region starts mid-screen"
         );
         let full = NormRect::FULL;
-        let (pad, screen) = contact_points(&l, region, full, 0.0, 0.0);
-        let screen = screen.unwrap();
+        let (pad, screen) = contact_points(&l, region, full, 0.0, 0.0).unwrap();
         assert_eq!((pad.x, pad.y), (l.surface.left, l.surface.top));
         assert_eq!((screen.x, screen.y), (r.left, r.top));
-        let (pad, screen) = contact_points(&l, region, full, 1.0, 1.0);
-        let screen = screen.unwrap();
+        let (pad, screen) = contact_points(&l, region, full, 1.0, 1.0).unwrap();
         assert_eq!((pad.x, pad.y), (l.surface.right - 1, l.surface.bottom - 1));
         assert!((screen.x - (r.right - 1)).abs() <= 1 && (screen.y - (r.bottom - 1)).abs() <= 1);
         // Out-of-range contacts are clamped onto the surface.
-        let (pad, _) = contact_points(&l, region, full, 2.0, -1.0);
+        let (pad, _) = contact_points(&l, region, full, 2.0, -1.0).unwrap();
         assert_eq!((pad.x, pad.y), (l.surface.right - 1, l.surface.top));
         // With part of the pad used, its edges map to the region's edges and
-        // contacts outside it have no screen position.
+        // contacts outside it are hidden on both the pad and the screen.
         let half = NormRect {
             left: 0.25,
             top: 0.0,
@@ -576,13 +577,12 @@ mod tests {
             ((s.right - s.left) as f64 * 0.25).round() as i32
         );
         assert_eq!((used.top, used.bottom), (s.top, s.bottom));
-        let (_, screen) = contact_points(&l, region, half, 0.25, 0.0);
-        assert_eq!(screen.map(|p| (p.x, p.y)), Some((r.left, r.top)));
-        let (_, screen) = contact_points(&l, region, half, 0.5, 0.5);
-        let p = screen.unwrap();
+        let (_, screen) = contact_points(&l, region, half, 0.25, 0.0).unwrap();
+        assert_eq!((screen.x, screen.y), (r.left, r.top));
+        let (_, p) = contact_points(&l, region, half, 0.5, 0.5).unwrap();
         assert!((p.x - (r.left + r.right) / 2).abs() <= 1);
-        assert!(contact_points(&l, region, half, 0.1, 0.5).1.is_none());
-        assert!(contact_points(&l, region, half, 0.9, 0.5).1.is_none());
+        assert!(contact_points(&l, region, half, 0.1, 0.5).is_none());
+        assert!(contact_points(&l, region, half, 0.9, 0.5).is_none());
     }
     #[test]
     fn layout_scales_with_dpi_and_rejects_tiny_areas() {

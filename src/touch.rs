@@ -957,14 +957,21 @@ pub mod tests {
     }
     #[test]
     fn used_touchpad_region_maps_inside_and_ignores_outside() {
+        use crate::mapping::{fit_pad, PadFit};
+        use windows_sys::Win32::Foundation::RECT;
+
         let mut e = engine(2);
-        // Use the central half horizontally (Touchpad area: fill area).
-        let half = NormRect {
-            left: 0.25,
-            top: 0.0,
-            right: 0.75,
-            bottom: 1.0,
-        };
+        // Force proportions maps the central half of a 2:1 pad to a square.
+        let (_, half) = fit_pad(
+            RECT {
+                right: 101,
+                bottom: 101,
+                ..Default::default()
+            },
+            Some(2.0),
+            PadFit::FillArea,
+        )
+        .unwrap();
         e.retarget(
             Rectangle {
                 left: 0,

@@ -93,7 +93,9 @@ The **Touchpad area** list uses the mapping terms from [Wacom's documentation](h
 | Full | All | All | Scaled independently on X and Y | No |
 | Portion… | The area you draw on the touchpad diagram | All | Scaled independently on X and Y | No |
 
-For **Portion…**, click **Select pad area…** and drag on the touchpad diagram. After selecting it, you can use that portion with any screen target, including the test area. Fingers outside the active part are ignored for injection, and fingers that slide out are released. With **Force proportions**, resizing a window target also recalculates the active part of the touchpad to match the new shape.
+In **Force proportions** and **Portion…**, the mapping diagram shades the unused touchpad area and shows contacts only inside the active area. Pad2Touch ignores outside contacts for injection and releases injected contacts when they slide out. Windows can still use those fingers for its normal pointer input.
+
+With **Force proportions**, resizing a window target recalculates the active part of the touchpad to match the new shape. For **Portion…**, click **Select pad area…** and drag on the touchpad diagram. You can use the selected portion with any screen target, including the test area.
 
 The used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
 
