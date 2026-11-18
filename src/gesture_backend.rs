@@ -34,6 +34,7 @@ use windows_sys::{
 };
 
 type Result<T> = std::result::Result<T, String>;
+const DEFAULT_GESTURE_BUILD: &str = "26300";
 const PAD_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad";
 const SCREEN_KEY: &str = r"Control Panel\Desktop";
 const SCREEN_PREF: &str = "TouchGestureSetting";
@@ -661,18 +662,33 @@ fn validate_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_build() -> Result<()> {
+fn windows_build() -> Result<String> {
     let version = Key::open(
         HKEY_LOCAL_MACHINE,
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
         false,
     )?;
-    if version.string("CurrentBuildNumber")? != "26300" || version.dword("UBR")? != Some(9974) {
-        return Err(
-            "Background gesture suppression is supported on Windows build 26300.9974".into(),
-        );
+    version.string("CurrentBuildNumber")
+}
+
+pub fn overrides_enabled_by_default() -> bool {
+    windows_build().is_ok_and(|build| build == DEFAULT_GESTURE_BUILD)
+}
+
+fn uses_current_touchpad_cache_layout(build: &str) -> bool {
+    // The cache IDs in SessionCache are shared by Windows 11 22H2 through
+    // 25H2 in the community reports, and by 26H2 in our validation.
+    matches!(build, "22621" | "22631" | "26100" | "26200" | "26300")
+}
+
+fn open_touchpad_cache() -> Result<SessionCache> {
+    let build = windows_build()?;
+    if !uses_current_touchpad_cache_layout(&build) {
+        return Err(format!(
+            "Touchpad gesture blocking has no known cache mapping for Windows build {build}"
+        ));
     }
-    Ok(())
+    SessionCache::open()
 }
 
 fn recover(directory: &Path) -> Result<()> {
@@ -688,7 +704,6 @@ fn recover(directory: &Path) -> Result<()> {
     }
     let changed = directory.join("mutation-started.json").exists();
     if changed {
-        validate_build()?;
         let pad = Snapshot {
             screen: None,
             ..snapshot
@@ -698,7 +713,7 @@ fn recover(directory: &Path) -> Result<()> {
             ..snapshot
         };
         let pad_result = (|| {
-            let cache = pad.scope().touchpad.then(SessionCache::open).transpose()?;
+            let cache = pad.scope().touchpad.then(open_touchpad_cache).transpose()?;
             pad.restore(&Access::open(pad.scope(), cache.as_ref())?, false)
         })();
         let screen_result = (|| {
@@ -787,9 +802,8 @@ impl Worker {
         if !request.scope.any() {
             return Err("Select a gesture override".into());
         }
-        validate_build()?;
         if request.scope.touchpad && self.cache.is_none() {
-            self.cache = Some(SessionCache::open()?);
+            self.cache = Some(open_touchpad_cache()?);
         }
         let lease = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -837,8 +851,8 @@ impl Worker {
                 if watchdog.try_wait().map_err(io_error)?.is_some() {
                     return Err("Recovery watchdog exited before settings changed".into());
                 }
-                if let (Some((key, _)), Some(pad)) = (&access.pad, snapshot.pad) {
-                    if pad_values(key)? != pad.values {
+                if let (Some((key, cache)), Some(pad)) = (&access.pad, snapshot.pad) {
+                    if pad_values(key)? != pad.values || cache.values(false)? != pad.cached {
                         return Err("Touchpad settings changed since snapshot".into());
                     }
                 }
@@ -953,7 +967,7 @@ pub fn run(mode: &str, args: &[OsString]) -> Result<()> {
     if warm_pad == "true" {
         // Prewarm may fail on an unsupported runtime. The capture request
         // performs its normal checks and can report the error to the GUI.
-        worker.cache = validate_build().and_then(|()| SessionCache::open()).ok();
+        worker.cache = open_touchpad_cache().ok();
     }
     for line in io::stdin().lock().lines() {
         let request: Request =
@@ -973,6 +987,16 @@ pub fn run(mode: &str, args: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touchpad_cache_layout_accepts_25h2_and_only_known_build_families() {
+        for build in ["22621", "22631", "26100", "26200", "26300"] {
+            assert!(uses_current_touchpad_cache_layout(build), "{build}");
+        }
+        for build in ["19045", "22000", "26201", "28000"] {
+            assert!(!uses_current_touchpad_cache_layout(build), "{build}");
+        }
+    }
 
     #[test]
     fn watchdog_recovers_from_local_appdata_without_working_directory_artifacts() {

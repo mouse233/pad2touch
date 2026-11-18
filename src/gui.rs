@@ -565,8 +565,9 @@ impl Gui {
                 22,
             ],
         )?;
-        SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
-        SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
+        let gesture_default = usize::from(crate::gesture_backend::overrides_enabled_by_default());
+        SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, gesture_default, 0);
+        SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, gesture_default, 0);
         g.add(
             "BUTTON",
             "Mapping",

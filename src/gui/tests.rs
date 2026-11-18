@@ -797,14 +797,9 @@ fn native_gui_fixed_size_repaints_background_and_canvas() {
         let mut gui = Gui::new(hwnd, false).unwrap();
         assert!(gui.item(LOG_PATH).is_null());
         assert!(gui.checked(FEEDBACK), "touch feedback defaults to enabled");
-        assert!(
-            gui.checked(PAD_GESTURES),
-            "touchpad guard defaults to enabled"
-        );
-        assert!(
-            gui.checked(SCREEN_GESTURES),
-            "touchscreen guard defaults to enabled"
-        );
+        let gesture_default = crate::gesture_backend::overrides_enabled_by_default();
+        assert_eq!(gui.checked(PAD_GESTURES), gesture_default);
+        assert_eq!(gui.checked(SCREEN_GESTURES), gesture_default);
         gui.refresh_devices();
         let dpi = gui.dpi;
         let expected = (gui.px(DEFAULT_CLIENT.0), gui.px(DEFAULT_CLIENT.1));

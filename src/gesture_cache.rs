@@ -158,7 +158,7 @@ pub(super) fn screen_state(set: Option<u32>) -> Result<u32, String> {
             ));
         }
     }
-    let mut live = 0u32;
+    let mut live = u32::MAX;
     if unsafe { SystemParametersInfoW(0x2030, 0, (&mut live as *mut u32).cast(), 0) } == 0 {
         return Err(format!(
             "Get touchscreen state: {}",

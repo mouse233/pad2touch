@@ -2,7 +2,7 @@
 
 These developer tools investigate an undocumented Windows interface. They are separate from Pad2Touch's default capture path. They do not implement a production global-capture mode, a GUI, hotkeys, drivers, or process injection. Use the ordinary interactive desktop under the same user account as Explorer.
 
-The GUI's explicit **Background guard (experimental)** selection embeds this transaction and its native helper through a separate adapter. Its `session` mode retains the same journal, lease, snapshot, readback, and watchdog path while the GUI owns Raw Input capture. It monitors the GUI owner's process identity, accepts a stop marker after input cleanup, and signals expiry at 120 seconds before restoration. This GUI mode accepts only the locally validated build 26300.9974 and remains off by default. The original bounded `apply` experiment is still available independently.
+The standalone script retains a legacy `session` mode on build 26300.9974. Pad2Touch's GUI now uses its own native worker and recovery process. Use `apply` for the bounded standalone experiment described below. [Current GUI gesture behavior](../docs/gui.md#background-guard)
 
 ## Build and read-only inspection
 
@@ -19,7 +19,7 @@ The default native probe activates IImmersiveSettingsCache only. `--read-cache` 
 
 The native helper's explicit `--reload-four` option calls OnSettingChanged for only `0x0F`, `0x10`, `0x11`, and `0x12`, checks each HRESULT, then reads cache values. It performs no registry writes itself. Do not treat notification success or cache readback as proof of physical gesture suppression. The ABI and IDs are community observations rather than a Microsoft compatibility contract; see [the research document](../docs/background-gesture-feasibility.md).
 
-GUI sessions with injection additionally pass `-SuppressTouchscreen` to the transaction script. This build-bound option records and temporarily disables the live touchscreen three-/four-finger system-gesture state, preserves the persistent desktop preference, and restores through the same journal/watchdog. It is not enabled for the raw-only `apply` experiment. A read-only `probe -SuppressTouchscreen` includes the live state and persistent preference snapshot. See [GUI gesture behavior and native test coverage](../docs/gui.md#background-guard).
+On build 26300.9974, the legacy `session` mode accepts `-SuppressTouchscreen` to temporarily disable the live touchscreen gesture state and restore it through the watchdog. A read-only `probe -SuppressTouchscreen` on that build includes the live state and persistent preference snapshot.
 
 ## Explicit, bounded mutation test
 
@@ -59,4 +59,4 @@ After the experiment, confirm `restored.json` reports exact registry/cache resto
 
 Do not run concurrent experiments, edit preferences during one, replace the helper binary mid-run, or start a new experiment before an earlier journal has been recovered. A change to the same zero value cannot be distinguished from the experiment's own write. The watchdog is a separate best-effort process, not a guarantee against logoff, machine shutdown, killed recovery processes, Explorer failure, or incompatible undocumented interfaces. Forced-termination recovery needs its own test. There is no installed persistent recovery service or automatic startup recovery.
 
-The implementation is independently written using interface facts with source attribution. No external script or GPL implementation is embedded. These tools do not install or change the user's PowerShell execution policy. Normal CLI capture does not enable them; GUI use requires explicitly selecting Background guard.
+The implementation is independently written using interface facts with source attribution. No external script or GPL implementation is embedded. These tools do not install or change the user's PowerShell execution policy.
