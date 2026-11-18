@@ -35,6 +35,10 @@ fn restored(directory: &Path) -> bool {
     };
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     compact.contains("\"restored\":true")
+        && (!directory.join("touchscreen-required.json").exists()
+            || compact.contains("\"touchscreen_exact\":true")
+            || (compact.contains("\"no_mutation\":true")
+                && !directory.join("mutation-started.json").exists()))
         && ((compact.contains("\"no_mutation\":true")
             && !directory.join("mutation-started.json").exists())
             || (compact.contains("\"registry_exact\":true")
@@ -80,6 +84,7 @@ impl Guard {
         shared: Shared,
         log: Log,
         stop: Arc<AtomicBool>,
+        suppress_touchscreen: bool,
     ) -> Result<Option<Self>, String> {
         if stop.load(Ordering::Relaxed) {
             return Ok(None);
@@ -117,7 +122,8 @@ impl Guard {
         };
         let stdout = fs::File::create(root.join("stdout.txt")).map_err(|e| e.to_string())?;
         let stderr = fs::File::create(root.join("stderr.txt")).map_err(|e| e.to_string())?;
-        let child = Command::new(shell)
+        let mut command = Command::new(shell);
+        command
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&script)
             .args([
@@ -138,7 +144,11 @@ impl Guard {
             .creation_flags(0x08000000)
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(stderr)
+            .stderr(stderr);
+        if suppress_touchscreen {
+            command.arg("-SuppressTouchscreen");
+        }
+        let child = command
             .spawn()
             .map_err(|e| format!("Could not start background gesture guard: {e}"))?;
         shared.lock().unwrap().guard_status =
@@ -163,9 +173,14 @@ impl Guard {
             if guard.directory.join("active.json").exists()
                 && !guard.directory.join("restored.json").exists()
             {
-                guard.shared.lock().unwrap().guard_status =
-                    "Background guard ACTIVE (120 s maximum)".into();
-                guard.log.event("BACKGROUND_GUARD active=true");
+                guard.shared.lock().unwrap().guard_status = if suppress_touchscreen {
+                    "Background guard ACTIVE: touchpad + touchscreen (120 s maximum)".into()
+                } else {
+                    "Background guard ACTIVE (120 s maximum)".into()
+                };
+                guard.log.event(format!(
+                    "BACKGROUND_GUARD active=true touchscreen={suppress_touchscreen}"
+                ));
                 let directory = guard.directory.clone();
                 let shared = guard.shared.clone();
                 let log = guard.log.clone();
@@ -173,17 +188,30 @@ impl Guard {
                 guard.monitor = Some(thread::spawn(move || {
                     let started = Instant::now();
                     while !shutdown.load(Ordering::Relaxed) {
-                        if directory.join("expired.json").exists()
+                        let failed = directory.join("failed.json").exists();
+                        if failed
+                            || directory.join("expired.json").exists()
                             || directory.join("restored.json").exists()
                             || started.elapsed() >= Duration::from_secs(120)
                         {
                             let mut s = shared.lock().unwrap();
-                            s.stop_reason =
-                                "Background guard ended or reached its 120 s limit".into();
+                            s.stop_reason = if failed {
+                                "Background gesture guard verification failed; see guard logs"
+                                    .into()
+                            } else {
+                                "Background guard ended or reached its 120 s limit".into()
+                            };
                             s.guard_status =
                                 "Stopping capture before restoring Windows gestures...".into();
                             drop(s);
                             log.event("BACKGROUND_GUARD safety_stop=true");
+                            if failed {
+                                log.event(format!(
+                                    "BACKGROUND_GUARD verification_failed {}",
+                                    fs::read_to_string(directory.join("failed.json"))
+                                        .unwrap_or_default()
+                                ));
+                            }
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
@@ -264,6 +292,14 @@ mod tests {
         )
         .unwrap();
         assert!(restored(&dir));
+        fs::write(dir.join("touchscreen-required.json"), "{}").unwrap();
+        assert!(!restored(&dir));
+        fs::write(
+            dir.join("restored.json"),
+            "{\"restored\":true,\"registry_exact\":true,\"cache_exact\":true,\"touchscreen_exact\":true}",
+        ).unwrap();
+        assert!(restored(&dir));
+        fs::remove_file(dir.join("touchscreen-required.json")).unwrap();
         fs::remove_file(dir.join("restored.json")).unwrap();
         fs::remove_dir(dir).unwrap();
     }
@@ -282,11 +318,54 @@ mod tests {
             shared.clone(),
             log.clone(),
             Arc::new(AtomicBool::new(false)),
+            true,
         )
         .unwrap()
         .unwrap();
         assert!(shared.lock().unwrap().guard_status.contains("ACTIVE"));
+        assert!(shared
+            .lock()
+            .unwrap()
+            .guard_status
+            .contains("touchpad + touchscreen"));
+        // Include a periodic live-state verification before normal restoration.
+        thread::sleep(Duration::from_millis(1500));
         guard.release().unwrap();
+        let directory = out.join("gesture-backend/artifacts/session");
+        assert!(directory.join("touchscreen-required.json").exists());
+        assert!(restored(&directory));
+        assert!(!shared.lock().unwrap().recovery_pending);
+        drop(log);
+        writer.join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "temporarily changes gesture preferences and kills only its own backend to verify independent watchdog restoration"]
+    fn native_background_guard_watchdog_restores_touchscreen() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let out = PathBuf::from(format!("artifacts/gui-guard-watchdog-test-{stamp}"));
+        let (log, writer) = Log::open(&out).unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(crate::experiment::Stats::default()));
+        let mut guard = Guard::acquire(
+            &out,
+            shared.clone(),
+            log.clone(),
+            Arc::new(AtomicBool::new(false)),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        // Terminate only the transaction process we just created. The separate
+        // watchdog must restore both settings paths without that process.
+        guard.child.kill().unwrap();
+        guard.child.wait().unwrap();
+        guard.release().unwrap();
+        let directory = out.join("gesture-backend/artifacts/session");
+        assert!(directory.join("touchscreen-mutation-started.json").exists());
+        assert!(restored(&directory));
         assert!(!shared.lock().unwrap().recovery_pending);
         drop(log);
         writer.join().unwrap().unwrap();

@@ -109,6 +109,7 @@ pub struct Stats {
     pub scans: Vec<u32>,
     pub report_rate: crate::report_rate::Snapshot,
     pub gesture_guard: bool,
+    pub background_guard: bool,
     pub gesture_events: u64,
     pub guard_status: String,
     pub recovery_pending: bool,
@@ -610,6 +611,10 @@ impl Session {
         log.event(target_record("TARGET", &target, r));
         {
             let mut s = shared.lock().unwrap();
+            s.background_guard = background_guard;
+            if background_guard {
+                s.guard_status = "Preparing background guard and recovery watchdog...".into();
+            }
             s.target_label = target_label(&target);
             s.target_state = format!("mapped {}", crate::mapping::describe(r));
             s.mapped = r;
@@ -630,6 +635,7 @@ impl Session {
                     worker_shared.clone(),
                     worker_log.clone(),
                     worker_stop.clone(),
+                    inject,
                 )
             } else {
                 Ok(None)
@@ -992,15 +998,42 @@ unsafe fn paint(hwnd: HWND) {
     });
     EndPaint(hwnd, &ps);
 }
+fn gesture_guard_label(s: &Stats) -> &str {
+    if s.background_guard {
+        // This mode has its own lifecycle and does not depend on foreground
+        // controller ownership or receive that controller's gesture events.
+        if s.guard_status.contains("ACTIVE") {
+            if s.guard_status.contains("touchpad + touchscreen") {
+                "ACTIVE (pad + screen)"
+            } else {
+                "ACTIVE (background)"
+            }
+        } else if s.guard_status == "Windows gestures restored" {
+            "RESTORED (background)"
+        } else if s.guard_status.starts_with("Stopping") {
+            "STOPPING (background)"
+        } else if s.guard_status.starts_with("Restoring") {
+            "RESTORING (background)"
+        } else {
+            "PREPARING (background)"
+        }
+    } else if !s.gesture_guard || s.capture_stopped {
+        "OFF"
+    } else if s.foreground {
+        "ACTIVE (foreground)"
+    } else {
+        "INACTIVE (background)"
+    }
+}
 pub(crate) fn diagnostic_text(s: &Stats) -> String {
-    let text = format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {} / events {}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,if !s.gesture_guard || s.capture_stopped{"OFF"}else if s.foreground{"ACTIVE (foreground)"}else{"INACTIVE (background)"},s.gesture_events,if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
+    let text = format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {}{}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,gesture_guard_label(s),if s.background_guard { String::new() } else { format!(" / events {}", s.gesture_events) },if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
     let text = format!("{text}\n{}", s.report_rate.label());
     let text = if s.target_label.is_empty() {
         text
     } else {
         format!("{text}\nTarget: {} | {}", s.target_label, s.target_state)
     };
-    if s.guard_status.is_empty() {
+    if s.guard_status.is_empty() || s.background_guard {
         text
     } else {
         format!("{text}\n{}", s.guard_status)
@@ -1735,6 +1768,55 @@ unsafe extern "system" fn input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_guard_diagnostics_follow_its_own_lifecycle_and_scope() {
+        let mut s = Stats {
+            background_guard: true,
+            ..Default::default()
+        };
+        for (status, label) in [
+            (
+                "Preparing background guard and recovery watchdog...",
+                "PREPARING (background)",
+            ),
+            (
+                "Background guard ACTIVE (120 s maximum)",
+                "ACTIVE (background)",
+            ),
+            (
+                "Background guard ACTIVE: touchpad + touchscreen (120 s maximum)",
+                "ACTIVE (pad + screen)",
+            ),
+            (
+                "Stopping capture before restoring Windows gestures...",
+                "STOPPING (background)",
+            ),
+            (
+                "Restoring Windows gesture settings...",
+                "RESTORING (background)",
+            ),
+            ("Windows gestures restored", "RESTORED (background)"),
+        ] {
+            s.guard_status = status.into();
+            for foreground in [false, true] {
+                s.foreground = foreground;
+                let text = diagnostic_text(&s);
+                assert!(text.contains(&format!("3/4-finger guard: {label}")));
+                assert_eq!(text.matches(label).count(), 1);
+                assert!(!text.contains("3/4-finger guard: OFF"));
+                assert!(!text.contains(" / events "));
+            }
+        }
+        s.background_guard = false;
+        s.gesture_guard = true;
+        s.foreground = false;
+        assert_eq!(gesture_guard_label(&s), "INACTIVE (background)");
+        s.foreground = true;
+        assert_eq!(gesture_guard_label(&s), "ACTIVE (foreground)");
+        s.capture_stopped = true;
+        assert_eq!(gesture_guard_label(&s), "OFF");
+    }
 
     #[test]
     fn frame_signal_keeps_one_message_in_flight() {

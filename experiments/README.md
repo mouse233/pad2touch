@@ -19,6 +19,8 @@ The default native probe activates IImmersiveSettingsCache only. `--read-cache` 
 
 The native helper's explicit `--reload-four` option calls OnSettingChanged for only `0x0F`, `0x10`, `0x11`, and `0x12`, checks each HRESULT, then reads cache values. It performs no registry writes itself. Do not treat notification success or cache readback as proof of physical gesture suppression. The ABI and IDs are community observations rather than a Microsoft compatibility contract; see [the research document](../docs/background-gesture-feasibility.md).
 
+GUI sessions with injection additionally pass `-SuppressTouchscreen` to the transaction script. This build-bound option records and temporarily disables the live touchscreen three-/four-finger system-gesture state, preserves the persistent desktop preference, and restores through the same journal/watchdog. It is not enabled for the raw-only `apply` experiment. A read-only `probe -SuppressTouchscreen` includes the live state and persistent preference snapshot. See [GUI gesture behavior and native test coverage](../docs/gui.md#background-guard).
+
 ## Explicit, bounded mutation test
 
 First review the read-only output and the actual Windows build. The following template intentionally requires substituting a build number and a new local directory:

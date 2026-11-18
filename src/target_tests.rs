@@ -2,8 +2,7 @@
 //! process. The test binary re-launches itself as that host process.
 //!
 //! All tests here are ignored by default. Only
-//! `native_touch_injection_lands_in_external_window_at_mapped_positions`
-//! submits native touch input, and only through the same hit-tested transport
+//! injection tests submit native touch input only through the same hit-tested transport
 //! used by capture sessions, into the dedicated host window.
 use crate::{
     experiment::wide,
@@ -486,6 +485,82 @@ fn taps(injector: &mut Injector, id: u32, raws: &[(i32, i32)]) {
         injector.frame(&[contact(id, x, y)]).unwrap();
         injector.frame(&[]).unwrap();
     }
+}
+
+#[test]
+#[ignore = "temporarily suppresses touchpad/touchscreen system gestures and injects multi-finger swipes into a dedicated helper window"]
+fn native_background_guard_preserves_injected_multitouch() {
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let out = std::path::PathBuf::from(format!("artifacts/touchscreen-guard-test-{stamp}"));
+    let (log, writer) = Log::open(&out).unwrap();
+    let shared = Arc::new(Mutex::new(crate::experiment::Stats::default()));
+    let guard = crate::background_guard::Guard::acquire(
+        &out,
+        shared,
+        log.clone(),
+        Arc::new(AtomicBool::new(false)),
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let host = Host::spawn("pmv2");
+        host.place(180, 160, 840, 540);
+        let target = MappingTarget::Window { handle: host.hwnd }
+            .resolve(null_mut())
+            .unwrap();
+        assert_eq!(covered(&target), 0);
+        let mut injector = Injector::new(
+            target.hit,
+            target.bounds,
+            NormRect::FULL,
+            5,
+            false,
+            log.clone(),
+        )
+        .unwrap();
+        injector.frame(&[]).unwrap();
+        for fingers in [3, 4, 5] {
+            // Swipe down far enough to exercise shell recognition while keeping
+            // every point safely inside the dedicated host's client rectangle.
+            for step in 0..25 {
+                let contacts: Vec<_> = (0..fingers)
+                    .map(|id| contact(id + 1, 250 + id as i32 * 100, 250 + step * 20))
+                    .collect();
+                injector.frame(&contacts).unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            injector.frame(&[]).unwrap();
+            let touches = host.touches(Duration::from_millis(300));
+            let downs = touches.iter().filter(|t| t.action == "DOWN").count();
+            let ups = touches.iter().filter(|t| t.action == "UP").count();
+            assert_eq!(
+                (downs, ups),
+                (fingers as usize, fingers as usize),
+                "{fingers} fingers: {touches:?}"
+            );
+            assert_eq!(
+                IsIconic(host.handle()),
+                0,
+                "host minimized by system gesture"
+            );
+            assert_eq!(
+                GetAncestor(GetForegroundWindow(), GA_ROOT),
+                host.handle(),
+                "system gesture took foreground"
+            );
+        }
+        assert_eq!(injector.active_count(), 0);
+        drop(injector);
+    }
+    guard.release().unwrap();
+    drop(log);
+    writer.join().unwrap().unwrap();
 }
 
 #[test]

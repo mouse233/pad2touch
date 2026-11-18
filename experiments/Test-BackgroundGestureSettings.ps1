@@ -6,6 +6,7 @@ param(
     [string]$Journal,
     [string]$CaptureExecutable,
     [switch]$WaitForStart,
+    [switch]$SuppressTouchscreen,
     [int]$OwnerPid,
     [long]$OwnerStartedFileTime
 )
@@ -26,6 +27,55 @@ function Get-Preference($key,[string]$name) {
 }
 function Test-SamePreference($a,$b) {
     return $a.exists -eq $b.exists -and $a.kind -ceq $b.kind -and $a.bytes -ceq $b.bytes
+}
+function Initialize-TouchscreenApi {
+    if(!('PadBridgeTouchscreenGestures' -as [type])){
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PadBridgeTouchscreenGestures {
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", SetLastError=true)]
+    public static extern bool Read(uint action, uint param, out uint value, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", SetLastError=true)]
+    public static extern bool Write(uint action, uint param, IntPtr value, uint flags);
+}
+'@
+    }
+}
+function Get-TouchscreenGestures {
+    Initialize-TouchscreenApi
+    [uint32]$value=0
+    if(![PadBridgeTouchscreenGestures]::Read(0x2030,0,[ref]$value,0)){
+        throw ('Cannot read touchscreen gesture state: '+[Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    if($value -gt 1){throw 'Unsupported touchscreen gesture state'}
+    return $value
+}
+function Set-TouchscreenGestures([uint32]$value) {
+    Initialize-TouchscreenApi
+    # Build-bound undocumented SPI pair. Flags=0 changes only live state; do not
+    # persist TouchGestureSetting or broadcast unrelated preference changes.
+    if(![PadBridgeTouchscreenGestures]::Write(0x2031,0,[IntPtr]::new([long]$value),0)){
+        throw ('Cannot set touchscreen gesture state: '+[Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    if((Get-TouchscreenGestures) -ne $value){throw 'Touchscreen gesture live readback mismatch'}
+}
+function Get-TouchscreenSnapshot {
+    $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop',$false)
+    if($null -eq $key){throw 'Desktop preferences key is unavailable'}
+    try {$preference=Get-Preference $key 'TouchGestureSetting'} finally {$key.Dispose()}
+    return [pscustomobject]@{runtime=(Get-TouchscreenGestures);preference=$preference}
+}
+function Restore-TouchscreenGestures($snapshot) {
+    $current=Get-TouchscreenSnapshot
+    if(!(Test-SamePreference $snapshot.preference $current.preference)){
+        throw 'Touchscreen preference changed externally; retained the new setting'
+    }
+    if($current.runtime -ne $snapshot.runtime){Set-TouchscreenGestures ([uint32]$snapshot.runtime)}
+    $after=Get-TouchscreenSnapshot
+    if($after.runtime -ne $snapshot.runtime -or !(Test-SamePreference $snapshot.preference $after.preference)){
+        throw 'Touchscreen gesture restoration mismatch'
+    }
 }
 function Get-RestoreAction($old,$current) {
     if(Test-SamePreference $old $current){return 'already-original'}
@@ -58,6 +108,33 @@ function Reload-Cache {
     $output | ForEach-Object {Write-Host $_}
     if($LASTEXITCODE -ne 0){throw 'At least one precise cache notification failed'}
 }
+function Test-DisabledPreferences($preferences) {
+    return @($preferences).Count -eq 4 -and @($preferences | Where-Object {
+        !$_.exists -or $_.kind -cne 'DWord' -or $_.bytes -cne 'AAAAAA=='
+    }).Count -eq 0
+}
+function Assert-SessionGuard {
+    if($SuppressTouchscreen){
+        $currentTouchscreen=Get-TouchscreenSnapshot
+        if($currentTouchscreen.runtime -ne 0){throw 'Touchscreen system gestures became enabled during capture'}
+        if(!(Test-SamePreference $touchscreen.preference $currentTouchscreen.preference)){
+            throw 'Touchscreen preference changed during capture; stopping without overwriting the change'
+        }
+    }
+    # Never overwrite a concurrent settings edit. Only refresh the cache while
+    # the exact four registry values are still the zeros owned by this session.
+    $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$false)
+    if($null -eq $key){throw 'Touchpad preferences key disappeared during capture'}
+    try {$current=@(foreach($name in $names){Get-Preference $key $name})} finally {$key.Dispose()}
+    if(!(Test-DisabledPreferences $current)){throw 'Gesture preferences changed during capture; stopping without overwriting the change'}
+    $cache=Read-Cache
+    if(@($names | Where-Object {$cache[$_] -ne 0}).Count){
+        Write-Host 'Background guard cache drift detected; refreshing the four owned settings.'
+        Reload-Cache
+        $cache=Read-Cache
+        foreach($name in $names){if($cache[$name] -ne 0){throw ('Background guard cache remains enabled: '+$name)}}
+    }
+}
 function Read-Journal([string]$path) {
     $resolved=(Resolve-Path -LiteralPath $path).Path
     $artifactRoot=[IO.Path]::GetFullPath((Join-Path $repoPath 'artifacts'))+[IO.Path]::DirectorySeparatorChar
@@ -70,6 +147,15 @@ function Read-Journal([string]$path) {
         if($p.exists){
             if($p.kind -cne 'DWord' -or [Convert]::FromBase64String($p.bytes).Length -ne 4){throw 'Unsupported recovery bytes'}
         } elseif($p.kind -cne 'Absent' -or $p.bytes -cne ''){throw 'Invalid absent-value snapshot'}
+    }
+    if($null -ne $j.touchscreen){
+        if($j.touchscreen.runtime -notin @(0,1) -or $j.touchscreen.preference.name -cne 'TouchGestureSetting'){
+            throw 'Unsupported touchscreen recovery snapshot'
+        }
+        $p=$j.touchscreen.preference
+        if($p.exists){
+            if($p.kind -cne 'DWord' -or [Convert]::FromBase64String($p.bytes).Length -ne 4){throw 'Unsupported touchscreen preference bytes'}
+        } elseif($p.kind -cne 'Absent' -or $p.bytes -cne ''){throw 'Invalid absent touchscreen preference'}
     }
     return $j
 }
@@ -111,11 +197,17 @@ function Restore-Preferences([string]$path) {
                 if($conflicts -notcontains $p.name -and !(Test-SamePreference $p (Get-Preference $key $p.name))){$conflicts+=$p.name}
             }
         } finally {$key.Dispose()}
-        Reload-Cache
-        if($conflicts.Count){throw ('Restored other owned values; retained external/unsupported values requiring review: '+($conflicts -join ','))}
-        $cache=Read-Cache
-        foreach($p in $j.preferences){if($cache[$p.name] -ne [uint32]$p.cacheValue){throw ('Cache restoration mismatch: '+$p.name)}}
-        Save-NewJson $done ([ordered]@{restored=$true;registry_exact=$true;cache_exact=$true;utc=[DateTime]::UtcNow.ToString('o')})
+        # Restore both independent paths even if either one fails.
+        try {
+            Reload-Cache
+            $cache=Read-Cache
+            foreach($p in $j.preferences){if($cache[$p.name] -ne [uint32]$p.cacheValue){throw ('Cache restoration mismatch: '+$p.name)}}
+        } catch {$conflicts+=$_.Exception.Message}
+        if($null -ne $j.touchscreen -and (Test-Path -LiteralPath (Join-Path $dir 'touchscreen-mutation-started.json'))){
+            try {Restore-TouchscreenGestures $j.touchscreen} catch {$conflicts+=$_.Exception.Message}
+        }
+        if($conflicts.Count){throw ('Restored other owned settings; retained external/unsupported values requiring review: '+($conflicts -join ','))}
+        Save-NewJson $done ([ordered]@{restored=$true;registry_exact=$true;cache_exact=$true;touchscreen_exact=$true;utc=[DateTime]::UtcNow.ToString('o')})
         Write-Host 'Exact registry presence/type/bytes and cache values restored.'
         try {[Console]::Beep(650,250)} catch {}
     } finally {if($held){$lock.ReleaseMutex()};$lock.Dispose()}
@@ -129,13 +221,33 @@ if($Mode -eq 'self-test'){
     foreach($case in @(@($absent,$zero,'restore-owned-zero'),@($one,$zero,'restore-owned-zero'),@($one,$one,'already-original'),@($absent,$absent,'already-original'),@($one,$two,'conflict'),@($absent,$two,'conflict'))){
         if((Get-RestoreAction $case[0] $case[1]) -cne $case[2]){throw 'Restoration decision self-test failed'}
     }
+    if(!(Test-DisabledPreferences @($zero,$zero,$zero,$zero))){throw 'Owned disabled preferences rejected'}
+    foreach($preferences in @(@($zero,$zero,$zero),@($zero,$zero,$zero,$one),@($zero,$zero,$zero,$absent))){
+        if(Test-DisabledPreferences $preferences){throw 'Incomplete or externally changed preferences accepted'}
+    }
     $utcText='2099-12-31T11:46:57.2856908Z'
     $jsonDate=('{"deadlineUtc":"'+$utcText+'"}') | ConvertFrom-Json
     $expectedTicks=[DateTime]::Parse($utcText,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).Ticks
     foreach($value in @($utcText,$jsonDate.deadlineUtc)){
         if((Get-DeadlineUtc $value).Ticks -ne $expectedTicks){throw 'Deadline timezone/precision regression'}
     }
-    Write-Output 'restoration_decision_tests=6 passed; deadline_roundtrip_tests=2 passed; registry_access=false'
+    # Exercise restore against fake live state: no registry or SPI writes.
+    function Get-TouchscreenSnapshot {return $script:fakeTouchscreen}
+    function Set-TouchscreenGestures([uint32]$value) {$script:fakeTouchscreen.runtime=$value;$script:fakeWrites++}
+    foreach($preference in @($absent,$zero,$one)){
+        $script:fakeWrites=0
+        $script:fakeTouchscreen=[pscustomobject]@{runtime=0;preference=$preference}
+        Restore-TouchscreenGestures ([pscustomobject]@{runtime=1;preference=$preference})
+        if($script:fakeTouchscreen.runtime -ne 1 -or $script:fakeWrites -ne 1){throw 'Touchscreen restore did not recover runtime state'}
+        Restore-TouchscreenGestures ([pscustomobject]@{runtime=1;preference=$preference})
+        if($script:fakeWrites -ne 1){throw 'Touchscreen restore was not idempotent'}
+    }
+    $script:fakeTouchscreen=[pscustomobject]@{runtime=1;preference=$one}
+    $script:fakeWrites=0
+    $conflictDetected=$false
+    try {Restore-TouchscreenGestures ([pscustomobject]@{runtime=0;preference=$absent})} catch {$conflictDetected=$true}
+    if(!$conflictDetected -or $script:fakeWrites -ne 0){throw 'External touchscreen preference was overwritten'}
+    Write-Output 'restoration_decision_tests=6 passed; disabled_ownership_tests=4 passed; deadline_roundtrip_tests=2 passed; touchscreen_restore_tests=7 passed; registry_access=false'
     return
 }
 if(!(Test-Path -LiteralPath $helper)){throw 'Compile experiments/gesture-cache-probe.rs into artifacts/gesture-cache-probe.exe first'}
@@ -174,12 +286,16 @@ if($Mode -eq 'session'){
     $guiOwner=Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
     if($null -eq $guiOwner -or $guiOwner.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $OwnerStartedFileTime){throw 'GUI owner identity is unavailable or changed'}
 }
+if($SuppressTouchscreen -and ($Mode -notin @('session','probe') -or $version.CurrentBuildNumber -cne '26300' -or [int]$version.UBR -ne 9974)){
+    throw 'Touchscreen gesture control requires a session or read-only probe on build 26300.9974'
+}
 $cache=Read-Cache
 $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$false)
 if($null -eq $key){throw 'Touchpad preferences key is unavailable'}
 try {$original=@(foreach($name in $names){$p=Get-Preference $key $name;$p | Add-Member -NotePropertyName cacheValue -NotePropertyValue $cache[$name];$p})} finally {$key.Dispose()}
 if($Mode -eq 'probe'){
-    [ordered]@{read_only=$true;build=$version.CurrentBuildNumber;display_version=$version.DisplayVersion;preferences=$original} | ConvertTo-Json -Depth 5
+    $touchscreen=if($SuppressTouchscreen){Get-TouchscreenSnapshot}else{$null}
+    [ordered]@{read_only=$true;build=$version.CurrentBuildNumber;display_version=$version.DisplayVersion;preferences=$original;touchscreen=$touchscreen} | ConvertTo-Json -Depth 5
     return
 }
 if(!$ExpectedBuild -or $ExpectedBuild -cne $version.CurrentBuildNumber){throw 'Apply requires -ExpectedBuild matching the explicitly reviewed current Windows build; no automatic version compatibility is claimed'}
@@ -203,6 +319,7 @@ try {
         if(!(Test-Path -LiteralPath $previousDone)){throw ('Earlier experiment is not recovered: '+$previous.journal)}
         $completion=Get-Content -LiteralPath $previousDone -Raw | ConvertFrom-Json
         $safeCompletion=($completion.registry_exact -and $completion.cache_exact) -or ($completion.no_mutation -and !(Test-Path -LiteralPath (Join-Path $previousDirectory 'mutation-started.json')))
+        if((Test-Path -LiteralPath (Join-Path $previousDirectory 'touchscreen-required.json')) -and !$completion.touchscreen_exact -and !$completion.no_mutation){$safeCompletion=$false}
         if(!$completion.restored -or !$safeCompletion){throw ('Earlier experiment requires recovery review: '+$previous.journal)}
     }
     # Re-snapshot under the global lease after excluding an unfinished session.
@@ -211,9 +328,11 @@ try {
     if($null -eq $key){throw 'Touchpad preferences key is unavailable'}
     try {$original=@(foreach($name in $names){$p=Get-Preference $key $name;$p | Add-Member -NotePropertyName cacheValue -NotePropertyValue $cache[$name];$p})} finally {$key.Dispose()}
     foreach($p in $original){if($p.exists -and [BitConverter]::ToUInt32([Convert]::FromBase64String($p.bytes),0) -ne $p.cacheValue){throw ('Registry/cache prerequisite mismatch: '+$p.name)}}
+    $touchscreen=if($SuppressTouchscreen){Get-TouchscreenSnapshot}else{$null}
     New-Item -ItemType Directory -Path $runPath | Out-Null
     $journalPath=Join-Path $runPath 'original.json'
-    Save-NewJson $journalPath ([ordered]@{format=1;id=[Guid]::NewGuid().ToString('N');subkey=$subkey;build=$version.CurrentBuildNumber;parentPid=$PID;parentStartedTicks=(Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks;deadlineUtc=[DateTime]::UtcNow.AddSeconds($Seconds+20).ToString('o');preferences=$original})
+    Save-NewJson $journalPath ([ordered]@{format=1;id=[Guid]::NewGuid().ToString('N');subkey=$subkey;build=$version.CurrentBuildNumber;parentPid=$PID;parentStartedTicks=(Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks;deadlineUtc=[DateTime]::UtcNow.AddSeconds($Seconds+20).ToString('o');preferences=$original;touchscreen=$touchscreen})
+    if($SuppressTouchscreen){Save-NewJson (Join-Path $runPath 'touchscreen-required.json') @{required=$true}}
     New-Item -ItemType Directory -Path $leaseDirectory -Force | Out-Null
     # A malformed lease after an interrupted write blocks the next experiment.
     # The immutable original journal remains the recovery source of truth.
@@ -246,6 +365,17 @@ try {
                 $key.Flush()
                 foreach($name in $names){if((Get-Preference $key $name).bytes -cne 'AAAAAA=='){throw 'Disabled registry readback mismatch'}}
             } finally {$key.Dispose()}
+            if($SuppressTouchscreen){
+                $currentTouchscreen=Get-TouchscreenSnapshot
+                if($currentTouchscreen.runtime -ne $touchscreen.runtime -or !(Test-SamePreference $touchscreen.preference $currentTouchscreen.preference)){
+                    throw 'Touchscreen settings changed since snapshot; refusing to override'
+                }
+                Save-NewJson (Join-Path $runPath 'touchscreen-mutation-started.json') @{utc=[DateTime]::UtcNow.ToString('o')}
+                Set-TouchscreenGestures 0
+                $afterTouchscreen=Get-TouchscreenSnapshot
+                if(!(Test-SamePreference $touchscreen.preference $afterTouchscreen.preference)){throw 'Live touchscreen override unexpectedly changed the persistent preference'}
+                Write-Host 'Touchscreen three/four-finger system gestures disabled; application multitouch preserved.'
+            }
         } finally {if($writeHeld){$writeLock.ReleaseMutex()};$writeLock.Dispose()}
         Reload-Cache
         $disabled=Read-Cache
@@ -256,9 +386,23 @@ try {
         try {[Console]::Beep(1100,250)} catch {}
         if($Mode -eq 'session'){
             $activeTimer=[Diagnostics.Stopwatch]::StartNew()
+            $healthTimer=[Diagnostics.Stopwatch]::StartNew()
             while($activeTimer.Elapsed.TotalSeconds -lt $Seconds -and !(Test-Path -LiteralPath (Join-Path $runPath 'stop-requested.json'))){
                 $guiOwner=Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
                 if($null -eq $guiOwner -or $guiOwner.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $OwnerStartedFileTime){break}
+                if($healthTimer.Elapsed.TotalSeconds -ge 1){
+                    try {
+                        if($watchdog.HasExited){throw 'Background guard recovery watchdog exited during capture'}
+                        Assert-SessionGuard
+                    } catch {
+                        Save-NewJson (Join-Path $runPath 'failed.json') ([ordered]@{failed=$true;reason=$_.Exception.Message;utc=[DateTime]::UtcNow.ToString('o')})
+                        # Let the GUI stop and drain injected contacts before restoration.
+                        $drainTimer=[Diagnostics.Stopwatch]::StartNew()
+                        while($drainTimer.Elapsed.TotalSeconds -lt 3 -and !(Test-Path -LiteralPath (Join-Path $runPath 'stop-requested.json'))){Start-Sleep -Milliseconds 50}
+                        throw
+                    }
+                    $healthTimer.Restart()
+                }
                 Start-Sleep -Milliseconds 100
             }
             if($activeTimer.Elapsed.TotalSeconds -ge $Seconds){
