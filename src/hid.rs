@@ -332,7 +332,7 @@ pub fn discover() -> Result<Vec<Device>, String> {
 pub fn probe() -> Result<(), String> {
     let devices = discover()?;
     println!(
-        "PadBridge Phase 0: Raw Input touchpad collections={}",
+        "Pad2Touch Phase 0: Raw Input touchpad collections={}",
         devices.len()
     );
     for (i, d) in devices.iter().enumerate() {

@@ -127,7 +127,7 @@ enum Choice {
     ScreenPortion,
     /// A window's whole client area, or a dragged part of it.
     Window,
-    /// PadBridge's own receiver, for checking touch delivery.
+    /// Pad2Touch's own receiver, for checking touch delivery.
     Diagnostic,
 }
 impl Choice {
@@ -168,7 +168,7 @@ fn choice_label(choice: Choice, monitors: &[mapping::MonitorEntry]) -> String {
         },
         Choice::ScreenPortion => "Portion of screen…".into(),
         Choice::Window => "Application window".into(),
-        Choice::Diagnostic => "Test area (inside PadBridge)".into(),
+        Choice::Diagnostic => "Test area (inside Pad2Touch)".into(),
     }
 }
 /// What an in-progress overlay selection will configure.
@@ -225,7 +225,7 @@ pub fn run() -> Result<(), String> {
             MessageBoxW(
                 null_mut(),
                 wide(error).as_ptr(),
-                wide("PadBridge could not start").as_ptr(),
+                wide("Pad2Touch could not start").as_ptr(),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -239,16 +239,16 @@ fn run_window() -> Result<(), String> {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
             return Err(winerr("SetProcessDpiAwarenessContext(GUI)"));
         }
-        register("PadBridgeGui", Some(window_proc), 0)?;
+        register("Pad2TouchGui", Some(window_proc), 0)?;
         register(
-            "PadBridgeDiagnosticPanel",
+            "Pad2TouchDiagnosticPanel",
             Some(panel_proc),
             CS_HREDRAW | CS_VREDRAW,
         )?;
         let hwnd = CreateWindowExW(
             0,
-            wide("PadBridgeGui").as_ptr(),
-            wide("PadBridge Control Panel").as_ptr(),
+            wide("Pad2TouchGui").as_ptr(),
+            wide("Pad2Touch Control Panel").as_ptr(),
             MAIN_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -590,7 +590,7 @@ impl Gui {
         )?;
         g.panel = CreateWindowExW(
             0,
-            wide("PadBridgeDiagnosticPanel").as_ptr(),
+            wide("Pad2TouchDiagnosticPanel").as_ptr(),
             wide("Touch receiver").as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0,
@@ -1915,7 +1915,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         g.refresh_diagram_preview();
                     }
                     WM_ENTERSIZEMOVE => {
-                        // External targets do not depend on PadBridge's own window.
+                        // External targets do not depend on Pad2Touch's own window.
                         if g.session.is_some() && g.checked(INJECT) && g.session_diagnostic {
                             g.disarm("Window or display changed. Capture stopped.");
                         }
@@ -2086,17 +2086,17 @@ mod tests {
     fn native_gui_focus_moves_off_disabled_controls() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge focus regression").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch focus regression").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 40,
                 40,
@@ -2190,7 +2190,7 @@ mod tests {
         }
         /// Drag inside the live overlay using client coordinates.
         unsafe fn drag(from: (i32, i32), to: (i32, i32)) {
-            let overlay = FindWindowW(wide("PadBridgeSelectionOverlay").as_ptr(), null());
+            let overlay = FindWindowW(wide("Pad2TouchSelectionOverlay").as_ptr(), null());
             assert!(!overlay.is_null(), "selection overlay not shown");
             let pack = |(x, y): (i32, i32)| ((y as isize) << 16 | x as isize) as LPARAM;
             SendMessageW(overlay, WM_LBUTTONDOWN, 1, pack(from));
@@ -2200,17 +2200,17 @@ mod tests {
         }
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge Phase 3 GUI check").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch Phase 3 GUI check").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 40,
                 40,
@@ -2437,7 +2437,7 @@ mod tests {
                 "Screen · 2560×1440",
                 "Portion of screen…",
                 "Application window",
-                "Test area (inside PadBridge)"
+                "Test area (inside Pad2Touch)"
             ]
         );
         // Several monitors: full desktop, then each monitor, main first.
@@ -2483,17 +2483,17 @@ mod tests {
         const RED: u32 = 0x002020E0;
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge mapping diagram check").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch mapping diagram check").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 40,
                 40,
@@ -2664,7 +2664,7 @@ mod tests {
                 SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 2, 0);
                 g.select_pad_area().unwrap();
             });
-            let picker = FindWindowW(wide("PadBridgeSelectionOverlay").as_ptr(), null());
+            let picker = FindWindowW(wide("Pad2TouchSelectionOverlay").as_ptr(), null());
             assert!(!picker.is_null());
             let mut picker_bounds = RECT::default();
             GetClientRect(picker, &mut picker_bounds);
@@ -2801,17 +2801,17 @@ mod tests {
     fn native_gui_fixed_size_repaints_background_and_canvas() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge fixed-size regression").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch fixed-size regression").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 20,
                 20,
@@ -2909,17 +2909,17 @@ mod tests {
     fn native_gui_background_guard_session_restores() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge background integration check").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch background integration check").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 80,
                 80,
@@ -3057,17 +3057,17 @@ mod tests {
     fn native_gui_sessions_restart_and_hotkey_messages_stop_cleanly() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            register("PadBridgeGui", Some(window_proc), 0).unwrap();
+            register("Pad2TouchGui", Some(window_proc), 0).unwrap();
             register(
-                "PadBridgeDiagnosticPanel",
+                "Pad2TouchDiagnosticPanel",
                 Some(panel_proc),
                 CS_HREDRAW | CS_VREDRAW,
             )
             .unwrap();
             let hwnd = CreateWindowExW(
                 0,
-                wide("PadBridgeGui").as_ptr(),
-                wide("PadBridge GUI integration check").as_ptr(),
+                wide("Pad2TouchGui").as_ptr(),
+                wide("Pad2Touch GUI integration check").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 80,
                 80,

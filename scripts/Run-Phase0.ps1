@@ -6,7 +6,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
-$exePath=Join-Path $repoPath 'target\release\padbridge-phase0.exe'
+$exePath=Join-Path $repoPath 'target\release\Pad2Touch.exe'
 if (!(Test-Path -LiteralPath $exePath)) { throw 'Build first: cargo build --release --locked' }
 Push-Location -LiteralPath $repoPath
 try {

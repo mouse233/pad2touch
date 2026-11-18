@@ -1,10 +1,14 @@
 [package]
-name = "padbridge-phase0"
+name = "pad2touch"
 version = "0.4.0"
 edition = "2021"
 description = "Native GUI for Precision Touchpad capture and synchronized native touch injection"
 license = "MIT"
-repository = "https://github.com/mouse233/padbridge"
+repository = "https://github.com/mouse233/pad2touch"
+
+[[bin]]
+name = "Pad2Touch"
+path = "src/main.rs"
 
 [dependencies]
 base64 = "0.23.1"

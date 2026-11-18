@@ -1,6 +1,6 @@
 # Isolated settings-cache experiment
 
-These developer tools investigate an undocumented Windows interface. They are separate from PadBridge's default capture path. They do not implement a production global-capture mode, a GUI, hotkeys, drivers, or process injection. Use the ordinary interactive desktop under the same user account as Explorer.
+These developer tools investigate an undocumented Windows interface. They are separate from Pad2Touch's default capture path. They do not implement a production global-capture mode, a GUI, hotkeys, drivers, or process injection. Use the ordinary interactive desktop under the same user account as Explorer.
 
 The GUI's explicit **Background guard (experimental)** selection embeds this transaction and its native helper through a separate adapter. Its `session` mode retains the same journal, lease, snapshot, readback, and watchdog path while the GUI owns Raw Input capture. It monitors the GUI owner's process identity, accepts a stop marker after input cleanup, and signals expiry at 120 seconds before restoration. This GUI mode accepts only the locally validated build 26300.9974 and remains off by default. The original bounded `apply` experiment is still available independently.
 
@@ -43,7 +43,7 @@ The script preserves the existence, type, and original DWORD bytes of only these
 
 Before writing, it flushes `original.json` and starts an independent recovery process. That process must acknowledge readiness. A durable mutation marker precedes the four writes. The script sets the four values to zero, checks registry readback, notifies the four cache IDs, and requires four zero cache reads. Directional/custom bindings and unrelated preferences are not edited.
 
-Once active, it runs a raw-only, minimized PadBridge capture for the requested duration. Keep another application foreground, repeat three-/four-finger swipes and taps, and include single-/two-/five-contact movement and complete releases. Observe shell behavior separately from the captured input.
+Once active, it runs a raw-only, minimized Pad2Touch capture for the requested duration. Keep another application foreground, repeat three-/four-finger swipes and taps, and include single-/two-/five-contact movement and complete releases. Observe shell behavior separately from the captured input.
 
 Normal completion and failures after mutation request exact restoration. The recovery process also attempts restoration when its parent exits or its deadline expires. The original existence/type/bytes and cache values are checked after restoration; originally missing values are removed again instead of being restored as enabled DWORDs. Changed external values are retained and reported for review. A per-run mutex serializes normal and watchdog restoration.
 

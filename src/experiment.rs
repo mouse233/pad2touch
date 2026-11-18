@@ -299,8 +299,8 @@ pub fn run(opt: Options) -> Result<(), String> {
             return Err(winerr("SetConsoleCtrlHandler"));
         }
         let hwnd = make_window(
-            "PadBridgeReceiver",
-            &format!("PadBridge Phase 1+2 - {} - PT_TOUCH receiver", opt.mode),
+            "Pad2TouchReceiver",
+            &format!("Pad2Touch Phase 1+2 - {} - PT_TOUCH receiver", opt.mode),
             Some(ui_proc),
             true,
         )?;
@@ -1026,7 +1026,7 @@ fn gesture_guard_label(s: &Stats) -> &str {
     }
 }
 pub(crate) fn diagnostic_text(s: &Stats) -> String {
-    let text = format!("PadBridge PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {}{}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,gesture_guard_label(s),if s.background_guard { String::new() } else { format!(" / events {}", s.gesture_events) },if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
+    let text = format!("Pad2Touch PHASE 1+2 | {} | max {} touches\n{}\nRaw {} / Frames {} / Peak fingers {} / Parse errors {}\nInjected batches {} / Errors {} / Retry {} / Active {} / {}\nPT_TOUCH: DOWN {} / UPDATE {} / UP {} / Active {} / Peak {}\nTwo-finger ratio {:.2} | 3/4-finger guard: {}{}\n{}",if s.mode=="self-test"{"SYNTHETIC API TEST"}else{"PHYSICAL TOUCHPAD"},s.capacity,s.device_label,s.raw,s.frames,s.peak,s.parse_errors,s.injected,s.inject_errors,s.retries,s.injected_active,if s.cleanup_pending{"CLEANUP FAILED"}else if s.capture_stopped{"STOPPED"}else if s.armed{"ARMED"}else{"WAIT ALL FINGERS UP"},s.down,s.update,s.up,s.received_active.len(),s.received_peak,s.pinch_ratio,gesture_guard_label(s),if s.background_guard { String::new() } else { format!(" / events {}", s.gesture_events) },if !s.stop_reason.is_empty(){format!("Stopped: {} | Esc to close",s.stop_reason)}else if !s.error.is_empty(){s.error.clone()}else{"ESC: release and stop | Native mouse remains active".into()});
     let text = format!("{text}\n{}", s.report_rate.label());
     let text = if s.target_label.is_empty() {
         text
@@ -1280,7 +1280,7 @@ fn worker_loop(
         } else {
             None
         };
-        let hwnd = make_window("PadBridgePhase0RawInput", "", Some(input_proc), false)?;
+        let hwnd = make_window("Pad2TouchPhase0RawInput", "", Some(input_proc), false)?;
         INPUT.with(|i| *i.borrow_mut() = Some(worker));
         let rid = RAWINPUTDEVICE {
             usUsagePage: 0x0D,

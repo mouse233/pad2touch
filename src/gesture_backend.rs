@@ -636,7 +636,7 @@ pub fn command(mode: &str) -> Result<Command> {
         "--ignored",
         "--nocapture",
     ])
-    .env("PADBRIDGE_TEST_GESTURE_CHILD", mode);
+    .env("PAD2TOUCH_TEST_GESTURE_CHILD", mode);
     #[cfg(not(test))]
     cmd.arg(mode);
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -649,7 +649,7 @@ fn validate_directory(directory: &Path) -> Result<()> {
     let allowed = fs::canonicalize(allowed).map_err(io_error)?;
     let actual = fs::canonicalize(directory).map_err(io_error)?;
     if actual == allowed || !actual.starts_with(allowed) {
-        return Err("Gesture journal must be under PadBridge's artifacts directory".into());
+        return Err("Gesture journal must be under Pad2Touch's artifacts directory".into());
     }
     Ok(())
 }
@@ -745,7 +745,7 @@ impl Worker {
         let mut cmd = command("--gesture-watchdog")?;
         #[cfg(test)]
         cmd.env(
-            "PADBRIDGE_TEST_GESTURE_ARGS",
+            "PAD2TOUCH_TEST_GESTURE_ARGS",
             serde_json::to_string(&[
                 directory
                     .to_str()
@@ -968,9 +968,9 @@ mod tests {
     #[test]
     #[ignore = "internal child process entry point for native gesture integration tests"]
     fn child_process() {
-        let mode = std::env::var("PADBRIDGE_TEST_GESTURE_CHILD").unwrap();
+        let mode = std::env::var("PAD2TOUCH_TEST_GESTURE_CHILD").unwrap();
         let args: Vec<String> =
-            serde_json::from_str(&std::env::var("PADBRIDGE_TEST_GESTURE_ARGS").unwrap()).unwrap();
+            serde_json::from_str(&std::env::var("PAD2TOUCH_TEST_GESTURE_ARGS").unwrap()).unwrap();
         super::run(&mode, &args.into_iter().map(Into::into).collect::<Vec<_>>()).unwrap();
     }
 }

@@ -1,6 +1,6 @@
 # Architecture
 
-PadBridge is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and Phase 3 targets: application windows, rectangles inside windows, and desktop rectangles. Persistent configuration and release-level recovery remain outside this implementation. The CLI receiver remains available.
+Pad2Touch is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and Phase 3 targets: application windows, rectangles inside windows, and desktop rectangles. Persistent configuration and release-level recovery remain outside this implementation. The CLI receiver remains available.
 
 ## Modules
 
@@ -122,7 +122,7 @@ Missing DOWN/UP events, incorrect coordinates, incomplete batches, logged errors
 
 ## Documentation and privacy
 
-Repository documentation describes architecture and reusable testing procedures in English. The original [Chinese whitepaper](PadBridge.md) is retained as a specification. Machine-specific reports, checklists containing observations, raw logs, screenshots, and recorded fixtures stay in ignored local directories.
+Repository documentation describes architecture and reusable testing procedures in English. The original [Chinese whitepaper](Pad2Touch.md) is retained as a specification. Machine-specific reports, checklists containing observations, raw logs, screenshots, and recorded fixtures stay in ignored local directories.
 
 Tapview was used only as a technical reference. Its unconfirmed source license was not treated as permission to copy code. See [third-party notices](third-party-notices.md) and the root LICENSE.
 

@@ -10,14 +10,14 @@ param(
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
-$exePath=Join-Path $repoPath 'target\release\padbridge-phase0.exe'
+$exePath=Join-Path $repoPath 'target\release\Pad2Touch.exe'
 if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
 Push-Location -LiteralPath $repoPath
 try {
     if($Mode -eq 'gui'){
         if($Inject -or $SuppressSystemGestures -or $Background){throw 'Use the GUI controls for injection and foreground gesture ownership; -Background is a CLI capture diagnostic'}
         & $exePath --gui
-        if($LASTEXITCODE -ne 0){throw 'PadBridge GUI failed'}
+        if($LASTEXITCODE -ne 0){throw 'Pad2Touch GUI failed'}
         return
     }
     if($Mode -eq 'probe'){& $exePath --probe;if($LASTEXITCODE -ne 0){throw 'Device discovery failed'};return}

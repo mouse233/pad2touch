@@ -55,7 +55,7 @@ cargo test --locked native_gui_phase3_target_selection_without_capture -- --igno
 cargo test --locked native_gui_mapping_diagram_draws_region_and_touchpad -- --ignored --test-threads=1
 ```
 
-They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of PadBridge's own windows, target destruction, and GUI selection of every mode. The diagram check renders the panel and verifies the red region frame, touchpad surface and pad body at the positions computed by the pure layout, and that idle repaints and resizing reuse the desktop thumbnail while a screen area change captures exactly one new one. It also writes `artifacts/diagram-*.bmp` for visual review; these images include a desktop thumbnail, so review them before sharing. None needs a touchpad or injects touch.
+They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of Pad2Touch's own windows, target destruction, and GUI selection of every mode. The diagram check renders the panel and verifies the red region frame, touchpad surface and pad body at the positions computed by the pure layout, and that idle repaints and resizing reuse the desktop thumbnail while a screen area change captures exactly one new one. It also writes `artifacts/diagram-*.bmp` for visual review; these images include a desktop thumbnail, so review them before sharing. None needs a touchpad or injects touch.
 
 The following check **submits native touch input** into the helper window, once with a Per-Monitor-V2 host and once with a DPI-unaware host:
 
@@ -70,7 +70,7 @@ Manual Phase 3 acceptance still needs a physical touchpad and real applications:
 ## Prepare a physical test
 
 1. Use an ordinary interactive Windows desktop and build the Release executable.
-2. Run `scripts\Run-PadBridge.ps1 -Mode probe` and select a collection with `-Device N` if needed.
+2. Run `scripts\Run-Pad2Touch.ps1 -Mode probe` and select a collection with `-Device N` if needed.
 3. Keep the dedicated receiver visible and stationary. Native touchpad mouse behavior and system gestures remain enabled.
 4. Begin a sequence directly: the first valid touch must inject without a preliminary touch-and-lift. After a cancellation or mapping change, lift all fingers once before resuming.
 5. Use a new output directory for every run. The wrapper creates timestamped directories automatically.
@@ -82,7 +82,7 @@ Some hardware reserves special regions for vendor controls. Record such coverage
 ### Isolate background Raw Input
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode capture -Background -Contacts 5 -Seconds 75
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Background -Contacts 5 -Seconds 75
 ```
 
 This raw-only diagnostic starts the receiver minimized without requesting foreground. Do not add `-Inject`. Keep another ordinary application foreground, touch and lift all fingers once, then repeat single-finger movement, two-finger movement/pinch, three-/four-/five-contact sequences, partial lifts, and complete release. Leave all fingers lifted at the end. Windows mouse and shell gestures remain enabled; this test measures receipt only. A visible receiver without focus is also a valid background condition; minimization is a convenient way to maintain that condition.
@@ -95,11 +95,11 @@ See [background gesture feasibility](background-gesture-feasibility.md) for the 
 
 ### Foreground gesture ownership
 
-To temporarily claim three-/four-finger touchpad gestures while the PadBridge receiver is foreground:
+To temporarily claim three-/four-finger touchpad gestures while the Pad2Touch receiver is foreground:
 
 ```powershell
-.\target\release\padbridge-phase0.exe --gesture-support
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
+.\target\release\Pad2Touch.exe --gesture-support
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Inject -SuppressSystemGestures -Contacts 5 -Seconds 180
 ```
 
 Check that the receiver shows `3/4-finger guard: ACTIVE (foreground)`. Repeat three-/four-finger swipes and taps, confirm independent contact trails, and observe whether task switching or desktop actions occur. Do not switch to a chat or another application to report progress while testing. Wait until capture ends before giving feedback. A visible topmost window is not necessarily the foreground window: `INACTIVE (background)` means that the controller is ineligible. End capture, then verify ordinary Windows touchpad gestures work again in another foreground application. Gesture-controller activation/readback alone does not establish that physical gesture interception worked.
@@ -107,10 +107,10 @@ Check that the receiver shows `3/4-finger guard: ACTIVE (foreground)`. Repeat th
 For isolation, run a separate capture without injection:
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode capture -SuppressSystemGestures -Contacts 5 -Seconds 30
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -SuppressSystemGestures -Contacts 5 -Seconds 30
 ```
 
-No received touch trails are expected in this run. Review `GESTURE_EVENT`, `GESTURE_HANDLER_ERROR`, and `WINDOW_STATE` records and compare timestamps. Then repeat with `-Inject`. A system action during raw-only capture cannot have been caused by PadBridge's injected touches. A failure only with injection calls for separate investigation of touchscreen gesture handling. If needed, open `ms-settings:devices-touch` and manually compare the Windows three-/four-finger **Touch** preference on and off, restoring the original preference afterward. PadBridge does not modify this setting.
+No received touch trails are expected in this run. Review `GESTURE_EVENT`, `GESTURE_HANDLER_ERROR`, and `WINDOW_STATE` records and compare timestamps. Then repeat with `-Inject`. A system action during raw-only capture cannot have been caused by Pad2Touch's injected touches. A failure only with injection calls for separate investigation of touchscreen gesture handling. If needed, open `ms-settings:devices-touch` and manually compare the Windows three-/four-finger **Touch** preference on and off, restoring the original preference afterward. Pad2Touch does not modify this setting.
 
 The option does not modify Windows preferences. If unavailable, the requested run fails before capture. Do not report suppression as working simply because capture without the option succeeds. If conflicts persist, distinguish physical touchpad shell gestures from Windows' separate three-/four-finger touchscreen gestures; see the [Microsoft explanation](https://learn.microsoft.com/en-us/troubleshoot/windows/win32/finger3or4-touch-interaction-no-longer-works).
 
@@ -119,7 +119,7 @@ The receiver uses double buffering. Observe it during idle updates, active trail
 ## Single-contact procedure
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 1 -Seconds 120
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Inject -Contacts 1 -Seconds 120
 ```
 
 Check:
@@ -135,7 +135,7 @@ Check:
 ## Multitouch procedure
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 180
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Inject -Contacts 5 -Seconds 180
 ```
 
 Check two-finger movement, pinch/expand, one stationary finger while another moves, partial release, and repeated replacement of one finger while retaining another. Then check three, four, and five simultaneous contacts, followed by simultaneous release.
@@ -145,7 +145,7 @@ Look for stable IDs, independent trails, the expected active count, retained con
 ## Shutdown procedure
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 30
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Inject -Contacts 5 -Seconds 30
 ```
 
 Hold multiple contacts and press Esc. Repeat with duration expiry while contacts remain active. Check that final UP events arrive and both sides finish with zero contacts and no cleanup pending. An ordinary exit after fingers have already lifted does not cover this case.
@@ -157,7 +157,7 @@ A runtime safety stop keeps the result window until explicit close or the origin
 ## Optional native API exercise
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode self-test -Contacts 5 -Seconds 40
+.\scripts\Run-Pad2Touch.ps1 -Mode self-test -Contacts 5 -Seconds 40
 ```
 
 This command submits **real native touch input** using synthetic coordinates. It covers dragging, holds, quick taps, two-finger pinch/expand, partial release, replacement, and concurrent contacts. A successful synthetic exercise does not replace physical touchpad testing.
@@ -174,6 +174,6 @@ Review `summary.txt` and `analysis.json`, including parse failures, incomplete f
 
 The verifier checks complete lifetimes and ordered coordinates. `passed=true` means that these log checks succeeded. It does not by itself prove every manual scenario, visual behavior, edge coordinate, hold duration, or compatibility requirement passed.
 
-The wrapper saves the audit JSON and emits a warning for failed touch-delivery checks by default. This does not convert a failure to a pass. Use `-Strict` on `Analyze-Run.ps1` or `Run-PadBridge.ps1` when an automated workflow needs a terminating failure. Native `--verify-log` retains its nonzero exit code for failed audits. Command errors, missing files, and invalid arguments remain errors.
+The wrapper saves the audit JSON and emits a warning for failed touch-delivery checks by default. This does not convert a failure to a pass. Use `-Strict` on `Analyze-Run.ps1` or `Run-Pad2Touch.ps1` when an automated workflow needs a terminating failure. Native `--verify-log` retains its nonzero exit code for failed audits. Command errors, missing files, and invalid arguments remain errors.
 
 Record each manual outcome locally as passed, failed, or not tested, with the observation and any scope exception. Preserve the distinction between a confirmed failure, an untested boundary, and a hardware-specific reserved region. Review device paths, usernames, local directories, and screen content before sharing diagnostics.

@@ -1,8 +1,8 @@
-# PadBridge
+# Pad2Touch
 
 **Turn a Windows Precision Touchpad into a touchscreen.**
 
-PadBridge reads absolute finger positions from your touchpad through Windows Raw Input and replays them as native multitouch input (`InjectTouchInput`) on a window or region of your screen. It runs entirely in user mode — no driver, no hooks into the target application.
+Pad2Touch reads absolute finger positions from your touchpad through Windows Raw Input and replays them as native multitouch input (`InjectTouchInput`) on a window or region of your screen. It runs entirely in user mode — no driver, no hooks into the target application.
 
 > **Status:** experimental. Expect rough edges; settings are not saved between launches yet.
 
@@ -25,7 +25,7 @@ PadBridge reads absolute finger positions from your touchpad through Windows Raw
 
 ```powershell
 cargo build --release --locked
-.\target\release\padbridge-phase0.exe
+.\target\release\Pad2Touch.exe
 ```
 
 The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, then click **Start capture**. You can also enable Toggle (Ctrl+Alt+F8–F11) or Hold (Alt). The first valid touch is injected directly, with up to five simultaneous contacts and Windows touch feedback enabled by default. Selected system-gesture overrides last until capture stops, then restore the original settings.
@@ -35,8 +35,8 @@ The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, 
 Command-line modes (probe, raw capture, self-test, …) are available through the helper script:
 
 ```powershell
-.\scripts\Run-PadBridge.ps1 -Mode probe
-.\scripts\Run-PadBridge.ps1 -Mode capture -Inject -Contacts 5 -Seconds 120
+.\scripts\Run-Pad2Touch.ps1 -Mode probe
+.\scripts\Run-Pad2Touch.ps1 -Mode capture -Inject -Contacts 5 -Seconds 120
 ```
 
 ## Limitations
@@ -63,14 +63,14 @@ Default tests never open windows or inject input. See the [testing guide](docs/t
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Background capture & gesture suppression research](docs/background-gesture-feasibility.md)
-- [Design spec (Chinese)](docs/PadBridge.md)
+- [Design spec (Chinese)](docs/Pad2Touch.md)
 
 ## Acknowledgments
 
-Huge thanks to **[JohnAZoidberg/tapview](https://github.com/JohnAZoidberg/tapview)**, the touchpad visualizer whose Windows Raw Input / HID approach showed the way and inspired this project. PadBridge is an independent implementation — no Tapview code is included.
+Huge thanks to **[JohnAZoidberg/tapview](https://github.com/JohnAZoidberg/tapview)**, the touchpad visualizer whose Windows Raw Input / HID approach showed the way and inspired this project. Pad2Touch is an independent implementation — no Tapview code is included.
 
 Thanks also to the [windows-rs](https://github.com/microsoft/windows-rs) project. See [third-party notices](docs/third-party-notices.md) for details.
 
 ## License
 
-[MIT](LICENSE). PadBridge has no telemetry or network features. The mapping diagram's desktop thumbnail is only drawn on screen, never saved. Logs written to `artifacts/` may contain device paths — review them before sharing.
+[MIT](LICENSE). Pad2Touch has no telemetry or network features. The mapping diagram's desktop thumbnail is only drawn on screen, never saved. Logs written to `artifacts/` may contain device paths — review them before sharing.

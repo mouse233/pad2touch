@@ -1,10 +1,10 @@
-# PadBridge
+# Pad2Touch
 ## Windows Precision Touchpad to Touchscreen
 ### 技术白皮书与开发实施规范
 
 **Version:** 1.0  
 **Date:** 2026-11-16  
-**Project:** PadBridge  
+**Project:** Pad2Touch  
 **Platform:** Windows 10 / Windows 11 x64  
 **Primary Language:** Rust  
 **Status:** Technical Specification / MVP Development
@@ -21,11 +21,11 @@ macOS 在 Apple Silicon 设备运行 iOS/iPadOS 应用时，提供了一项名�
 
 Windows 虽然具有 Precision Touchpad（PTP）原始触摸数据读取能力，以及原生 Touch Injection API，但缺少一套将两者结合起来的通用用户态工具。
 
-PadBridge 的目标是填补这一空缺。
+Pad2Touch 的目标是填补这一空缺。
 
 ## 1.2 项目目标
 
-PadBridge 是一个 Windows 用户态工具，用于将 Windows Precision Touchpad 转换为虚拟触摸输入设备。
+Pad2Touch 是一个 Windows 用户态工具，用于将 Windows Precision Touchpad 转换为虚拟触摸输入设备。
 
 它通过读取触控板的原始 HID 多点触摸报告，获取手指的真实接触状态和坐标，再将其转换为 Windows 原生触摸事件。
 
@@ -54,7 +54,7 @@ PadBridge 是一个 Windows 用户态工具，用于将 Windows Precision Touchp
 9. 默认不需要管理员权限。
 10. 不收集或上传用户输入数据。
 
-PadBridge 的输入结果必须是真正的 Windows Touch Input，而不是鼠标事件。
+Pad2Touch 的输入结果必须是真正的 Windows Touch Input，而不是鼠标事件。
 
 ---
 
@@ -108,7 +108,7 @@ Tapview 是一个开源触控板可视化工具，能够显示 Precision Touchpa
 
 # 3. 总体系统架构
 
-PadBridge 分为六个主要模块。
+Pad2Touch 分为六个主要模块。
 
 ```text
 ┌──────────────────────────────────────┐
@@ -337,7 +337,7 @@ Contact ID 必须在一次触摸生命周期内保持稳定。
 
 # 6. 绝对坐标映射
 
-这是 PadBridge 最核心的功能。
+这是 Pad2Touch 最核心的功能。
 
 ## 6.1 坐标转换
 
@@ -540,7 +540,7 @@ InitializeTouchInjection(
 
 它将触摸事件注入当前交互桌面，随后由 Windows 根据屏幕坐标进行命中测试，将输入交给相应窗口。
 
-因此 PadBridge 的窗口映射实际分为两步：
+因此 Pad2Touch 的窗口映射实际分为两步：
 
 1. 根据目标窗口或矩形计算屏幕坐标。
 2. 由 Windows 将该坐标对应的触摸事件交给最上层窗口。
@@ -566,7 +566,7 @@ InitializeTouchInjection(
 
 # 9. 捕获模式与快捷键
 
-PadBridge 应提供多种激活方式。
+Pad2Touch 应提供多种激活方式。
 
 ## 9.1 Hold Mode
 
@@ -656,7 +656,7 @@ Tapview 的 Windows 实现也存在这一限制，不能像 Linux 那样通过�
 - 正常鼠标指针移动。
 - 系统触控板点击。
 - 系统滚动。
-- PadBridge 注入的触摸事件。
+- Pad2Touch 注入的触摸事件。
 
 ## 10.1 MVP 处理策略
 
@@ -767,7 +767,7 @@ UI 中应说明捕获期间原生触控板鼠标行为可能继续存在。
 建议采用模块化结构：
 
 ```text
-padbridge/
+pad2touch/
 │
 ├── Cargo.toml
 ├── README.md
@@ -836,7 +836,7 @@ padbridge/
 
 # 13. 性能与稳定性要求
 
-PadBridge 是实时输入工具，延迟和输入连续性非常重要。
+Pad2Touch 是实时输入工具，延迟和输入连续性非常重要。
 
 ## 13.1 性能目标
 
@@ -1129,7 +1129,7 @@ Coding Agent 必须遵循以下规则。
 
 # 19. 项目最终愿景
 
-PadBridge 不应只是一个将触控板映射为鼠标的工具。
+Pad2Touch 不应只是一个将触控板映射为鼠标的工具。
 
 它的核心价值在于：
 
@@ -1141,4 +1141,4 @@ PadBridge 不应只是一个将触控板映射为鼠标的工具。
 
 最终目标是实现一套接近 macOS Touch Alternatives / Trackpad Capture 使用体验的 Windows 方案。
 
-**PadBridge — Bridge your touchpad to touchscreen input.**
+**Pad2Touch — Bridge your touchpad to touchscreen input.**

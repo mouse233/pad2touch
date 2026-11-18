@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $runPath = (Resolve-Path -LiteralPath $RunDirectory).Path
 $lines = Get-Content -LiteralPath (Join-Path $runPath 'events.log')
 if($lines | Select-String -Pattern ' RUN format=2 ' -Quiet){
-    $exePath=Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\padbridge-phase0.exe'
+    $exePath=Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\Pad2Touch.exe'
     if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
     # The verifier's JSON and exit status carry the result. Capture its stderr
     # separately so PowerShell 5 does not turn an expected failed audit into a

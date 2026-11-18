@@ -56,7 +56,7 @@ jobs:
       - name: Upload build for inspection
         uses: actions/upload-artifact@v4
         with:
-          name: padbridge-windows-x64-${{ github.sha }}
-          path: target/release/padbridge-phase0.exe
+          name: pad2touch-windows-x64-${{ github.sha }}
+          path: target/release/Pad2Touch.exe
           if-no-files-found: error
           retention-days: 7

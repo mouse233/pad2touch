@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
 $helper=Join-Path $repoPath 'artifacts\gesture-cache-probe.exe'
-$captureExe=if($CaptureExecutable){[IO.Path]::GetFullPath($CaptureExecutable)}else{Join-Path $repoPath 'target\release\padbridge-phase0.exe'}
+$captureExe=if($CaptureExecutable){[IO.Path]::GetFullPath($CaptureExecutable)}else{Join-Path $repoPath 'target\release\Pad2Touch.exe'}
 $subkey='Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad'
 $names=@('ThreeFingerTapEnabled','FourFingerTapEnabled','ThreeFingerSlideEnabled','FourFingerSlideEnabled')
 $leaseDirectory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'PadBridge\ExperimentalGestureCache'
@@ -268,17 +268,17 @@ if($Mode -eq 'watchdog'){
 }
 if($WaitForStart){
     if($Mode -ne 'apply'){throw '-WaitForStart is only valid with apply'}
-    if(!('PadBridgeExperimentStart' -as [type])){
+    if(!('Pad2TouchExperimentStart' -as [type])){
         Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public static class PadBridgeExperimentStart {
+public static class Pad2TouchExperimentStart {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     public static extern int MessageBox(IntPtr owner, string text, string caption, uint flags);
 }
 '@
     }
-    $choice=[PadBridgeExperimentStart]::MessageBox([IntPtr]::Zero,"Click OK only when ready to operate the touchpad immediately. After activation, test three- and four-finger swipes and taps for $Seconds seconds, then lift all fingers. A start tone and restoration tone mark the test. Settings are unchanged while this dialog is open.",'PadBridge - start bounded gesture test',0x50041)
+    $choice=[Pad2TouchExperimentStart]::MessageBox([IntPtr]::Zero,"Click OK only when ready to operate the touchpad immediately. After activation, test three- and four-finger swipes and taps for $Seconds seconds, then lift all fingers. A start tone and restoration tone mark the test. Settings are unchanged while this dialog is open.",'Pad2Touch - start bounded gesture test',0x50041)
     if($choice -ne 1){Write-Output 'Experiment cancelled before any preference changes.';return}
 }
 $version=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'

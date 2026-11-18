@@ -28,8 +28,8 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::Pointer::*, WindowsAndMessaging::*},
 };
 
-const HOST_ENV: &str = "PADBRIDGE_PHASE3_HOST";
-const DPI_ENV: &str = "PADBRIDGE_PHASE3_HOST_DPI";
+const HOST_ENV: &str = "PAD2TOUCH_PHASE3_HOST";
+const DPI_ENV: &str = "PAD2TOUCH_PHASE3_HOST_DPI";
 
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
@@ -91,7 +91,7 @@ fn phase3_target_host_process() {
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
         };
         SetThreadDpiAwarenessContext(context);
-        let class = wide("PadBridgePhase3Host");
+        let class = wide("Pad2TouchPhase3Host");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(host_proc),
             hInstance: GetModuleHandleW(null()),
@@ -104,7 +104,7 @@ fn phase3_target_host_process() {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide(&format!("PadBridge Phase 3 host {nonce}")).as_ptr(),
+            wide(&format!("Pad2Touch Phase 3 host {nonce}")).as_ptr(),
             WS_OVERLAPPEDWINDOW,
             200,
             150,
@@ -261,7 +261,7 @@ unsafe fn client(hwnd: HWND) -> RECT {
 /// An ordinary opaque window. (A STATIC control would answer HTTRANSPARENT
 /// and be skipped by WindowFromPoint, unlike a real covering application.)
 unsafe fn cover(r: RECT) -> HWND {
-    let class = wide("PadBridgePhase3Occluder");
+    let class = wide("Pad2TouchPhase3Occluder");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(DefWindowProcW),
         hInstance: GetModuleHandleW(null()),
@@ -273,7 +273,7 @@ unsafe fn cover(r: RECT) -> HWND {
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         class.as_ptr(),
-        wide("PadBridge occluder").as_ptr(),
+        wide("Pad2Touch occluder").as_ptr(),
         WS_POPUP | WS_VISIBLE,
         r.left,
         r.top,
@@ -432,7 +432,7 @@ fn native_external_window_targets_follow_move_resize_minimize_and_close() {
             Decision::Resume(_)
         ));
 
-        // PadBridge's own windows are not application targets.
+        // Pad2Touch's own windows are not application targets.
         let own = cover(RECT {
             left: 0,
             top: 0,

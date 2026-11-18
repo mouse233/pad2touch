@@ -4,7 +4,7 @@ Version 0.4.0 adds Phase 3 window and rectangle mapping to the native GUI. Appli
 
 ## Launch and devices
 
-Run `target\release\padbridge-phase0.exe --gui`, run the executable without arguments, or use `scripts\Run-PadBridge.ps1 -Mode gui`. The wrapper defaults to GUI mode. The GUI detaches its console; CLI capture, probe, self-test, and offline verification retain their console behavior.
+Run `target\release\Pad2Touch.exe --gui`, run the executable without arguments, or use `scripts\Run-Pad2Touch.ps1 -Mode gui`. The wrapper defaults to GUI mode. The GUI detaches its console; CLI capture, probe, self-test, and offline verification retain their console behavior.
 
 The device list shows Precision Touchpad Raw Input collections with VID/PID. Refresh preserves the selected device path when present. Starting rediscovers and matches that path, so reordered indexes cannot silently change the selected source. Configuration is locked during capture and while shortcut activation is enabled. Stop/disarm first to change it. A disconnected or unsupported device produces a visible error.
 
@@ -20,13 +20,13 @@ The application opens idle. Native injection is selected by default, but capture
 | Toggle with shortcut | Click **Enable shortcut**, then press the selected global chord. | Press again to stop; the chord remains enabled for another session. |
 | Hold Alt to capture | Click **Enable shortcut**, then press and hold Alt. | Release Alt to stop. Press Alt again to start another session. |
 
-Toggle uses Ctrl+Alt+F8, F9, F10, or F11. If Windows rejects the chosen chord, PadBridge shows an error before arming. Hold samples Windows' Alt key state at approximately 30 ms intervals and leaves the key available to Windows and other apps. If Alt is already down when you enable Hold, release it and press again.
+Toggle uses Ctrl+Alt+F8, F9, F10, or F11. If Windows rejects the chosen chord, Pad2Touch shows an error before arming. Hold samples Windows' Alt key state at approximately 30 ms intervals and leaves the key available to Windows and other apps. If Alt is already down when you enable Hold, release it and press again.
 
 **Stop / disarm**, Esc while the GUI has focus, and global Ctrl+Alt+Esc all disarm activation and request cleanup. A fresh enable action is needed afterward. The emergency chord's registration result remains visible; if unavailable, use the button or focused-window Esc.
 
 Stop waits for the worker, then processes receiver messages for at least 300 ms before finalizing logs. Another session waits for that drain. Diagnostics and trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
 
-With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the PadBridge window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
+With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the Pad2Touch window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
 
 ## Diagnostics and system gestures
 
@@ -64,7 +64,7 @@ The **Screen area** group selects where touches go. It is kept short, like a pen
 | Portion of screen… | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None |
 | Application window | Choose a window from the list | Whole client area (title bar and borders excluded) | Target window or its child windows |
 | Application window, part | **Select part…**, drag inside its client area; **Whole window** resets | Normalized client-relative rectangle | Target window or its child windows |
-| Test area (inside PadBridge) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
+| Test area (inside Pad2Touch) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
 
 With a single monitor, the whole desktop and that monitor are the same area, so only one "Screen" entry is listed. The list is rebuilt when the display configuration changes. A selected monitor is matched by its display device name; if it disappears, the choice falls back to the first entry. Choosing another window resets a selected part. Full desktop requires a rectangular arrangement: if monitors of different sizes leave uncovered corners, it is rejected with an explanation (use a monitor or a portion instead).
 
@@ -79,9 +79,9 @@ For every choice except the test area, the right panel shows a mapping diagram b
 
 While idle, the region is re-resolved every 250 ms, so moving a target window updates the diagram. During a session the diagram shows the session's current bounds, including retargets. If the target is not configured or not available, the diagram shows the reason instead of a region. The thumbnail is drawn only in this panel; it is never logged or written to disk.
 
-The desktop thumbnail refreshes once per second while the PadBridge main window is active in the foreground and shows the mapping diagram. It pauses when another window takes focus, when PadBridge is minimized, or while an area is being selected. A worker reads the desktop so the GUI can repaint and respond to input independently.
+The desktop thumbnail refreshes once per second while the Pad2Touch main window is active in the foreground and shows the mapping diagram. It pauses when another window takes focus, when Pad2Touch is minimized, or while an area is being selected. A worker reads the desktop so the GUI can repaint and respond to input independently.
 
-The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. PadBridge's own windows cannot be application targets. Selections are not persisted across launches.
+The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. Pad2Touch's own windows cannot be application targets. Selections are not persisted across launches.
 
 ### Touchpad area
 
@@ -109,7 +109,7 @@ During a session the worker re-resolves window targets every 16 ms:
 
 Because Windows routes injected touch by screen position, every non-cleanup DOWN/UPDATE point is hit-tested first; a point covered by another window cancels the sequence (`INJECT_BLOCKED`) instead of touching the wrong application. The diagnostics line also samples a 3×3 grid every 250 ms and reports `COVERED at n/9 sample points` as an early warning. Starting or enabling a shortcut warns if the target runs at a higher integrity level, because UIPI may reject injected input there.
 
-The Foreground guard only applies while PadBridge itself is foreground, so it is normally inactive while you work in a target application; Background guard is the relevant option there.
+The Foreground guard only applies while Pad2Touch itself is foreground, so it is normally inactive while you work in a target application; Background guard is the relevant option there.
 
 `mapping::MappingTarget` carries the configuration; `ResolvedTarget` adds physical bounds, the hit policy and the physical aspect so the worker can re-resolve. `mapping::Tracker` is the pure state machine behind retarget/pause/resume/stop decisions.
 

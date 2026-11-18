@@ -2,7 +2,7 @@
 
 This document analyzes public Windows interfaces and describes reproducible experiments. It is not a hardware test report and does not claim that an untested suppression method works.
 
-The intended behavior is for PadBridge to keep receiving Precision Touchpad contacts while another application is foreground, convert them into native touch input, and avoid simultaneous Windows touchpad actions while replacement is active. These are separate requirements: receiving input does not establish exclusive ownership of it.
+The intended behavior is for Pad2Touch to keep receiving Precision Touchpad contacts while another application is foreground, convert them into native touch input, and avoid simultaneous Windows touchpad actions while replacement is active. These are separate requirements: receiving input does not establish exclusive ownership of it.
 
 ## Scope and constraints
 
@@ -14,7 +14,7 @@ This review did not find a documented public API that grants a background applic
 
 ### Background receipt is supported by Raw Input
 
-`RIDEV_INPUTSINK`, with a target window, requests input even when the registering application is not foreground. PadBridge uses this registration. It must still be tested on the actual device: a successful registration alone does not demonstrate that every physical contact and release reaches the parser during a focus change. Neither this flag nor the arrival of raw reports promises to prevent Windows from interpreting the same contacts. See [RAWINPUTDEVICE](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-rawinputdevice).
+`RIDEV_INPUTSINK`, with a target window, requests input even when the registering application is not foreground. Pad2Touch uses this registration. It must still be tested on the actual device: a successful registration alone does not demonstrate that every physical contact and release reaches the parser during a focus change. Neither this flag nor the arrival of raw reports promises to prevent Windows from interpreting the same contacts. See [RAWINPUTDEVICE](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-rawinputdevice).
 
 `RIDEV_EXINPUTSINK` is a conditional background fallback: foreground Raw Input handling takes priority. It is not an exclusive-capture flag. `RIDEV_NOLEGACY` is defined for mouse and keyboard devices and concerns legacy messages for the application. `RIDEV_CAPTUREMOUSE` concerns mouse-click activation and requires mouse NOLEGACY registration. These flags do not provide a documented PTP shell-gesture suppression mechanism. See the same [registration contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-rawinputdevice).
 
@@ -39,10 +39,10 @@ The standard configuration collection describes two relevant Feature Reports:
 | Report or field | Documented effect | Implication for this requirement |
 |---|---|---|
 | Input Mode, usage `0x52` | Selects mouse collection reporting or PTP collection reporting. | Selecting mouse mode does not preserve the required PTP multi-contact stream. |
-| Surface Switch, usage `0x57` | Selects whether surface contacts are reported. | Disabling surface reports also removes the contacts PadBridge needs. |
+| Surface Switch, usage `0x57` | Selects whether surface contacts are reported. | Disabling surface reports also removes the contacts Pad2Touch needs. |
 | Button Switch, usage `0x58` | Selects whether button state is reported. | Disabling button reports does not describe disabling Windows gestures recognized from surface contacts. |
 
-These documented controls do not describe a mode that sends raw contacts to an application while withholding the same surface data specifically from the Windows gesture recognizer. No supported Feature parameter for that narrower purpose was found in this review. PadBridge does not probe writable Feature behavior or alter these reports. See [Configuration Collection](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-configuration-collection).
+These documented controls do not describe a mode that sends raw contacts to an application while withholding the same surface data specifically from the Windows gesture recognizer. No supported Feature parameter for that narrower purpose was found in this review. Pad2Touch does not probe writable Feature behavior or alter these reports. See [Configuration Collection](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-configuration-collection).
 
 ## Other candidate approaches
 
@@ -52,11 +52,11 @@ These documented controls do not describe a mode that sends raw contacts to an a
 | `SetGestureConfig` | Configures Windows Touch gesture messages for a specified window. It does not document a global PTP shell-gesture switch. See [SetGestureConfig](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setgestureconfig). |
 | Direct exclusive HID access | Windows opens the PTP top-level collection for system use with exclusive access. Raw Input observation should not be confused with acquiring that device exclusively. See [Top-level collections opened by Windows](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/top-level-collections-opened-by-windows-for-system-use). |
 | Customization filter driver | Microsoft's device-customization guidance discusses controlling delivery to the Windows gesture processor in a filter-driver design. Installing such a component is outside the project's current constraints. See [Experience Customization](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-experience-customization). |
-| Force PadBridge to retain foreground | Does not meet the requirement that other applications remain usable in the foreground. It is not a substitute for background suppression. |
+| Force Pad2Touch to retain foreground | Does not meet the requirement that other applications remain usable in the foreground. It is not a substitute for background suppression. |
 
 ## Experimental route: refresh the Immersive Settings Cache
 
-**Status: undocumented candidate, not a verified suppression or recovery implementation.** It changes user preferences and then asks Explorer to reload selected cached settings. It is conceptually different from exclusive input capture: Windows would remain configured to ignore those gesture actions while PadBridge independently observes raw contacts.
+**Status: undocumented candidate, not a verified suppression or recovery implementation.** It changes user preferences and then asks Explorer to reload selected cached settings. It is conceptually different from exclusive input capture: Windows would remain configured to ignore those gesture actions while Pad2Touch independently observes raw contacts.
 
 The answer by **co_init_ex** on [Disable Gestures through registry](https://stackoverflow.com/questions/73331905/disable-gestures-through-registry) describes this COM path for Windows 11 25H2:
 
@@ -85,7 +85,7 @@ These are community observations, not a Microsoft compatibility promise. The dis
 
 ### Proposed narrow experiment and restoration contract
 
-The following is PadBridge's proposed experiment design, rather than an observed result or a copy of the referenced implementations:
+The following is Pad2Touch's proposed experiment design, rather than an observed result or a copy of the referenced implementations:
 
 1. Start with a read-only probe: record the OS build, activate the service, and inspect only the four relevant current-user values and corresponding cache entries. Do not notify or change settings at this stage. An unexpected type, failed cache read, or mismatch between an existing registry value and the cache prevents mutation. A missing value must be represented as absent with its original cached default preserved; it must not silently be treated as an enabled DWORD. An unverified build needs an explicit, isolated experiment rather than automatic activation.
 2. Before any opt-in write, preserve each value's exact existence, registry type, byte length, and bytes in a local recovery journal. Limit access to the four names under `HKCU\Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad`. Do not export the entire user hive or collect custom keyboard bindings. See [RegQueryValueExW](https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regqueryvalueexw).
@@ -97,20 +97,20 @@ Before production use, the design also needs rollback for partial writes, a dura
 
 This route should be an explicit experimental option. It is not scoped by foreground ownership, but the resulting preference changes are user-wide and can persist after termination until restored. It does not suppress native mouse motion or every other touchpad action, and does not address injected touchscreen gesture processing. A successful raw-only experiment would still require separate native-injection and failure-recovery tests.
 
-The independent [prototype tools](../experiments/README.md) provide read-only inspection and an explicit build-bound, limited-duration transaction with a recovery journal and separate watchdog. Their presence is not a compatibility or hardware acceptance claim. They are not enabled by normal PadBridge capture.
+The independent [prototype tools](../experiments/README.md) provide read-only inspection and an explicit build-bound, limited-duration transaction with a recovery journal and separate watchdog. Their presence is not a compatibility or hardware acceptance claim. They are not enabled by normal Pad2Touch capture.
 
 ### Reference and license boundary
 
-The sources above supply technical observations, not a permissive implementation to import. Stack Overflow's [licensing policy](https://stackoverflow.com/help/licensing) assigns CC BY-SA 4.0 to contributions from May 2, 2018 onward, including this answer. The related [NVDA pull request](https://github.com/nvaccess/nvda/pull/19823) is an unmerged experimental reference; its touchpad module declares GPL coverage, and the repository's [authoritative license](https://github.com/nvaccess/nvda/blob/master/copying.txt) is GPL version 2 or later with stated exceptions. No third-party implementation or external script is included or executed here. An independent PadBridge prototype should use the minimal required interface facts and its own implementation, with source attribution retained.
+The sources above supply technical observations, not a permissive implementation to import. Stack Overflow's [licensing policy](https://stackoverflow.com/help/licensing) assigns CC BY-SA 4.0 to contributions from May 2, 2018 onward, including this answer. The related [NVDA pull request](https://github.com/nvaccess/nvda/pull/19823) is an unmerged experimental reference; its touchpad module declares GPL coverage, and the repository's [authoritative license](https://github.com/nvaccess/nvda/blob/master/copying.txt) is GPL version 2 or later with stated exceptions. No third-party implementation or external script is included or executed here. An independent Pad2Touch prototype should use the minimal required interface facts and its own implementation, with source attribution retained.
 
 ## Optional manual comparison experiment
 
 This procedure is a manual control experiment for operating-system preferences. It is not a requirement to abandon the experimental programmatic route above, and it is not an implemented automatic capture mode. It uses the Windows settings interface rather than assuming registry writes alone are sufficient.
 
 1. Record the current three- and four-finger swipe and tap assignments so the exact original selections can be restored. Preserve custom directional assignments if present. Keep this record local.
-2. Start a new raw-only PadBridge capture, without touch injection and without the optional foreground gesture controller. Focus another ordinary application and keep it foreground while performing single-finger movement, multiple-contact movement, three-/four-finger swipes and taps, partial lifts, and all-fingers-up. Record the baseline shell behavior and receipt of the physical contacts separately.
+2. Start a new raw-only Pad2Touch capture, without touch injection and without the optional foreground gesture controller. Focus another ordinary application and keep it foreground while performing single-finger movement, multiple-contact movement, three-/four-finger swipes and taps, partial lifts, and all-fingers-up. Record the baseline shell behavior and receipt of the physical contacts separately.
 3. In **Settings > Bluetooth & devices > Touchpad**, set both **Swipes** and **Taps** to **Nothing** for both three- and four-finger gestures. Inspect advanced/custom assignments where the Windows version exposes them. This is the Touchpad page; the separate Touch setting governs touchscreen gestures.
-4. Start a fresh raw-only capture. Again keep another application foreground and repeat the same physical actions. Confirm both that the unwanted shell actions do not occur and that PadBridge receives complete contacts, coordinates, and release transitions in the background.
+4. Start a fresh raw-only capture. Again keep another application foreground and repeat the same physical actions. Confirm both that the unwanted shell actions do not occur and that Pad2Touch receives complete contacts, coordinates, and release transitions in the background.
 5. Restore every original assignment through Settings, including custom assignments. Repeat a short baseline check to confirm ordinary Windows gestures work again.
 
 Windows provides user-facing gesture preferences; an official example describes selecting Nothing for a multi-finger tap action. Exact settings labels and available choices vary, so inspect the actual interface rather than relying on coordinate automation. See [Microsoft's touchpad settings example](https://support.microsoft.com/en-us/windows/experience/prevent-windows-search-from-randomly-launching).

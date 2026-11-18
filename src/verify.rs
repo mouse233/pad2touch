@@ -101,7 +101,7 @@ pub fn analyze(text: &str) -> Result<Audit, String> {
         .any(|l| l.contains(" RUN ") && l.contains("format=2"))
     {
         return Err(
-            "format-2 PadBridge log required; legacy Phase 0 logs need the historical analyzer"
+            "format-2 Pad2Touch log required; legacy Phase 0 logs need the historical analyzer"
                 .into(),
         );
     }

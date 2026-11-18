@@ -17,8 +17,8 @@ use windows_sys::Win32::{
 };
 
 pub const WM_SELECTION_DONE: u32 = WM_APP + 1;
-const SELECT_CLASS: &str = "PadBridgeSelectionOverlay";
-const OUTLINE_CLASS: &str = "PadBridgeTargetOutline";
+const SELECT_CLASS: &str = "Pad2TouchSelectionOverlay";
+const OUTLINE_CLASS: &str = "Pad2TouchTargetOutline";
 const OUTLINE_TIMER: usize = 1;
 const OUTLINE_WIDTH: i32 = 4;
 
@@ -71,7 +71,7 @@ pub fn begin(owner: HWND, bounds: RECT, prompt: &str) -> Result<HWND, String> {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             wide(SELECT_CLASS).as_ptr(),
-            wide("PadBridge area selection").as_ptr(),
+            wide("Pad2Touch area selection").as_ptr(),
             WS_POPUP,
             bounds.left,
             bounds.top,
@@ -276,7 +276,7 @@ pub fn flash(bounds: RECT, millis: u32) -> Result<(), String> {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
             wide(OUTLINE_CLASS).as_ptr(),
-            wide("PadBridge target outline").as_ptr(),
+            wide("Pad2Touch target outline").as_ptr(),
             WS_POPUP,
             outer.left,
             outer.top,

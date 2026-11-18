@@ -32,7 +32,7 @@ impl Backend {
         ];
         #[cfg(test)]
         command.env(
-            "PADBRIDGE_TEST_GESTURE_ARGS",
+            "PAD2TOUCH_TEST_GESTURE_ARGS",
             serde_json::to_string(&args).map_err(|e| e.to_string())?,
         );
         #[cfg(not(test))]
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     #[test]
     fn partial_restoration_cannot_allow_another_session() {
-        let dir = std::env::temp_dir().join(format!("padbridge-guard-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pad2touch-guard-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         for value in [
             "{}",

@@ -1,6 +1,6 @@
 # Third-party notices
 
-PadBridge's original code and accompanying documentation use the MIT License in the repository root. That license does not replace the licenses of third-party components.
+Pad2Touch's original code and accompanying documentation use the MIT License in the repository root. That license does not replace the licenses of third-party components.
 
 ## Rust dependencies
 
@@ -15,8 +15,8 @@ Copyright remains with the respective upstream rights holders. Crates obtained t
 
 ## Technical references
 
-Tapview was consulted only as a reference for the Windows Raw Input and HID API approach. Its source code was not copied, modified, or redistributed. PadBridge's MIT License does not grant rights to Tapview.
+Tapview was consulted only as a reference for the Windows Raw Input and HID API approach. Its source code was not copied, modified, or redistributed. Pad2Touch's MIT License does not grant rights to Tapview.
 
 Microsoft documentation and official samples are technical references. See [architecture](architecture.md) for the relevant links.
 
-The isolated settings-cache experiment uses interface facts reported by [co_init_ex on Stack Overflow](https://stackoverflow.com/questions/73331905/disable-gestures-through-registry) and discussed by [gexgd0419 in the NVDA project](https://github.com/nvaccess/nvda/discussions/19841). PadBridge's experiment is independently written; no Stack Overflow code block, NVDA source module, or external script is embedded. These sources do not grant a Microsoft compatibility guarantee for the undocumented interface. See the [research and license boundary](background-gesture-feasibility.md#reference-and-license-boundary).
+The isolated settings-cache experiment uses interface facts reported by [co_init_ex on Stack Overflow](https://stackoverflow.com/questions/73331905/disable-gestures-through-registry) and discussed by [gexgd0419 in the NVDA project](https://github.com/nvaccess/nvda/discussions/19841). Pad2Touch's experiment is independently written; no Stack Overflow code block, NVDA source module, or external script is embedded. These sources do not grant a Microsoft compatibility guarantee for the undocumented interface. See the [research and license boundary](background-gesture-feasibility.md#reference-and-license-boundary).
