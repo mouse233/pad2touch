@@ -503,7 +503,11 @@ fn native_background_guard_preserves_injected_multitouch() {
         shared,
         log.clone(),
         Arc::new(AtomicBool::new(false)),
-        true,
+        crate::gesture_backend::Scope {
+            touchpad: true,
+            touchscreen: true,
+        },
+        None,
     )
     .unwrap()
     .unwrap();
@@ -524,7 +528,6 @@ fn native_background_guard_preserves_injected_multitouch() {
             log.clone(),
         )
         .unwrap();
-        injector.frame(&[]).unwrap();
         for fingers in [3, 4, 5] {
             // Swipe down far enough to exercise shell recognition while keeping
             // every point safely inside the dedicated host's client rectangle.

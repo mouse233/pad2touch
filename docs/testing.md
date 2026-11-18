@@ -31,7 +31,7 @@ An opt-in native integration check creates real controls and Raw Input workers. 
 cargo test --locked native_gui_sessions_restart_and_hotkey_messages_stop_cleanly -- --ignored --test-threads=1 --nocapture
 ```
 
-It checks repeated manual sessions and finalized logs, configuration locking, rejected occupied shortcuts, Toggle message dispatch, a released Hold notification, emergency disarming, and closing an active session after drain. It sends test window messages for shortcut transitions; it does not prove real physical key delivery. Restricted execution environments can reject `RegisterHotKey` with error 5 even if the ordinary desktop supports it.
+It checks repeated manual sessions and finalized logs, configuration locking, rejected occupied shortcuts, Toggle message dispatch, stale Toggle notifications in Alt Hold mode, emergency disarming, and closing an active session after drain. Restricted execution environments can reject `RegisterHotKey` with error 5 even if the ordinary desktop supports it.
 
 Two additional opt-in checks temporarily change the four gesture preferences and verify restoration on the validated desktop. Run serially, separately from other gesture transactions:
 
@@ -40,7 +40,7 @@ cargo test --locked native_background_guard_applies_and_restores_without_injecti
 cargo test --locked native_gui_background_guard_session_restores -- --ignored --test-threads=1 --nocapture
 ```
 
-The first checks the embedded transaction adapter; the second exercises GUI start, the real Raw Input worker, stop, and verified settings restoration together. Neither initializes touch injection. They do not replace physical gesture observation, 120-second timeout acceptance, or process-kill recovery tests. The native GUI lifecycle check also exports a local client-area preview using the application's print handlers; inspect it alongside actual desktop behavior, not as proof of live flicker-free rendering.
+The first checks the native settings transaction. The second exercises GUI start, the real Raw Input worker, stop, and verified settings restoration together. Run `cargo test --locked native_background_guard_unlimited_and_independent_scopes -- --ignored --test-threads=1 --nocapture` separately to check touchpad-only, touchscreen-only, and combined overrides using the same prewarmed worker, including 125 seconds of continuous combined operation. Run `native_background_guard_watchdog_restores_touchscreen` separately to verify recovery after worker termination. For physical verification, enable Hold and press Alt to start capture, then release it to stop. Check that enabling while Alt is already pressed waits for a fresh press.
 
 For actual UI acceptance, launch the GUI and verify device refresh/selection, keyboard Tab navigation, the fixed window size, and DPI transitions. Clear native injection first, test manual / Toggle / Hold using real keys, and confirm each stop retains diagnostics and allows a subsequent session. Check Ctrl+Alt+Esc from another foreground application, focused-window Esc, and close while active. Select each Screen area choice and confirm Start stays unavailable, with an explanation, until a window or area is chosen. Then test native injection separately: single- and multi-contact trails, scaling, active-contact stop/close, and gesture-controller scope. Idle raw-only lifecycle checks do not establish physical touch release or visual quality.
 
@@ -72,7 +72,7 @@ Manual Phase 3 acceptance still needs a physical touchpad and real applications:
 1. Use an ordinary interactive Windows desktop and build the Release executable.
 2. Run `scripts\Run-PadBridge.ps1 -Mode probe` and select a collection with `-Device N` if needed.
 3. Keep the dedicated receiver visible and stationary. Native touchpad mouse behavior and system gestures remain enabled.
-4. Touch the pad and lift all fingers once to provide a clear frame. Wait for `ARMED` before beginning a new sequence.
+4. Begin a sequence directly: the first valid touch must inject without a preliminary touch-and-lift. After a cancellation or mapping change, lift all fingers once before resuming.
 5. Use a new output directory for every run. The wrapper creates timestamped directories automatically.
 
 Some hardware reserves special regions for vendor controls. Record such coverage exceptions separately from confirmed mapping defects. A device-specific exception does not establish compatibility for another touchpad.

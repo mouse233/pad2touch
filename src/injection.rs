@@ -153,9 +153,8 @@ impl Injector {
             batch: 0,
             blocked: 0,
         };
-        let mut engine = Engine::new(capacity, rectangle(rect), transport)?;
-        // Nothing is active yet, so this only sets the used touchpad region.
-        engine.retarget(rectangle(rect), input)?;
+        // Configure the initial mapping without cancellation's re-arming gate.
+        let engine = Engine::new(capacity, rectangle(rect), input, transport)?;
         // DEFAULT draws the standard touch visuals for injected contacts and
         // honors the user's "Touch indicator" setting; NONE draws nothing.
         let mode = if feedback {

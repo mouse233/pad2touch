@@ -515,6 +515,7 @@ pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
         crate::mapping::PadFit::KeepShape => "whole pad, keep shape",
         crate::mapping::PadFit::Stretch => "whole pad, stretched",
         crate::mapping::PadFit::FillArea => "part of pad, fill area",
+        crate::mapping::PadFit::Portion(_) => "selected portion of pad",
     };
     let place: String = match target.spec {
         crate::mapping::MappingTarget::Diagnostics => "diagnostic receiver".into(),
@@ -550,11 +551,11 @@ pub(crate) struct Session {
 /// User choices for a GUI session, fixed for its lifetime.
 pub struct SessionSettings {
     pub inject: bool,
-    pub capacity: usize,
-    pub suppress_gestures: bool,
-    pub background_guard: bool,
+    pub suppress_touchpad: bool,
+    pub suppress_touchscreen: bool,
     /// Draw Windows touch visuals for injected contacts.
     pub touch_feedback: bool,
+    pub prewarmed: Option<crate::background_guard::Backend>,
 }
 impl Session {
     pub fn start(
@@ -565,14 +566,13 @@ impl Session {
     ) -> Result<Self, String> {
         let SessionSettings {
             inject,
-            capacity,
-            suppress_gestures,
-            background_guard,
+            suppress_touchpad,
+            suppress_touchscreen,
             touch_feedback,
+            prewarmed,
         } = settings;
-        if !(1..=5).contains(&capacity) {
-            return Err("invalid GUI contact capacity".into());
-        }
+        let capacity = 5;
+        let background_guard = suppress_touchpad || suppress_touchscreen;
         // Resolve parser support before starting either thread.
         device.fields()?;
         if inject && target.fit.needs_shape() {
@@ -601,7 +601,7 @@ impl Session {
             ..Default::default()
         }));
         let (log, writer) = Log::open(&out)?;
-        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} gesture_guard_requested={suppress_gestures} touch_feedback={touch_feedback} frontend=GUI"));
+        log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} suppress_touchpad={suppress_touchpad} suppress_touchscreen={suppress_touchscreen} touch_feedback={touch_feedback} frontend=GUI"));
         log.event(format!("DEVICE {}", device.summary()));
         let r = target.bounds;
         log.event(format!(
@@ -635,7 +635,11 @@ impl Session {
                     worker_shared.clone(),
                     worker_log.clone(),
                     worker_stop.clone(),
-                    inject,
+                    crate::gesture_backend::Scope {
+                        touchpad: suppress_touchpad,
+                        touchscreen: suppress_touchscreen,
+                    },
+                    prewarmed,
                 )
             } else {
                 Ok(None)
@@ -646,13 +650,7 @@ impl Session {
                 } else {
                     worker_loop(
                         Some(device),
-                        (
-                            "capture".into(),
-                            inject,
-                            capacity,
-                            suppress_gestures,
-                            touch_feedback,
-                        ),
+                        ("capture".into(), inject, capacity, false, touch_feedback),
                         target,
                         worker_shared.clone(),
                         worker_log.clone(),
@@ -1005,6 +1003,8 @@ fn gesture_guard_label(s: &Stats) -> &str {
         if s.guard_status.contains("ACTIVE") {
             if s.guard_status.contains("touchpad + touchscreen") {
                 "ACTIVE (pad + screen)"
+            } else if s.guard_status.ends_with(": touchscreen") {
+                "ACTIVE (screen)"
             } else {
                 "ACTIVE (background)"
             }
@@ -1780,14 +1780,12 @@ mod tests {
                 "Preparing background guard and recovery watchdog...",
                 "PREPARING (background)",
             ),
+            ("Background guard ACTIVE: touchpad", "ACTIVE (background)"),
             (
-                "Background guard ACTIVE (120 s maximum)",
-                "ACTIVE (background)",
-            ),
-            (
-                "Background guard ACTIVE: touchpad + touchscreen (120 s maximum)",
+                "Background guard ACTIVE: touchpad + touchscreen",
                 "ACTIVE (pad + screen)",
             ),
+            ("Background guard ACTIVE: touchscreen", "ACTIVE (screen)"),
             (
                 "Stopping capture before restoring Windows gestures...",
                 "STOPPING (background)",
