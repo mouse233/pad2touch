@@ -35,28 +35,40 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
-    name: Test and Release build
-    runs-on: windows-latest
+    name: Test and Release build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install stable-${{ matrix.target }} --profile minimal
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       # Default tests need no touchpad, desktop session or touch injection.
       # Tests marked #[ignore] (native GUI / injection) are intentionally not run.
       - name: Test
-        run: cargo test --locked
+        run: rustup run stable-${{ matrix.target }} cargo test --locked --target ${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --release --locked
+        run: rustup run stable-${{ matrix.target }} cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Upload build for inspection
         uses: actions/upload-artifact@v4
         with:
-          name: pad2touch-windows-x64-${{ github.sha }}
-          path: target/release/Pad2Touch.exe
+          name: pad2touch-windows-${{ matrix.arch }}-${{ github.sha }}
+          path: target/${{ matrix.target }}/release/Pad2Touch.exe
           if-no-files-found: error
           retention-days: 7

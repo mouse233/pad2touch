@@ -114,11 +114,13 @@ impl Guard {
         if stop.load(Ordering::Relaxed) || !scope.any() {
             return Ok(None);
         }
-        let directory = std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(out)
-            .join("gesture-backend/artifacts/session");
-        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let session = out.file_name().ok_or("Missing capture session name")?;
+        let root = gesture_backend::recovery_root()?;
+        let directory = root.join(session);
+        fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+        fs::create_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+        let directory =
+            fs::canonicalize(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
         let (backend, warm) = match prewarmed.filter(Backend::running) {
             Some(backend) => (backend, true),
             None => (Backend::spawn(false)?, false),
@@ -321,8 +323,8 @@ mod tests {
             .contains("touchpad + touchscreen"));
         // Include a periodic live-state verification before normal restoration.
         thread::sleep(Duration::from_millis(1500));
+        let directory = guard.directory.clone();
         guard.release().unwrap();
-        let directory = out.join("gesture-backend/artifacts/session");
         assert!(directory.join("touchscreen-required.json").exists());
         assert!(restored(&directory));
         assert!(!shared.lock().unwrap().recovery_pending);
@@ -416,8 +418,8 @@ mod tests {
         // Terminate only the transaction process we just created. The separate
         // watchdog must restore both settings paths without that process.
         guard.backend.kill_for_test();
+        let directory = guard.directory.clone();
         guard.release().unwrap();
-        let directory = out.join("gesture-backend/artifacts/session");
         assert!(directory.join("touchscreen-mutation-started.json").exists());
         assert!(restored(&directory));
         assert!(!shared.lock().unwrap().recovery_pending);

@@ -6,7 +6,8 @@ param(
     [ValidateRange(1,5)][int]$Contacts=5,
     [ValidateRange(1,86400)][int]$Seconds=120,
     [ValidateRange(0,65535)][int]$Device=0,
-    [switch]$Strict
+    [switch]$Strict,
+    [switch]$Diagnostics
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
@@ -14,9 +15,12 @@ $exePath=Join-Path $repoPath 'target\release\Pad2Touch.exe'
 if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
 Push-Location -LiteralPath $repoPath
 try {
+    if($Diagnostics -and $Mode -ne 'gui'){throw '-Diagnostics is only used with -Mode gui'}
     if($Mode -eq 'gui'){
         if($Inject -or $SuppressSystemGestures -or $Background){throw 'Use the GUI controls for injection and foreground gesture ownership; -Background is a CLI capture diagnostic'}
-        & $exePath --gui
+        $guiArgs=@('--gui')
+        if($Diagnostics){$guiArgs+='--diagnostics'}
+        & $exePath @guiArgs
         if($LASTEXITCODE -ne 0){throw 'Pad2Touch GUI failed'}
         return
     }

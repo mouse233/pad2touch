@@ -278,20 +278,15 @@ impl HitPolicy {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+pub const TEST_AREA_INSET: i32 = 16;
+pub const DIAGNOSTICS_HEADER_HEIGHT: i32 = 190;
+
+#[derive(Clone, Copy)]
 pub enum MappingTarget {
-    #[default]
-    Diagnostics,
-    ScreenRectangle {
-        bounds: RECT,
-    },
-    Window {
-        handle: usize,
-    },
-    WindowRectangle {
-        handle: usize,
-        area: NormRect,
-    },
+    TestArea { diagnostics: bool },
+    ScreenRectangle { bounds: RECT },
+    Window { handle: usize },
+    WindowRectangle { handle: usize, area: NormRect },
 }
 
 #[derive(Clone, Copy)]
@@ -333,7 +328,7 @@ impl PartialEq for MappingTarget {
     fn eq(&self, other: &Self) -> bool {
         use MappingTarget::*;
         match (*self, *other) {
-            (Diagnostics, Diagnostics) => true,
+            (TestArea { diagnostics: a }, TestArea { diagnostics: b }) => a == b,
             (ScreenRectangle { bounds: a }, ScreenRectangle { bounds: b }) => tuple(a) == tuple(b),
             (Window { handle: a }, Window { handle: b }) => a == b,
             (WindowRectangle { handle: a, area: x }, WindowRectangle { handle: b, area: y }) => {
@@ -346,7 +341,10 @@ impl PartialEq for MappingTarget {
 impl std::fmt::Debug for MappingTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::Diagnostics => write!(f, "Diagnostics"),
+            Self::TestArea { diagnostics } => f
+                .debug_struct("TestArea")
+                .field("diagnostics", &diagnostics)
+                .finish(),
             Self::ScreenRectangle { bounds } => write!(f, "ScreenRectangle{:?}", tuple(bounds)),
             Self::Window { handle } => write!(f, "Window(0x{handle:X})"),
             Self::WindowRectangle { handle, area } => {
@@ -449,14 +447,14 @@ pub fn describe(r: RECT) -> String {
 impl MappingTarget {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Diagnostics => "diagnostic",
+            Self::TestArea { .. } => "diagnostic",
             Self::ScreenRectangle { .. } => "screen-rectangle",
             Self::Window { .. } => "window",
             Self::WindowRectangle { .. } => "window-rectangle",
         }
     }
     pub fn is_diagnostic(&self) -> bool {
-        matches!(self, Self::Diagnostics)
+        matches!(self, Self::TestArea { .. })
     }
     pub fn window_handle(&self) -> Option<usize> {
         match *self {
@@ -476,6 +474,12 @@ impl MappingTarget {
         fit: PadFit,
     ) -> Result<ResolvedTarget, String> {
         let mut target = self.resolve(window)?;
+        // The built-in test area can fit itself to the pad. External targets
+        // have fixed bounds, so Force proportions crops the pad for those.
+        let fit = match (self, fit) {
+            (Self::TestArea { .. }, PadFit::FillArea) => PadFit::KeepShape,
+            _ => fit,
+        };
         let (bounds, input) = fit_pad(target.bounds, aspect, fit)?;
         target.bounds = bounds;
         target.input = input;
@@ -485,7 +489,7 @@ impl MappingTarget {
     }
     pub fn resolve(self, diagnostic_window: HWND) -> Result<ResolvedTarget, String> {
         match self {
-            Self::Diagnostics => unsafe {
+            Self::TestArea { diagnostics } => unsafe {
                 let dpi = GetDpiForWindow(diagnostic_window).max(96) as i32;
                 let px = |n: i32| n * dpi / 96;
                 let mut client = RECT::default();
@@ -505,9 +509,14 @@ impl MappingTarget {
                     spec: self,
                     window: diagnostic_window as usize,
                     bounds: RECT {
-                        left: origin.x + px(16),
-                        top: origin.y + px(190),
-                        right: origin.x + client.right - px(16),
+                        left: origin.x + px(TEST_AREA_INSET),
+                        top: origin.y
+                            + px(if diagnostics {
+                                DIAGNOSTICS_HEADER_HEIGHT
+                            } else {
+                                TEST_AREA_INSET
+                            }),
+                        right: origin.x + client.right - px(TEST_AREA_INSET),
                         bottom: origin.y + client.bottom - px(20),
                     },
                     hit: HitPolicy::Exact(diagnostic_window as usize),
@@ -563,7 +572,7 @@ impl MappingTarget {
             Self::Window { handle } => (handle, NormRect::FULL),
             Self::WindowRectangle { handle, area } => (handle, area),
             Self::ScreenRectangle { bounds } => return Observation::Ready(bounds),
-            Self::Diagnostics => return Observation::Gone("not a dynamic target".into()),
+            Self::TestArea { .. } => return Observation::Gone("not a dynamic target".into()),
         };
         let client = match unsafe { client_screen_rect(handle) } {
             Ok(client) => client,

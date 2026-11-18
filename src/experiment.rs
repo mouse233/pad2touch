@@ -370,7 +370,7 @@ pub fn run(opt: Options) -> Result<(), String> {
         let worker_log = log.clone();
         let worker_stop = stop.clone();
         let target = crate::mapping::ResolvedTarget {
-            spec: crate::mapping::MappingTarget::Diagnostics,
+            spec: crate::mapping::MappingTarget::TestArea { diagnostics: true },
             window: hwnd as usize,
             bounds: rect,
             hit: crate::mapping::HitPolicy::Exact(hwnd as usize),
@@ -518,7 +518,7 @@ pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
         crate::mapping::PadFit::Portion(_) => "selected portion of pad",
     };
     let place: String = match target.spec {
-        crate::mapping::MappingTarget::Diagnostics => "diagnostic receiver".into(),
+        crate::mapping::MappingTarget::TestArea { .. } => "diagnostic receiver".into(),
         crate::mapping::MappingTarget::ScreenRectangle { .. } => "screen rectangle".into(),
         crate::mapping::MappingTarget::Window { handle } => {
             format!("window 0x{handle:X} client area")
@@ -539,11 +539,11 @@ pub(crate) fn target_label(target: &crate::mapping::ResolvedTarget) -> String {
 pub(crate) struct Session {
     pub shared: Shared,
     pub log: Log,
-    pub out: PathBuf,
+    out: PathBuf,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     worker: std::thread::JoinHandle<Result<(), String>>,
-    writer: std::thread::JoinHandle<Result<(), String>>,
+    writer: Option<std::thread::JoinHandle<Result<(), String>>>,
     drain_started: Option<Instant>,
     started: Instant,
     explicit_stop: AtomicBool,
@@ -555,6 +555,7 @@ pub struct SessionSettings {
     pub suppress_touchscreen: bool,
     /// Draw Windows touch visuals for injected contacts.
     pub touch_feedback: bool,
+    pub diagnostics: bool,
     pub prewarmed: Option<crate::background_guard::Backend>,
 }
 impl Session {
@@ -569,6 +570,7 @@ impl Session {
             suppress_touchpad,
             suppress_touchscreen,
             touch_feedback,
+            diagnostics,
             prewarmed,
         } = settings;
         let capacity = 5;
@@ -600,7 +602,12 @@ impl Session {
             pinch_ratio: 1.0,
             ..Default::default()
         }));
-        let (log, writer) = Log::open(&out)?;
+        let (log, writer) = if diagnostics {
+            let (log, writer) = Log::open(&out)?;
+            (log, Some(writer))
+        } else {
+            (Log::disabled(), None)
+        };
         log.event(format!("RUN format=2 mode=capture inject={inject} seconds=0 source=PHYSICAL_RAW_INPUT capacity={capacity} suppress_touchpad={suppress_touchpad} suppress_touchscreen={suppress_touchscreen} touch_feedback={touch_feedback} frontend=GUI"));
         log.event(format!("DEVICE {}", device.summary()));
         let r = target.bounds;
@@ -720,19 +727,24 @@ impl Session {
             .and_then(|r| r);
         let s = self.shared.lock().unwrap();
         let dropped = self.log.dropped.load(Ordering::Relaxed);
-        let result = result.and(
-            if dropped > 0
-                || s.cleanup_pending
+        let result = result.and_then(|()| {
+            if !s.error.is_empty() {
+                Err(s.error.clone())
+            } else if s.cleanup_pending
                 || s.recovery_pending
                 || s.injected_active > 0
                 || !s.received_active.is_empty()
-                || !s.error.is_empty()
             {
-                Err("Session ended with errors or unresolved contacts. Review diagnostics and logs.".into())
+                Err("Session ended with unresolved contacts or pending settings recovery.".into())
+            } else if dropped > 0 {
+                Err("Some diagnostic events were dropped.".into())
             } else {
                 Ok(())
-            },
-        );
+            }
+        });
+        let Some(writer) = self.writer else {
+            return result;
+        };
         let report = format!(
             "{}{}actual_duration_ms={}\nrun_status={}\nstop_reason={}\nbackground_guard_status={}\nsettings_recovery_pending={}\n",
             summary(&s, dropped, 0),
@@ -753,8 +765,7 @@ impl Session {
             std::fs::write(self.out.join("summary.txt"), report).map_err(|e| e.to_string());
         drop(s);
         drop(self.log);
-        let flushed = self
-            .writer
+        let flushed = writer
             .join()
             .map_err(|_| "log writer panicked".to_string())
             .and_then(|r| r);
@@ -989,7 +1000,9 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
         let buffer = ui.back_buffer.as_ref().unwrap();
-        paint_diagnostics(hwnd, buffer.dc, &rc, &ui.shared, ui.rect, 96, true);
+        FillRect(buffer.dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+        paint_diagnostics(hwnd, buffer.dc, &rc, &ui.shared, ui.rect, 96);
+        paint_touch_canvas(hwnd, buffer.dc, &ui.shared, ui.rect, true);
         if let Err(error) = buffer.present(screen) {
             ui.log.event(format!("RENDER_ERROR {error}"));
         }
@@ -1047,21 +1060,9 @@ pub(crate) unsafe fn paint_diagnostics(
     shared: &Shared,
     rect: RECT,
     dpi: u32,
-    canvas: bool,
 ) {
     let px = |n: i32| n * dpi as i32 / 96;
-    FillRect(dc, rc, (COLOR_BTNFACE + 1) as HBRUSH);
-    let (text, points, active, active_colors, pinch_ratio) = {
-        let s = shared.lock().unwrap();
-        let text = diagnostic_text(&s);
-        (
-            text,
-            s.points.clone(),
-            s.received_active.clone(),
-            s.received_colors.clone(),
-            s.pinch_ratio,
-        )
-    };
+    let text = diagnostic_text(&shared.lock().unwrap());
     // Release the statistics lock before GDI painting.
     let face = wide("Segoe UI");
     let font = CreateFontW(
@@ -1107,6 +1108,31 @@ pub(crate) unsafe fn paint_diagnostics(
         &mut tr,
         DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
     );
+    if !font.is_null() {
+        SelectObject(dc, old_font);
+        DeleteObject(font);
+    }
+}
+
+pub(crate) unsafe fn paint_touch_canvas(
+    hwnd: HWND,
+    dc: HDC,
+    shared: &Shared,
+    rect: RECT,
+    show_pointer_ids: bool,
+) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let (points, active, active_colors, pinch_ratio) = {
+        let s = shared.lock().unwrap();
+        (
+            s.points.clone(),
+            s.received_active.clone(),
+            s.received_colors.clone(),
+            s.pinch_ratio,
+        )
+    };
     let mut org = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut org);
     let boxrect = RECT {
@@ -1115,23 +1141,15 @@ pub(crate) unsafe fn paint_diagnostics(
         right: rect.right - org.x,
         bottom: rect.bottom - org.y,
     };
-    // Without a canvas, `rect` only limits the text (e.g. above a diagram).
-    let boxrect = if canvas { boxrect } else { RECT::default() };
-    if boxrect.right > boxrect.left && boxrect.bottom > boxrect.top {
-        FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
-    }
+    FrameRect(dc, &boxrect, GetStockObject(GRAY_BRUSH) as HBRUSH);
     let saved = SaveDC(dc);
-    if boxrect.right > boxrect.left && boxrect.bottom > boxrect.top {
-        IntersectClipRect(
-            dc,
-            boxrect.left + 1,
-            boxrect.top + 1,
-            boxrect.right - 1,
-            boxrect.bottom - 1,
-        );
-    } else {
-        IntersectClipRect(dc, 0, 0, 0, 0);
-    }
+    IntersectClipRect(
+        dc,
+        boxrect.left + 1,
+        boxrect.top + 1,
+        boxrect.right - 1,
+        boxrect.bottom - 1,
+    );
     let colors = [0x00709010, 0x002070D0, 0x00C06050, 0x009040A0, 0x0020A0A0];
     let pens: Vec<_> = colors
         .iter()
@@ -1156,8 +1174,10 @@ pub(crate) unsafe fn paint_diagnostics(
             pens[active_colors.get(&id).copied().unwrap_or(0) % pens.len()],
         );
         Ellipse(dc, x - 10, y - 10, x + 10, y + 10);
-        let label = wide(&format!("{id}"));
-        TextOutW(dc, x + 12, y - 12, label.as_ptr(), (label.len() - 1) as i32);
+        if show_pointer_ids {
+            let label = wide(&format!("{id}"));
+            TextOutW(dc, x + 12, y - 12, label.as_ptr(), (label.len() - 1) as i32);
+        }
     }
     if active.len() == 2 {
         let cx = (boxrect.left + boxrect.right) / 2;
@@ -1173,10 +1193,6 @@ pub(crate) unsafe fn paint_diagnostics(
         DeleteObject(pen);
     }
     RestoreDC(dc, saved);
-    if !font.is_null() {
-        SelectObject(dc, old_font);
-        DeleteObject(font);
-    }
 }
 
 struct Worker {

@@ -1,4 +1,4 @@
-//! Native Win32 shell; the diagnostic receiver is a child of the main window.
+//! Native Win32 shell with a touch preview and an embedded test area.
 use crate::{
     control::{Controller, TakeoverMode},
     diagram,
@@ -21,7 +21,16 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::LibraryLoader::GetModuleHandleW,
-    UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{
+        Controls::{
+            InitCommonControlsEx, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, TOOLTIPS_CLASSW,
+            TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW,
+            TTS_NOPREFIX, TTTOOLINFOW,
+        },
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        WindowsAndMessaging::*,
+    },
 };
 
 const DEVICE: usize = 101;
@@ -36,7 +45,7 @@ const START: usize = 109;
 const STOP: usize = 110;
 const HOTKEY: i32 = 1;
 const EMERGENCY: i32 = 2;
-const DIAGNOSTICS_GROUP: usize = 111;
+const PREVIEW_GROUP: usize = 111;
 const LOG_PATH: usize = 112;
 const STATUS: usize = 113;
 const STOP_HINT: usize = 114;
@@ -46,12 +55,42 @@ const TARGET_INFO: usize = 117;
 const PAD_FIT: usize = 118;
 const FEEDBACK: usize = 119;
 const PAD_AREA: usize = 120;
-const HOLD_KEY: usize = 121;
+const MAPPING_GROUP: usize = 125;
+const SCREEN_AREA_LABEL: usize = 126;
+const PAD_AREA_LABEL: usize = 127;
+const WINDOW_LABEL: usize = 128;
+const STATUS_DETAIL: usize = 129;
+const START_MODES: [(TakeoverMode, &str); 3] = [
+    (TakeoverMode::Manual, "Manual start / stop"),
+    (TakeoverMode::Hold, "Hold Alt to capture"),
+    (TakeoverMode::Toggle, "Toggle with shortcut"),
+];
+const SIDEBAR_TOP: i32 = 8;
+const SIDEBAR_WIDTH: i32 = 254;
+const SIDEBAR_ROW: i32 = 26;
+const GROUP_FIRST_ROW: i32 = SIDEBAR_ROW;
+const CAPTURE_TOP: i32 = 76;
+const GESTURES_TOP: i32 = 218;
+const MAPPING_TOP: i32 = 308;
+const SETTINGS_BOTTOM: i32 = MAPPING_TOP + 166;
+const LABEL_LEFT: i32 = 18;
+const LABEL_WIDTH: i32 = 84;
+const CONTROL_WIDTH: i32 = SIDEBAR_WIDTH - 20;
+const COMBO_LEFT: i32 = 104;
+const COMBO_WIDTH: i32 = LABEL_LEFT + CONTROL_WIDTH - COMBO_LEFT;
+const FOOTER_TOP: i32 = SETTINGS_BOTTOM + 10;
+const FOOTER_HEIGHT: i32 = 34;
+const LOG_ROW_HEIGHT: i32 = 28;
 const SS_CENTERIMAGE: u32 = 0x0200;
-const DEFAULT_CLIENT: (i32, i32) = (820, 618);
+const SS_ENDELLIPSIS: u32 = 0x4000;
+const SS_NOTIFY: u32 = 0x0100;
+const DROPDOWN_STYLE: u32 = CBS_DROPDOWNLIST as u32 | WS_TABSTOP;
+const DEFAULT_CLIENT: (i32, i32) = (820, FOOTER_TOP + FOOTER_HEIGHT + 10);
 const PREVIEW_MS: u32 = 1500;
-const PANEL_LEFT: i32 = 274;
-const PANEL_TOP: i32 = 28;
+const PREVIEW_LEFT: i32 = SIDEBAR_TOP + SIDEBAR_WIDTH + 8;
+const PANEL_LEFT: i32 = PREVIEW_LEFT + 8;
+const PANEL_TOP: i32 = SIDEBAR_TOP + GROUP_FIRST_ROW;
+const DIAGRAM_MAX_SIZE: (i32, i32) = (420, 318);
 /// Posted to the panel by the capture worker after each touchpad frame.
 const WM_PANEL_FRAME: u32 = WM_APP + 2;
 /// Set while a WM_PANEL_FRAME is queued; see `experiment::FrameSignal`.
@@ -65,9 +104,10 @@ const MAIN_STYLE: WINDOW_STYLE =
 #[derive(Clone, Copy)]
 enum Anchor {
     Fixed,
-    Diagnostics,
-    Log,
-    Hint,
+    Preview,
+    FullWidth,
+    Footer,
+    Action,
 }
 
 struct Control {
@@ -83,8 +123,10 @@ struct Gui {
     hwnd: HWND,
     panel: HWND,
     controls: Vec<Control>,
-    status: HWND,
+    status_tooltip: HWND,
+    status_tip_text: RefCell<Vec<u16>>,
     log_path: HWND,
+    diagnostics: bool,
     font: HFONT,
     dpi: u32,
     devices: Vec<Device>,
@@ -168,7 +210,7 @@ fn choice_label(choice: Choice, monitors: &[mapping::MonitorEntry]) -> String {
         },
         Choice::ScreenPortion => "Portion of screen…".into(),
         Choice::Window => "Application window".into(),
-        Choice::Diagnostic => "Test area (inside Pad2Touch)".into(),
+        Choice::Diagnostic => "Test area".into(),
     }
 }
 /// What an in-progress overlay selection will configure.
@@ -214,12 +256,12 @@ unsafe fn register(class: &str, proc: WNDPROC, style: WNDCLASS_STYLES) -> Result
     Ok(())
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(diagnostics: bool) -> Result<(), String> {
     // Detach this process only; command-line capture and verification keep stdout.
     unsafe {
         windows_sys::Win32::System::Console::FreeConsole();
     }
-    let result = run_window();
+    let result = run_window(diagnostics);
     if let Err(error) = &result {
         unsafe {
             MessageBoxW(
@@ -233,7 +275,7 @@ pub fn run() -> Result<(), String> {
     result
 }
 
-fn run_window() -> Result<(), String> {
+fn run_window(diagnostics: bool) -> Result<(), String> {
     experiment::EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
@@ -262,7 +304,7 @@ fn run_window() -> Result<(), String> {
         if hwnd.is_null() {
             return Err(winerr("CreateWindowExW(GUI)"));
         }
-        let result = Gui::new(hwnd);
+        let result = Gui::new(hwnd, diagnostics);
         let gui = match result {
             Ok(gui) => gui,
             Err(e) => {
@@ -320,7 +362,7 @@ fn run_window() -> Result<(), String> {
 }
 
 impl Gui {
-    unsafe fn new(hwnd: HWND) -> Result<Self, String> {
+    unsafe fn new(hwnd: HWND, diagnostics: bool) -> Result<Self, String> {
         // Flicker is an intermediate paint state reaching the screen: the dialog
         // background erased in one paint, the control drawn over it in a later
         // one. The background is therefore never painted under child windows;
@@ -339,8 +381,10 @@ impl Gui {
             hwnd,
             panel: null_mut(),
             controls: Vec::new(),
-            status: null_mut(),
+            status_tooltip: null_mut(),
+            status_tip_text: RefCell::new(vec![0]),
             log_path: null_mut(),
+            diagnostics,
             font: null_mut(),
             dpi,
             devices: Vec::new(),
@@ -361,7 +405,7 @@ impl Gui {
             buffer: None,
             closing: false,
             restart_blocked: false,
-            last_status: "Choose a device to get started.".into(),
+            last_status: String::new(),
             windows: Vec::new(),
             screen_rect: None,
             window_area: None,
@@ -383,58 +427,77 @@ impl Gui {
             "Input device",
             0,
             BS_GROUPBOX as u32,
-            [8, 8, 250, 81],
+            [8, SIDEBAR_TOP, SIDEBAR_WIDTH, 60],
         )?;
         g.add(
             "COMBOBOX",
             "",
             DEVICE,
-            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 28, 166, 180],
-        )?;
-        g.add("BUTTON", "Refresh", REFRESH, WS_TABSTOP, [190, 28, 58, 24])?;
-        g.add(
-            "STATIC",
-            "Up to 5 simultaneous touches",
-            0,
-            SS_CENTERIMAGE,
-            [18, 57, 230, 24],
+            DROPDOWN_STYLE | WS_VSCROLL,
+            [
+                LABEL_LEFT,
+                SIDEBAR_TOP + GROUP_FIRST_ROW,
+                CONTROL_WIDTH - 64,
+                180,
+            ],
         )?;
         g.add(
             "BUTTON",
-            "Capture activation",
+            "Refresh",
+            REFRESH,
+            WS_TABSTOP,
+            [
+                LABEL_LEFT + CONTROL_WIDTH - 58,
+                SIDEBAR_TOP + GROUP_FIRST_ROW,
+                58,
+                24,
+            ],
+        )?;
+        g.add(
+            "BUTTON",
+            "Capture",
             0,
             BS_GROUPBOX as u32,
-            [8, 97, 250, 139],
+            [8, CAPTURE_TOP, SIDEBAR_WIDTH, 134],
+        )?;
+        g.add(
+            "STATIC",
+            "Start mode",
+            0,
+            SS_CENTERIMAGE,
+            [LABEL_LEFT, CAPTURE_TOP + GROUP_FIRST_ROW, LABEL_WIDTH, 22],
         )?;
         g.add(
             "COMBOBOX",
             "",
             MODE,
-            CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [18, 117, 230, 160],
+            DROPDOWN_STYLE,
+            [COMBO_LEFT, CAPTURE_TOP + GROUP_FIRST_ROW, COMBO_WIDTH, 160],
         )?;
-        g.fill_combo(
-            MODE,
-            &[
-                "Manual start / stop",
-                "Toggle with shortcut",
-                "Hold Alt to capture",
-            ],
-        );
+        g.fill_combo(MODE, &START_MODES.map(|(_, label)| label));
         g.add(
             "STATIC",
-            "Global shortcut:",
+            "Toggle shortcut",
             0,
             SS_CENTERIMAGE,
-            [18, 146, 96, 22],
+            [
+                LABEL_LEFT,
+                CAPTURE_TOP + GROUP_FIRST_ROW + SIDEBAR_ROW,
+                LABEL_WIDTH,
+                22,
+            ],
         )?;
         g.add(
             "COMBOBOX",
             "",
             KEY,
-            CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [116, 146, 132, 160],
+            DROPDOWN_STYLE,
+            [
+                COMBO_LEFT,
+                CAPTURE_TOP + GROUP_FIRST_ROW + SIDEBAR_ROW,
+                COMBO_WIDTH,
+                160,
+            ],
         )?;
         g.fill_combo(
             KEY,
@@ -446,19 +509,16 @@ impl Gui {
             ],
         );
         g.add(
-            "STATIC",
-            "Alt",
-            HOLD_KEY,
-            SS_CENTERIMAGE,
-            [116, 146, 132, 22],
-        )?;
-        ShowWindow(g.item(HOLD_KEY), SW_HIDE);
-        g.add(
             "BUTTON",
             "Inject native touch input",
             INJECT,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [18, 175, 230, 22],
+            [
+                LABEL_LEFT,
+                CAPTURE_TOP + GROUP_FIRST_ROW + 2 * SIDEBAR_ROW,
+                CONTROL_WIDTH,
+                22,
+            ],
         )?;
         SendMessageW(g.item(INJECT), BM_SETCHECK, 1, 0);
         g.add(
@@ -466,7 +526,12 @@ impl Gui {
             "Show Windows touch feedback",
             FEEDBACK,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [18, 204, 230, 22],
+            [
+                LABEL_LEFT,
+                CAPTURE_TOP + GROUP_FIRST_ROW + 3 * SIDEBAR_ROW,
+                CONTROL_WIDTH,
+                22,
+            ],
         )?;
         SendMessageW(g.item(FEEDBACK), BM_SETCHECK, 1, 0);
         g.add(
@@ -474,66 +539,97 @@ impl Gui {
             "Windows system gestures",
             0,
             BS_GROUPBOX as u32,
-            [8, 244, 250, 80],
+            [8, GESTURES_TOP, SIDEBAR_WIDTH, 82],
         )?;
         g.add(
             "BUTTON",
-            "Block touchpad system gestures",
+            "Block touchpad gestures",
             PAD_GESTURES,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [18, 264, 230, 22],
+            [
+                LABEL_LEFT,
+                GESTURES_TOP + GROUP_FIRST_ROW,
+                CONTROL_WIDTH,
+                22,
+            ],
         )?;
         g.add(
             "BUTTON",
-            "Block touchscreen system gestures",
+            "Block touchscreen gestures",
             SCREEN_GESTURES,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [18, 293, 230, 22],
+            [
+                LABEL_LEFT,
+                GESTURES_TOP + GROUP_FIRST_ROW + SIDEBAR_ROW,
+                CONTROL_WIDTH,
+                22,
+            ],
         )?;
         SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
         SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
         g.add(
             "BUTTON",
-            "Screen area",
-            0,
+            "Mapping",
+            MAPPING_GROUP,
             BS_GROUPBOX as u32,
-            [8, 332, 250, 168],
+            [8, MAPPING_TOP, SIDEBAR_WIDTH, SETTINGS_BOTTOM - MAPPING_TOP],
+        )?;
+        g.add(
+            "STATIC",
+            "Screen area",
+            SCREEN_AREA_LABEL,
+            SS_CENTERIMAGE,
+            [LABEL_LEFT, MAPPING_TOP + GROUP_FIRST_ROW, LABEL_WIDTH, 22],
         )?;
         g.add(
             "COMBOBOX",
             "",
             TARGET,
-            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 352, 230, 240],
+            DROPDOWN_STYLE | WS_VSCROLL,
+            [COMBO_LEFT, MAPPING_TOP + GROUP_FIRST_ROW, COMBO_WIDTH, 240],
         )?;
         g.fill_targets();
+        g.add(
+            "STATIC",
+            "Window",
+            WINDOW_LABEL,
+            SS_CENTERIMAGE,
+            [LABEL_LEFT, MAPPING_TOP + 52, LABEL_WIDTH, 22],
+        )?;
         g.add(
             "COMBOBOX",
             "",
             WINDOW,
-            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 381, 230, 240],
+            DROPDOWN_STYLE | WS_VSCROLL,
+            [COMBO_LEFT, MAPPING_TOP + 52, COMBO_WIDTH, 240],
         )?;
         g.add(
             "BUTTON",
             "Select area…",
             AREA,
             WS_TABSTOP,
-            [18, 410, 96, 24],
+            [LABEL_LEFT, MAPPING_TOP + 78, 100, 24],
         )?;
         g.add(
             "STATIC",
-            "Touchpad area:",
-            0,
+            "",
+            TARGET_INFO,
             SS_CENTERIMAGE,
-            [18, 439, 96, 22],
+            [LABEL_LEFT + 106, MAPPING_TOP + 78, CONTROL_WIDTH - 106, 24],
+        )?;
+        g.add(
+            "STATIC",
+            "Touchpad area",
+            PAD_AREA_LABEL,
+            SS_CENTERIMAGE,
+            [LABEL_LEFT, MAPPING_TOP + 108, LABEL_WIDTH, 22],
         )?;
         g.add(
             "COMBOBOX",
             "",
             PAD_FIT,
-            CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [116, 439, 132, 160],
+            DROPDOWN_STYLE,
+            [COMBO_LEFT, MAPPING_TOP + 108, COMBO_WIDTH, 160],
         )?;
         g.fill_combo(PAD_FIT, &["Force proportions", "Full", "Portion…"]);
         SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 0, 0);
@@ -542,51 +638,57 @@ impl Gui {
             "Select pad area…",
             PAD_AREA,
             WS_TABSTOP,
-            [18, 468, 230, 24],
+            [COMBO_LEFT, MAPPING_TOP + 134, COMBO_WIDTH, 24],
         )?;
         g.add(
             "STATIC",
             "",
-            TARGET_INFO,
+            STATUS,
             SS_CENTERIMAGE,
-            [116, 410, 132, 24],
+            [8, FOOTER_TOP, 84, FOOTER_HEIGHT],
         )?;
+        g.add(
+            "STATIC",
+            "",
+            STATUS_DETAIL,
+            SS_CENTERIMAGE | SS_ENDELLIPSIS | SS_NOTIFY,
+            [100, FOOTER_TOP, 310, FOOTER_HEIGHT],
+        )?;
+        g.create_status_tooltip();
+        let emergency_label = g.add(
+            "STATIC",
+            "Stop: Ctrl + Alt + Esc",
+            STOP_HINT,
+            SS_CENTERIMAGE,
+            [422, FOOTER_TOP, 132, FOOTER_HEIGHT],
+        )?;
+        if diagnostics {
+            g.log_path = g.add(
+                "EDIT",
+                "Logs: no session started",
+                LOG_PATH,
+                ES_READONLY as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                [8, FOOTER_TOP, 0, 22],
+            )?;
+        }
         g.add(
             "BUTTON",
             "Start capture",
             START,
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            [8, 508, 122, 26],
+            [136, 0, 122, 26],
         )?;
+        g.add("BUTTON", "Stop / disarm", STOP, WS_TABSTOP, [8, 0, 122, 26])?;
         g.add(
             "BUTTON",
-            "Stop / disarm",
-            STOP,
-            WS_TABSTOP,
-            [136, 508, 122, 26],
-        )?;
-        // Four lines: the state plus up to three wrapped lines of detail.
-        g.status = g.add("STATIC", "", STATUS, 0, [8, 544, 250, 64])?;
-        let emergency_label = g.add(
-            "STATIC",
-            "Emergency stop: Ctrl + Alt + Esc (or Esc here)",
-            STOP_HINT,
-            0,
-            [PANEL_LEFT, 0, 0, 16],
-        )?;
-        g.log_path = g.add(
-            "EDIT",
-            "Logs: no session started",
-            LOG_PATH,
-            ES_READONLY as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            [PANEL_LEFT, 0, 0, 22],
-        )?;
-        g.add(
-            "BUTTON",
-            "Diagnostics / touch receiver",
-            DIAGNOSTICS_GROUP,
+            if diagnostics {
+                "Diagnostics / touch receiver"
+            } else {
+                "Touch preview"
+            },
+            PREVIEW_GROUP,
             BS_GROUPBOX as u32,
-            [266, 8, 0, 0],
+            [PREVIEW_LEFT, SIDEBAR_TOP, 0, 0],
         )?;
         g.panel = CreateWindowExW(
             0,
@@ -612,10 +714,7 @@ impl Gui {
             VK_ESCAPE as u32,
         ) != 0;
         if !g.emergency_registered {
-            set_text(
-                emergency_label,
-                "Global emergency shortcut unavailable; use Stop / disarm or Esc in this window.",
-            );
+            set_text(emergency_label, "Stop: Esc here");
         }
         // Group boxes are opaque (`group_proc`) and must stay below every
         // control and the panel: WS_CLIPSIBLINGS then clips those out of the
@@ -636,7 +735,7 @@ impl Gui {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
         // The window cannot be resized, so it is never made smaller than its
         // layout; SWP_FRAMECHANGED applies the fixed frame set above.
-        let size = outer_size(DEFAULT_CLIENT.0, DEFAULT_CLIENT.1, g.dpi);
+        let size = outer_size(DEFAULT_CLIENT.0, g.client_height(), g.dpi);
         SetWindowPos(
             hwnd,
             null_mut(),
@@ -650,6 +749,51 @@ impl Gui {
     }
     fn px(&self, n: i32) -> i32 {
         ((n as i64 * self.dpi as i64) / 96) as i32
+    }
+
+    fn client_height(&self) -> i32 {
+        DEFAULT_CLIENT.1 + if self.diagnostics { LOG_ROW_HEIGHT } else { 0 }
+    }
+
+    fn status_tool(&self, text: &mut [u16]) -> TTTOOLINFOW {
+        TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: self.hwnd,
+            uId: unsafe { self.item(STATUS_DETAIL) } as usize,
+            lpszText: text.as_mut_ptr(),
+            ..Default::default()
+        }
+    }
+
+    unsafe fn create_status_tooltip(&mut self) {
+        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        });
+        self.status_tooltip = CreateWindowExW(
+            0,
+            TOOLTIPS_CLASSW,
+            null(),
+            WS_POPUP | TTS_NOPREFIX,
+            0,
+            0,
+            0,
+            0,
+            self.hwnd,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if !self.status_tooltip.is_null() {
+            let tool = self.status_tool(&mut self.status_tip_text.borrow_mut());
+            SendMessageW(
+                self.status_tooltip,
+                TTM_ADDTOOLW,
+                0,
+                &tool as *const _ as LPARAM,
+            );
+        }
     }
     unsafe fn add(
         &mut self,
@@ -689,9 +833,10 @@ impl Gui {
             width: bounds[2],
             height: bounds[3],
             anchor: match id {
-                DIAGNOSTICS_GROUP => Anchor::Diagnostics,
-                LOG_PATH => Anchor::Log,
-                STOP_HINT => Anchor::Hint,
+                PREVIEW_GROUP => Anchor::Preview,
+                LOG_PATH => Anchor::FullWidth,
+                STATUS | STATUS_DETAIL | STOP_HINT => Anchor::Footer,
+                START | STOP => Anchor::Action,
                 _ => Anchor::Fixed,
             },
         });
@@ -702,6 +847,11 @@ impl Gui {
     }
     unsafe fn selection(&self, id: usize) -> usize {
         SendMessageW(self.item(id), CB_GETCURSEL, 0, 0).max(0) as usize
+    }
+    unsafe fn selected_mode(&self) -> TakeoverMode {
+        START_MODES
+            .get(self.selection(MODE))
+            .map_or(TakeoverMode::Manual, |&(mode, _)| mode)
     }
     unsafe fn checked(&self, id: usize) -> bool {
         SendMessageW(self.item(id), BM_GETCHECK, 0, 0) == 1
@@ -755,6 +905,14 @@ impl Gui {
         for c in &self.controls {
             SendMessageW(c.hwnd, WM_SETFONT, font as WPARAM, 0);
         }
+        if !self.status_tooltip.is_null() {
+            SendMessageW(
+                self.status_tooltip,
+                TTM_SETMAXTIPWIDTH,
+                0,
+                self.px(420) as LPARAM,
+            );
+        }
         if !self.font.is_null() {
             DeleteObject(self.font);
         }
@@ -774,9 +932,11 @@ impl Gui {
             // Without geometry only Stretch can map the canvas.
             .or((!self.pad_fit().needs_shape()).then_some(None))
             .and_then(|aspect| {
-                MappingTarget::Diagnostics
-                    .resolve_fitted(self.panel, aspect, self.pad_fit())
-                    .ok()
+                MappingTarget::TestArea {
+                    diagnostics: self.diagnostics,
+                }
+                .resolve_fitted(self.panel, aspect, self.pad_fit())
+                .ok()
             })
         {
             self.rect = target.bounds;
@@ -792,11 +952,12 @@ impl Gui {
             return;
         }
         // Only controls whose bounds change are moved, and Windows' own
-        // invalidation is used: a moved control's pixels are copied to the new
-        // position, only the uncovered background is erased (WS_CLIPCHILDREN),
-        // and resized group boxes and the panel repaint from back buffers. Fixed
-        // controls, i.e. the whole left column, are not repainted at all.
+        // invalidation is used: only uncovered background is erased, and resized
+        // group boxes and the panel repaint from back buffers.
         let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        let preview_bottom = self.px(SETTINGS_BOTTOM);
+        let preview_right = rc.right - self.px(8);
+        let footer_offset = self.client_height() - DEFAULT_CLIENT.1;
         let mut placements = Vec::with_capacity(self.controls.len() + 1);
         for c in &self.controls {
             let (x, y, w, h) = match c.anchor {
@@ -806,23 +967,29 @@ impl Gui {
                     self.px(c.width),
                     self.px(c.height),
                 ),
-                Anchor::Diagnostics => (
-                    self.px(266),
-                    self.px(8),
-                    rc.right - self.px(274),
-                    rc.bottom - self.px(72),
+                Anchor::Preview => (
+                    self.px(c.x),
+                    self.px(c.y),
+                    preview_right - self.px(c.x),
+                    preview_bottom - self.px(c.y),
                 ),
-                Anchor::Log => (
-                    self.px(PANEL_LEFT),
-                    rc.bottom - self.px(56),
-                    rc.right - self.px(PANEL_LEFT + 10),
-                    self.px(22),
+                Anchor::FullWidth => (
+                    self.px(c.x),
+                    self.px(c.y),
+                    preview_right - self.px(c.x),
+                    self.px(c.height),
                 ),
-                Anchor::Hint => (
-                    self.px(PANEL_LEFT),
-                    rc.bottom - self.px(26),
-                    rc.right - self.px(PANEL_LEFT + 10),
-                    self.px(16),
+                Anchor::Footer => (
+                    self.px(c.x),
+                    self.px(c.y + footer_offset),
+                    self.px(c.width),
+                    self.px(c.height),
+                ),
+                Anchor::Action => (
+                    rc.right - self.px(c.x) - self.px(c.width),
+                    self.px(FOOTER_TOP + footer_offset + (FOOTER_HEIGHT - c.height) / 2),
+                    self.px(c.width),
+                    self.px(c.height),
                 ),
             };
             placements.push((c.hwnd, x, y, w.max(1), h.max(1)));
@@ -833,8 +1000,8 @@ impl Gui {
             self.panel,
             x,
             y,
-            (rc.right - x - self.px(10)).max(1),
-            (rc.bottom - y - self.px(76)).max(1),
+            (preview_right - self.px(8) - x).max(1),
+            (preview_bottom - self.px(12) - y).max(1),
         ));
         placements.retain(|&(hwnd, x, y, w, h)| {
             let old = child_rect(self.hwnd, hwnd);
@@ -874,9 +1041,9 @@ impl Gui {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+        self.refresh_preview_rect();
         // Painting stays queued: a synchronous WM_PAINT here would find GUI's
         // RefCell borrowed. See WM_SIZE in `window_proc` for the immediate update.
-        self.refresh_preview_rect();
     }
     unsafe fn refresh_devices(&mut self) {
         let previous = self
@@ -888,7 +1055,11 @@ impl Gui {
                 self.devices = devices;
                 SendMessageW(self.item(DEVICE), CB_RESETCONTENT, 0, 0);
                 for (i, d) in self.devices.iter().enumerate() {
-                    let label = format!("{} · VID {:04X} / PID {:04X}", i + 1, d.vid, d.pid);
+                    let label = if self.diagnostics {
+                        format!("{} · VID {:04X} / PID {:04X}", i + 1, d.vid, d.pid)
+                    } else {
+                        format!("Precision Touchpad {}", i + 1)
+                    };
                     SendMessageW(
                         self.item(DEVICE),
                         CB_ADDSTRING,
@@ -906,8 +1077,7 @@ impl Gui {
                     self.last_status =
                         "No Precision Touchpad found. Connect a device and refresh.".into();
                 } else {
-                    self.last_status =
-                        format!("{} touchpad collection(s) available.", self.devices.len());
+                    self.last_status.clear();
                 }
             }
             Err(e) => {
@@ -1016,7 +1186,9 @@ impl Gui {
                     None => MappingTarget::Window { handle },
                 })
             }
-            Choice::Diagnostic => Ok(MappingTarget::Diagnostics),
+            Choice::Diagnostic => Ok(MappingTarget::TestArea {
+                diagnostics: self.diagnostics,
+            }),
         }
     }
     fn aspect(&self) -> Option<f64> {
@@ -1050,35 +1222,51 @@ impl Gui {
             Ok((fitted.bounds, selected, fitted.input))
         });
     }
-    unsafe fn diagram_area(&self, rc: &RECT) -> RECT {
-        RECT {
+    fn diagram_area(&self, rc: &RECT) -> RECT {
+        let mut area = RECT {
             left: self.px(16),
-            top: self.px(190),
+            top: self.px(if self.diagnostics {
+                mapping::DIAGNOSTICS_HEADER_HEIGHT
+            } else {
+                mapping::TEST_AREA_INSET
+            }),
             right: rc.right - self.px(16),
             bottom: rc.bottom - self.px(12),
-        }
+        };
+        let width = (area.right - area.left).min(self.px(DIAGRAM_MAX_SIZE.0));
+        let height = (area.bottom - area.top).min(self.px(DIAGRAM_MAX_SIZE.1));
+        area.left += (area.right - area.left - width) / 2;
+        area.top += (area.bottom - area.top - height) / 2;
+        area.right = area.left + width;
+        area.bottom = area.top + height;
+        area
     }
 
-    /// Diagnostic text, then (for screen/window targets) the mapping diagram.
     unsafe fn paint_panel(&mut self, hwnd: HWND, dc: HDC, rc: &RECT) {
+        FillRect(dc, rc, GetSysColorBrush(COLOR_BTNFACE));
         let diagram = match &self.session {
             Some(_) => !self.session_diagnostic,
             None => self.choice() != Choice::Diagnostic,
         };
         if !diagram {
-            experiment::paint_diagnostics(hwnd, dc, rc, &self.shared, self.rect, self.dpi, true);
+            if self.diagnostics {
+                experiment::paint_diagnostics(hwnd, dc, rc, &self.shared, self.rect, self.dpi);
+            }
+            experiment::paint_touch_canvas(hwnd, dc, &self.shared, self.rect, self.diagnostics);
             return;
         }
         let area = self.diagram_area(rc);
-        let mut origin = POINT::default();
-        ClientToScreen(hwnd, &mut origin);
-        let text_limit = RECT {
-            left: area.left + origin.x,
-            top: area.top + origin.y,
-            right: area.right + origin.x,
-            bottom: area.bottom + origin.y,
-        };
-        experiment::paint_diagnostics(hwnd, dc, rc, &self.shared, text_limit, self.dpi, false);
+        if self.diagnostics {
+            let mut origin = POINT::default();
+            ClientToScreen(hwnd, &mut origin);
+            let text_limit = RECT {
+                left: area.left + origin.x,
+                top: area.top + origin.y,
+                right: area.right + origin.x,
+                bottom: area.bottom + origin.y,
+            };
+            experiment::paint_diagnostics(hwnd, dc, rc, &self.shared, text_limit, self.dpi);
+        }
         let (mapped, mapped_input, live) = {
             let s = self.shared.lock().unwrap();
             let live = if s.capture_stopped {
@@ -1365,11 +1553,7 @@ impl Gui {
                 return;
             }
         }
-        self.controller.mode = match self.selection(MODE) {
-            1 => TakeoverMode::Toggle,
-            2 => TakeoverMode::Hold,
-            _ => TakeoverMode::Manual,
-        };
+        self.controller.mode = self.selected_mode();
         if self.controller.mode == TakeoverMode::Toggle {
             if RegisterHotKey(
                 self.hwnd,
@@ -1453,7 +1637,7 @@ impl Gui {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
-        let out = PathBuf::from(format!("artifacts/gui-{stamp}"));
+        let out = PathBuf::from(format!("artifacts/gui-{}-{stamp}", std::process::id()));
         let session = Session::start(
             device,
             target,
@@ -1462,6 +1646,7 @@ impl Gui {
                 suppress_touchpad: self.checked(PAD_GESTURES),
                 suppress_touchscreen: self.checked(SCREEN_GESTURES),
                 touch_feedback: self.checked(FEEDBACK),
+                diagnostics: self.diagnostics,
                 prewarmed: self.prewarmed.clone(),
             },
             out.clone(),
@@ -1476,10 +1661,9 @@ impl Gui {
         self.session = Some(session);
         self.session_diagnostic = spec.is_diagnostic();
         self.refresh_preview_rect();
-        SetWindowTextW(
-            self.log_path,
-            wide(&format!("Logs: {}", out.display())).as_ptr(),
-        );
+        if self.diagnostics {
+            set_text(self.log_path, &format!("Logs: {}", out.display()));
+        }
         self.last_status = if spec.is_diagnostic() {
             "Starting capture.".into()
         } else {
@@ -1501,7 +1685,7 @@ impl Gui {
                 session.request_stop("Capture stopped.");
             }
             if session.stopped_unexpectedly() {
-                self.disarm("Capture stopped. Review diagnostics before enabling again.");
+                self.disarm("Capture stopped unexpectedly.");
             }
         }
         if self.session.as_mut().is_some_and(|s| s.ready_to_finish()) {
@@ -1527,8 +1711,7 @@ impl Gui {
             drop(s);
             if self.restart_blocked {
                 self.last_status =
-                    "Unresolved contacts. New sessions are blocked; keep the logs for review."
-                        .into();
+                    "Unresolved contacts or settings recovery. New sessions are blocked.".into();
             }
             self.layout();
         }
@@ -1562,7 +1745,7 @@ impl Gui {
             return;
         }
         let focus = GetFocus();
-        if !focus.is_null() && IsWindowEnabled(focus) != 0 {
+        if !focus.is_null() && IsWindowEnabled(focus) != 0 && IsWindowVisible(focus) != 0 {
             return;
         }
         let next = [STOP, START]
@@ -1595,13 +1778,10 @@ impl Gui {
         );
         let choice = self.choice();
         let portion = matches!(self.pad_fit(), mapping::PadFit::Portion(_));
-        ShowWindow(
-            self.item(PAD_AREA),
-            if portion { SW_SHOWNA } else { SW_HIDE },
-        );
+        let mode = self.selected_mode();
         EnableWindow(
             self.item(PAD_AREA),
-            i32::from(!locked && choice != Choice::Diagnostic),
+            i32::from(!locked && portion && choice != Choice::Diagnostic),
         );
         EnableWindow(
             self.item(WINDOW),
@@ -1637,22 +1817,23 @@ impl Gui {
         } else {
             self.target().err()
         };
-        let mode = self.selection(MODE);
-        ShowWindow(self.item(KEY), if mode == 2 { SW_HIDE } else { SW_SHOWNA });
-        ShowWindow(
-            self.item(HOLD_KEY),
-            if mode == 2 { SW_SHOWNA } else { SW_HIDE },
+        let target_error = target_error.or_else(|| {
+            (!self.devices.is_empty()
+                && self.checked(INJECT)
+                && self.geometry.is_none()
+                && self.pad_fit().needs_shape())
+            .then(|| "Touchpad dimensions unavailable. Choose Touchpad area Full.".into())
+        });
+        EnableWindow(
+            self.item(KEY),
+            i32::from(!locked && mode == TakeoverMode::Toggle),
         );
-        EnableWindow(self.item(KEY), i32::from(!locked && mode == 1));
         EnableWindow(
             self.item(START),
             i32::from(
                 !locked
                     && !self.restart_blocked
                     && !self.devices.is_empty()
-                    && (!self.checked(INJECT)
-                        || self.geometry.is_some()
-                        || !self.pad_fit().needs_shape())
                     && target_error.is_none(),
             ),
         );
@@ -1663,18 +1844,18 @@ impl Gui {
         self.keep_focus();
         set_text(
             self.item(START),
-            if self.selection(MODE) == 0 {
+            if mode == TakeoverMode::Manual {
                 "Start capture"
             } else {
                 "Enable shortcut"
             },
         );
         let state = if self.closing {
-            "Closing · releasing contacts"
+            "Closing"
         } else if self.session.as_ref().is_some_and(|s| s.stopping()) {
-            "Stopping · releasing contacts"
+            "Stopping"
         } else if self.session.is_some() && !self.checked(INJECT) {
-            "Capturing · raw input only"
+            "Raw capture"
         } else if self.session.is_some() {
             let s = self.shared.lock().unwrap();
             if s.armed {
@@ -1684,7 +1865,7 @@ impl Gui {
             } else if s.raw == 0 {
                 "Capturing"
             } else {
-                "Lift all fingers to resume"
+                "Lift all fingers"
             }
         } else if self.controller.enabled {
             "Shortcut ready"
@@ -1695,7 +1876,25 @@ impl Gui {
             Some(e) if self.session.is_none() && !self.controller.enabled => e,
             _ => &self.last_status,
         };
-        set_text(self.status, &format!("{state}\r\n{info}"));
+        set_text(self.item(STATUS), state);
+        let single_line;
+        let info = if info.contains(['\r', '\n']) {
+            single_line = info.split_whitespace().collect::<Vec<_>>().join(" ");
+            &single_line
+        } else {
+            info.as_str()
+        };
+        if set_text(self.item(STATUS_DETAIL), info) && !self.status_tooltip.is_null() {
+            let mut text = wide(info);
+            let tool = self.status_tool(&mut text);
+            SendMessageW(
+                self.status_tooltip,
+                TTM_UPDATETIPTEXTW,
+                0,
+                &tool as *const _ as LPARAM,
+            );
+            *self.status_tip_text.borrow_mut() = text;
+        }
     }
 }
 
@@ -1788,6 +1987,9 @@ impl Drop for Gui {
         overlay::cancel();
         overlay::hide_outline();
         unsafe {
+            if !self.status_tooltip.is_null() {
+                DestroyWindow(self.status_tooltip);
+            }
             if self.hotkey_registered {
                 UnregisterHotKey(self.hwnd, HOTKEY);
             }
@@ -1894,7 +2096,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     WM_TIMER => g.tick(),
                     WM_CLOSE => {
                         g.closing = true;
-                        g.disarm("Closing after contact cleanup and log flush.");
+                        g.disarm("Closing after contact cleanup.");
                         if g.session.is_none() {
                             destroy = true;
                         }
@@ -1911,6 +2113,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         if g.session.is_none() && !g.controller.enabled {
                             g.fill_targets();
                         }
+                        g.update_controls();
                         g.thumbnail = None;
                         g.refresh_diagram_preview();
                     }
@@ -1943,7 +2146,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         // Keep the suggested position, but size the fixed
                         // client area exactly for the new DPI.
                         let r = &*(l as *const RECT);
-                        let size = outer_size(DEFAULT_CLIENT.0, DEFAULT_CLIENT.1, g.dpi);
+                        let size = outer_size(DEFAULT_CLIENT.0, g.client_height(), g.dpi);
                         SetWindowPos(
                             hwnd,
                             null_mut(),
@@ -2062,6 +2265,14 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    unsafe fn select_start_mode(g: &Gui, mode: TakeoverMode) {
+        let index = START_MODES
+            .iter()
+            .position(|&(entry, _)| entry == mode)
+            .unwrap();
+        SendMessageW(g.item(MODE), CB_SETCURSEL, index, 0);
+    }
+
     #[test]
     fn escape_is_recognized_without_focus_but_not_alt_escape() {
         let key = |message, lparam| MSG {
@@ -2107,12 +2318,12 @@ mod tests {
                 GetModuleHandleW(null()),
                 null(),
             );
-            let mut g = Gui::new(hwnd).unwrap();
+            let mut g = Gui::new(hwnd, false).unwrap();
             g.refresh_devices();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
-            SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
+            select_start_mode(&g, TakeoverMode::Toggle);
             let (start, stop) = (g.item(START), g.item(STOP));
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
             GUI.with(|slot| {
@@ -2221,7 +2432,7 @@ mod tests {
                 GetModuleHandleW(null()),
                 null(),
             );
-            let g = Gui::new(hwnd).unwrap();
+            let g = Gui::new(hwnd, false).unwrap();
             // Raw-only: previews need no physical geometry.
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
@@ -2363,6 +2574,37 @@ mod tests {
                 assert!(g.last_status.contains("at least"), "{}", g.last_status);
             });
 
+            // The smaller preview and the pad selection overlay share the same bounds.
+            choose(hwnd, PAD_FIT, 2);
+            let surface = with(|g| {
+                let mut client = RECT::default();
+                GetClientRect(g.panel, &mut client);
+                let rects: Vec<_> = g.monitors.iter().map(|m| m.rect).collect();
+                let mut surface = diagram::layout(
+                    g.diagram_area(&client),
+                    mapping::virtual_screen(),
+                    &rects,
+                    g.aspect().unwrap_or(1.6),
+                    g.dpi,
+                )
+                .unwrap()
+                .surface;
+                let mut origin = POINT::default();
+                ClientToScreen(g.panel, &mut origin);
+                OffsetRect(&mut surface, origin.x, origin.y);
+                surface
+            });
+            click(hwnd, PAD_AREA);
+            with(|g| {
+                let Some(Pending::Touchpad(bounds)) = g.pending_selection else {
+                    panic!("the touchpad selector did not open");
+                };
+                assert_eq!(tuple(bounds), tuple(surface));
+            });
+            let (width, height) = (surface.right - surface.left, surface.bottom - surface.top);
+            drag((width / 4, height / 4), (width * 3 / 4, height * 3 / 4));
+            with(|g| assert!(g.pad_area.is_some()));
+
             // A closed target window is dropped from the selection.
             choose(hwnd, TARGET, index_of(Choice::Window));
             host.close();
@@ -2437,7 +2679,7 @@ mod tests {
                 "Screen · 2560×1440",
                 "Portion of screen…",
                 "Application window",
-                "Test area (inside Pad2Touch)"
+                "Test area"
             ]
         );
         // Several monitors: full desktop, then each monitor, main first.
@@ -2504,7 +2746,7 @@ mod tests {
                 GetModuleHandleW(null()),
                 null(),
             );
-            let g = Gui::new(hwnd).unwrap();
+            let g = Gui::new(hwnd, false).unwrap();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
@@ -2546,15 +2788,12 @@ mod tests {
                 )));
                 let mut rc = RECT::default();
                 GetClientRect(g.panel, &mut rc);
-                (
-                    RECT {
-                        left: g.px(16),
-                        top: g.px(190),
-                        right: rc.right - g.px(16),
-                        bottom: rc.bottom - g.px(12),
-                    },
-                    g.dpi,
-                )
+                let area = g.diagram_area(&rc);
+                assert_eq!(area.right - area.left, g.px(DIAGRAM_MAX_SIZE.0));
+                assert_eq!(area.bottom - area.top, g.px(DIAGRAM_MAX_SIZE.1));
+                assert!((area.left + area.right - rc.right).abs() <= 1);
+                assert!(area.top > g.px(mapping::TEST_AREA_INSET));
+                (area, g.dpi)
             });
             let rects: Vec<RECT> = monitors.iter().map(|m| m.rect).collect();
             let l = crate::diagram::layout(area, mapping::virtual_screen(), &rects, 1.6, dpi)
@@ -2719,8 +2958,8 @@ mod tests {
                 (228, 70),
                 (225, 83),
                 (250, 214),
-                (227, 318),
-                (252, 378),
+                (250, 318),
+                (285, 378),
                 (260, 230),
                 (600, 12),
             ] {
@@ -2730,10 +2969,15 @@ mod tests {
                     "live dialog background differs at ({x}, {y})"
                 );
             }
+            for y in g.px(SETTINGS_BOTTOM)..g.px(FOOTER_TOP) {
+                assert_eq!(
+                    GetPixel(dc, g.px(400), y),
+                    background,
+                    "footer gap at y={y}"
+                );
+            }
             ReleaseDC(hwnd, dc);
-            // The receiver canvas exists only for the test area with a known
-            // touchpad shape; without a touchpad only the dialog is checked.
-            if let Some(geometry) = g.geometry.filter(|_| g.rect.right > g.rect.left) {
+            if g.rect.right > g.rect.left {
                 let panel_dc = GetDC(g.panel);
                 let mut canvas = POINT {
                     x: g.rect.left,
@@ -2749,22 +2993,19 @@ mod tests {
                 let mut origin = POINT::default();
                 ClientToScreen(g.panel, &mut origin);
                 assert!(g.rect.left - origin.x >= g.px(16));
-                assert!(g.rect.top - origin.y >= g.px(190));
-                let aspect = geometry.aspect().unwrap();
-                let input = g
-                    .target()
-                    .unwrap()
-                    .resolve_fitted(g.panel, Some(aspect), g.pad_fit())
-                    .unwrap()
-                    .input;
-                let active_aspect =
-                    aspect * (input.right - input.left) / (input.bottom - input.top);
-                assert!(
-                    ((g.rect.right - g.rect.left) as f64
-                        - (g.rect.bottom - g.rect.top) as f64 * active_aspect)
-                        .abs()
-                        <= active_aspect.max(1.0)
-                );
+                assert!(g.rect.top - origin.y >= g.px(mapping::TEST_AREA_INSET));
+                if let Some(aspect) = g.aspect() {
+                    let target = g.resolve_target().unwrap();
+                    assert_eq!(target.input, NormRect::FULL, "Test area uses the whole pad");
+                    assert_eq!(mapping::tuple(g.rect), mapping::tuple(target.bounds));
+                    let (w, h) = mapping::size(g.rect);
+                    assert!(
+                        (w as f64 - h as f64 * aspect).abs() <= aspect.max(1.0),
+                        "Test area canvas {w}x{h} must match the physical pad ratio {aspect}"
+                    );
+                } else {
+                    assert_eq!(g.rect.top - origin.y, g.px(mapping::TEST_AREA_INSET));
+                }
             }
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client);
@@ -2822,7 +3063,8 @@ mod tests {
                 GetModuleHandleW(null()),
                 null(),
             );
-            let mut gui = Gui::new(hwnd).unwrap();
+            let mut gui = Gui::new(hwnd, false).unwrap();
+            assert!(gui.item(LOG_PATH).is_null());
             assert!(gui.checked(FEEDBACK), "touch feedback defaults to enabled");
             assert!(
                 gui.checked(PAD_GESTURES),
@@ -2839,10 +3081,90 @@ mod tests {
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
+                g.layout();
+                let shown = |id| GetWindowLongPtrW(g.item(id), GWL_STYLE) as u32 & WS_VISIBLE != 0;
+                let bounds = |id| child_rect(hwnd, g.item(id));
+                let enabled = |id| IsWindowEnabled(g.item(id)) != 0;
+                let combos = [DEVICE, MODE, KEY, TARGET, WINDOW, PAD_FIT];
+                let positions = || combos.map(|id| mapping::tuple(bounds(id)));
+                g.update_controls();
+                for id in combos {
+                    assert!(shown(id), "dropdown {id} is hidden in manual mode");
+                    let style = GetWindowLongPtrW(g.item(id), GWL_STYLE) as i32;
+                    assert_eq!(style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE), 0);
+                }
+                assert!(!enabled(KEY) && !enabled(WINDOW) && !enabled(PAD_AREA));
+                assert_eq!(bounds(INJECT).left, bounds(FEEDBACK).left);
+                let start_top = bounds(START).top;
+                let default_positions = positions();
+                for (label, combo) in [
+                    (SCREEN_AREA_LABEL, TARGET),
+                    (WINDOW_LABEL, WINDOW),
+                    (PAD_AREA_LABEL, PAD_FIT),
+                ] {
+                    assert_eq!(bounds(label).left, bounds(INJECT).left);
+                    assert_eq!(bounds(label).top, bounds(combo).top);
+                    assert_eq!(bounds(combo).left, bounds(MODE).left);
+                    assert_eq!(bounds(combo).right, bounds(MODE).right);
+                }
+                for (above, below, gap) in [
+                    (TARGET, WINDOW, 3),
+                    (WINDOW, AREA, 3),
+                    (AREA, PAD_AREA_LABEL, 6),
+                    (PAD_FIT, PAD_AREA, 3),
+                ] {
+                    assert!(bounds(below).top - bounds(above).bottom >= g.px(gap));
+                }
+                assert!(bounds(PAD_AREA).bottom < bounds(MAPPING_GROUP).bottom);
+                let preview = bounds(PREVIEW_GROUP);
+                let start = bounds(START);
+                let stop = bounds(STOP);
+                assert_eq!(preview.top, g.px(SIDEBAR_TOP));
+                assert_eq!(preview.bottom, bounds(MAPPING_GROUP).bottom);
+                assert!(child_rect(hwnd, g.panel).bottom < preview.bottom);
+                let hint = bounds(STOP_HINT);
+                assert!(preview.bottom < hint.top);
+                assert!(bounds(STATUS).right < bounds(STATUS_DETAIL).left);
+                assert!(bounds(STATUS_DETAIL).right < hint.left && hint.right < start.left);
+                assert!(((hint.top + hint.bottom) / 2 - (start.top + start.bottom) / 2).abs() <= 1);
+                assert!(preview.left < start.left && start.right < stop.left);
+                assert_eq!(start.top, stop.top);
+                assert_eq!(preview.right, stop.right);
+                assert!(stop.bottom < expected.1);
+
+                SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
+                g.update_controls();
+                assert_eq!(g.selected_mode(), TakeoverMode::Hold);
+                assert!(shown(KEY) && !enabled(KEY));
+                assert_eq!(positions(), default_positions);
+
+                SendMessageW(g.item(MODE), CB_SETCURSEL, 2, 0);
+                g.select_choice(Choice::Window);
+                SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 2, 0);
+                g.update_controls();
+                assert_eq!(g.selected_mode(), TakeoverMode::Toggle);
+                assert!(shown(KEY) && enabled(KEY));
+                assert!(shown(WINDOW) && enabled(WINDOW));
+                assert!(shown(PAD_AREA) && enabled(PAD_AREA));
+                assert_eq!(positions(), default_positions);
+                assert_eq!(bounds(START).top, start_top);
+
+                select_start_mode(g, TakeoverMode::Manual);
+                SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 0, 0);
                 let test_area = g.choices.iter().position(|&c| c == Choice::Diagnostic);
                 SendMessageW(g.item(TARGET), CB_SETCURSEL, test_area.unwrap(), 0);
-                g.layout();
+                if g.geometry.is_none() {
+                    SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 1, 0);
+                }
                 g.update_controls();
+                for id in combos {
+                    assert!(shown(id), "dropdown {id} is hidden for the test area");
+                }
+                assert!(!enabled(WINDOW) && !enabled(AREA) && !enabled(PAD_AREA));
+                assert_eq!(positions(), default_positions);
+                assert_eq!(bounds(START).top, start_top);
+                g.layout();
+                assert!(g.rect.right > g.rect.left, "Test area retains its canvas");
             });
             // Even when created with a sizable frame, the window becomes fixed.
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
@@ -2930,7 +3252,7 @@ mod tests {
                 GetModuleHandleW(null()),
                 null(),
             );
-            let mut g = Gui::new(hwnd).unwrap();
+            let mut g = Gui::new(hwnd, false).unwrap();
             g.refresh_devices();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
@@ -3079,7 +3401,8 @@ mod tests {
                 null(),
             );
             assert!(!hwnd.is_null());
-            let mut g = Gui::new(hwnd).unwrap();
+            let mut g = Gui::new(hwnd, true).unwrap();
+            assert!(!g.item(LOG_PATH).is_null());
             g.refresh_devices();
             assert!(!g.devices.is_empty(), "requires a local Precision Touchpad");
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
@@ -3135,7 +3458,7 @@ mod tests {
                 GUI.with(|slot| {
                     let mut slot = slot.borrow_mut();
                     let g = slot.as_mut().unwrap();
-                    SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
+                    select_start_mode(g, TakeoverMode::Toggle);
                 });
                 SendMessageW(hwnd, WM_COMMAND, START, 0);
                 GUI.with(|slot| assert!(!slot.borrow().as_ref().unwrap().controller.enabled));
@@ -3144,7 +3467,7 @@ mod tests {
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
-                SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
+                select_start_mode(g, TakeoverMode::Toggle);
             });
             SendMessageW(hwnd, WM_COMMAND, START, 0);
             GUI.with(|slot| {
@@ -3174,7 +3497,7 @@ mod tests {
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
-                SendMessageW(g.item(MODE), CB_SETCURSEL, 2, 0);
+                select_start_mode(g, TakeoverMode::Hold);
                 SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
                 SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
             });
@@ -3243,7 +3566,7 @@ mod tests {
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
-                SendMessageW(g.item(MODE), CB_SETCURSEL, 0, 0);
+                select_start_mode(g, TakeoverMode::Manual);
                 SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
                 SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             });

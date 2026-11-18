@@ -643,13 +643,20 @@ pub fn command(mode: &str) -> Result<Command> {
     Ok(cmd)
 }
 
-// Access only per-session directories inside this instance's artifacts root.
+pub fn recovery_root() -> Result<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("Local AppData is unavailable")?;
+    Ok(local.join("Pad2Touch").join("recovery"))
+}
+
+// The worker and watchdog accept only directories below the per-user recovery root.
 fn validate_directory(directory: &Path) -> Result<()> {
-    let allowed = std::env::current_dir().map_err(io_error)?.join("artifacts");
-    let allowed = fs::canonicalize(allowed).map_err(io_error)?;
+    let allowed = fs::canonicalize(recovery_root()?).map_err(io_error)?;
     let actual = fs::canonicalize(directory).map_err(io_error)?;
     if actual == allowed || !actual.starts_with(allowed) {
-        return Err("Gesture journal must be under Pad2Touch's artifacts directory".into());
+        return Err("Gesture journal must be under Pad2Touch's per-user recovery directory".into());
     }
     Ok(())
 }
@@ -965,6 +972,84 @@ pub fn run(mode: &str, args: &[OsString]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_recovers_from_local_appdata_without_working_directory_artifacts() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("pad2touch-recovery-{}", guid().unwrap()));
+        let launch = root.join("launch");
+        let appdata = root.join("local appdata");
+        let recovery = appdata.join("Pad2Touch/recovery");
+        let session = recovery.join("gui-test");
+        fs::create_dir_all(&launch).unwrap();
+        fs::create_dir_all(&session).unwrap();
+        let session = fs::canonicalize(session).unwrap();
+        let snapshot = Snapshot {
+            pad: None,
+            screen: Some(ScreenSnapshot {
+                runtime: 1,
+                preference: None,
+            }),
+        };
+        write_json(
+            &session.join("original.json"),
+            &snapshot.journal(guid().unwrap()),
+        )
+        .unwrap();
+        let pid = std::process::id().to_string();
+        let started = self_started().unwrap().to_string();
+        let run_watchdog = |directory: &Path| {
+            command("--gesture-watchdog")
+                .unwrap()
+                .current_dir(&launch)
+                .env("LOCALAPPDATA", &appdata)
+                .env(
+                    "PAD2TOUCH_TEST_GESTURE_ARGS",
+                    serde_json::to_string(&[
+                        directory.to_str().unwrap(),
+                        &pid,
+                        &started,
+                        &pid,
+                        &started,
+                    ])
+                    .unwrap(),
+                )
+                .output()
+                .unwrap()
+        };
+        // With no heartbeat or mutation marker, the watchdog completes dry recovery.
+        let result = run_watchdog(&session);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(restored(&session));
+        assert!(!launch.join("artifacts").exists());
+        for outside in [&launch, &recovery] {
+            let result = run_watchdog(outside);
+            assert!(!result.status.success());
+            let error = String::from_utf8_lossy(&result.stderr);
+            assert!(error.contains("per-user recovery directory"), "{error}");
+        }
+        for file in ["original.json", "watchdog-ready.json", "restored.json"] {
+            fs::remove_file(session.join(file)).unwrap();
+        }
+        for dir in [
+            session,
+            recovery,
+            appdata.join("Pad2Touch"),
+            appdata,
+            launch,
+            root,
+        ] {
+            fs::remove_dir(dir).unwrap();
+        }
+    }
+
     #[test]
     #[ignore = "internal child process entry point for native gesture integration tests"]
     fn child_process() {

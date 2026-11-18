@@ -6,7 +6,7 @@ Version 0.4.0 adds Phase 3 window and rectangle mapping to the native GUI. Appli
 
 Run `target\release\Pad2Touch.exe --gui`, run the executable without arguments, or use `scripts\Run-Pad2Touch.ps1 -Mode gui`. The wrapper defaults to GUI mode. The GUI detaches its console; CLI capture, probe, self-test, and offline verification retain their console behavior.
 
-The device list shows Precision Touchpad Raw Input collections with VID/PID. Refresh preserves the selected device path when present. Starting rediscovers and matches that path, so reordered indexes cannot silently change the selected source. Configuration is locked during capture and while shortcut activation is enabled. Stop/disarm first to change it. A disconnected or unsupported device produces a visible error.
+The device list shows Precision Touchpad Raw Input collections, numbered in discovery order. Diagnostics mode adds VID/PID. Refresh preserves the selected device path when present. Starting rediscovers and matches that path, so reordered indexes cannot silently change the selected source. Configuration is locked during capture and while shortcut activation is enabled. Stop/disarm first to change it. A disconnected or unsupported device produces a visible error.
 
 The application opens idle. Native injection is selected by default, but capture only starts after an explicit action. Clearing **Inject native touch input** selects raw-only capture; no received touch trails are expected then. The GUI always initializes the maximum supported capacity of five contacts; devices with fewer contacts still work. Click Start capture and use the pad directly: no preliminary touch-and-lift is required. The first complete, confident contact frame can begin injection, including contacts already present when capture starts. Errors, cancellation, and mapping changes retain their all-fingers-up recovery gate.
 
@@ -24,17 +24,17 @@ Toggle uses Ctrl+Alt+F8, F9, F10, or F11. If Windows rejects the chosen chord, P
 
 **Stop / disarm**, Esc while the GUI has focus, and global Ctrl+Alt+Esc all disarm activation and request cleanup. A fresh enable action is needed afterward. The emergency chord's registration result remains visible; if unavailable, use the button or focused-window Esc.
 
-Stop waits for the worker, then processes receiver messages for at least 300 ms before finalizing logs. Another session waits for that drain. Diagnostics and trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
+Stop waits for the worker, then processes receiver messages for at least 300 ms. Another session waits for that drain. Test area trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
 
 With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the Pad2Touch window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
 
 ## Diagnostics and system gestures
 
-The embedded receiver retains colored trails, two-contact distance scaling, parser/injection counters, lifecycle errors, gesture-controller state, and stop reasons. Controls sit outside the injectable rectangle. The interface uses system-drawn Win32 group boxes, combo boxes, check boxes, and buttons with the Windows theme and system dialog background. A back buffer presents completed diagnostic frames; native status text changes only when its value changes. Controls and the diagnostic header scale with DPI.
+**Test area** shows colored trails, active touches, and a two-finger scaling preview inside Pad2Touch. Controls sit outside the injectable rectangle. Settings and the preview scale with DPI.
 
-Each session writes `events.log` and `summary.txt` into a fresh `artifacts/gui-*` directory in the launch working directory. The GUI shows the location. Use `scripts\Analyze-Run.ps1` to audit native-injection runs afterward. Machine-specific logs remain local.
+Launch `Pad2Touch.exe --diagnostics` or run `scripts\Run-Pad2Touch.ps1 -Diagnostics` to show device geometry, report rate, capture counters, pointer IDs, and gesture-controller details. This also writes `events.log` and `summary.txt` into a fresh `artifacts/gui-*` directory per session and shows its path in the GUI. Use `scripts\Analyze-Run.ps1` to audit native-injection runs afterward. Normal GUI capture creates no `artifacts` directory. When a session uses a gesture override, the worker and watchdog keep their recovery files under `%LOCALAPPDATA%\Pad2Touch\recovery` in either mode.
 
-“Capture” or “takeover” does not promise exclusive device ownership. Native mouse movement, clicks, and scrolling remain active. **Windows system gestures** contains two independent check boxes, both selected by default: **Block touchpad system gestures** suppresses three-/four-finger touchpad swipes and taps, and **Block touchscreen system gestures** suppresses Windows' separate three-/four-finger touchscreen system actions while retaining application multitouch. Either can be used alone, both can be used together, or both can be cleared. The selections apply equally to injecting and raw-only sessions and are locked during capture. Foreground-only gesture ownership remains available through the CLI diagnostic option.
+“Capture” or “takeover” does not promise exclusive device ownership. Native mouse movement, clicks, and scrolling remain active. **Windows system gestures** contains two independent check boxes, both selected by default: **Block touchpad gestures** suppresses three-/four-finger touchpad swipes and taps, and **Block touchscreen gestures** suppresses Windows' separate three-/four-finger touchscreen system actions while retaining application multitouch. Either can be used alone, both can be used together, or both can be cleared. The selections apply equally to injecting and raw-only sessions and are locked during capture. Foreground-only gesture ownership remains available through the CLI diagnostic option.
 
 ## Background guard
 
@@ -54,7 +54,7 @@ The touchscreen SPI identifier was independently implemented from the first-pers
 
 ## Mapping targets (Phase 3)
 
-The **Screen area** group selects where touches go. It is kept short, like a pen-tablet panel: whole screen, portion of screen, a window, and a test area. The whole screen is the default.
+In **Mapping**, **Screen area** selects where touches go and **Touchpad area** selects how much of the touchpad is mapped. The whole screen is the default target.
 
 | Choice | Configure | Bounds | Hit test |
 |---|---|---|---|
@@ -64,13 +64,13 @@ The **Screen area** group selects where touches go. It is kept short, like a pen
 | Portion of screen… | **Select area…**, then drag on the dimmed desktop | Fixed physical virtual-desktop rectangle | None |
 | Application window | Choose a window from the list | Whole client area (title bar and borders excluded) | Target window or its child windows |
 | Application window, part | **Select part…**, drag inside its client area; **Whole window** resets | Normalized client-relative rectangle | Target window or its child windows |
-| Test area (inside Pad2Touch) | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
+| Test area | Nothing | Embedded receiver, fixed per session | Exactly the receiver |
 
 With a single monitor, the whole desktop and that monitor are the same area, so only one "Screen" entry is listed. The list is rebuilt when the display configuration changes. A selected monitor is matched by its display device name; if it disappears, the choice falls back to the first entry. Choosing another window resets a selected part. Full desktop requires a rectangular arrangement: if monitors of different sizes leave uncovered corners, it is rejected with an explanation (use a monitor or a portion instead).
 
 ### Mapping diagram
 
-For every choice except the test area, the right panel shows a mapping diagram below the diagnostic text, similar to pen-tablet control panels:
+For every choice except the test area, the right panel shows a centered mapping diagram that fits within 420 by 318 logical pixels. In diagnostics mode, the diagnostic text sits above it.
 
 - **Top:** each monitor drawn in its real arrangement and proportions, with a bezel, a stand under monitors on the bottom row, and a desktop thumbnail.
 - **Bottom:** the touchpad at its declared physical aspect. If the device geometry is unavailable, a 1.6 placeholder is shown and labeled as such. Unused parts of the touchpad are darker.
@@ -89,7 +89,7 @@ The **Touchpad area** list uses the mapping terms from [Wacom's documentation](h
 
 | Choice | Touchpad used | Screen area used | Shape | Needs physical geometry |
 |---|---|---|---|---|
-| Force proportions (default) | A centered part with the area's shape | All | Undistorted | Yes |
+| Force proportions (default) | The whole pad in Test area, a centered part for screen or window targets | Test area fits the pad, other targets use their full selected bounds | Undistorted | Yes |
 | Full | All | All | Scaled independently on X and Y | No |
 | Portion… | The area you draw on the touchpad diagram | All | Scaled independently on X and Y | No |
 
@@ -97,7 +97,7 @@ In **Force proportions** and **Portion…**, the mapping diagram shades the unus
 
 With **Force proportions**, resizing a window target recalculates the active part of the touchpad to match the new shape. For **Portion…**, click **Select pad area…** and drag on the touchpad diagram. You can use the selected portion with any screen target, including the test area.
 
-The used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
+In diagnostics mode, the used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
 
 ### Selection
 
@@ -119,7 +119,7 @@ The Foreground guard only applies while Pad2Touch itself is foreground, so it is
 
 ## Window layout and repainting
 
-The window has a fixed size: no sizing border and no maximize button (it can still be moved and minimized). The client area is 820 by 618 logical pixels, scaled using the monitor DPI and resized only when the DPI changes. The status field holds four lines (state plus three wrapped lines of detail). Non-client borders are calculated separately using AdjustWindowRectExForDpi. The settings column uses fixed compact rows. The diagnostics group, receiver, log field and stop hint are placed relative to the client bounds; controls are not vertically compressed.
+The window has a fixed size: no sizing border and no maximize button (it can still be moved and minimized). The client area is 820 by 528 logical pixels, or 820 by 556 in diagnostics mode to make room for the log path. The window scales with the monitor DPI. Non-client borders are calculated separately using AdjustWindowRectExForDpi. The toggle shortcut and window lists stay visible and are disabled when they do not apply. The preview group aligns with the top and bottom of the settings groups. A single row below it shows the capture state, relevant details, emergency stop hint, and capture buttons.
 
 Native labels, group boxes and read-only status fields use the system COLOR_BTNFACE brush through the control-color messages. Editable/selectable input surfaces retain their system theme.
 
@@ -131,9 +131,9 @@ During a session the live contact preview repaints when input arrives rather tha
 
 ## Physical shape and device information
 
-The diagnostic mapping rectangle uses the selected touchpad's declared physical X/Y dimensions, normalized with HID units and signed unit exponents. It fits centrally inside the available area with letterboxing and at most pixel-rounding error. Logical coordinate maxima alone are never used as a physical aspect ratio: X and Y coordinate densities can differ. Device selection, resize and movement refresh the preview; each injection session validates and retains the same physical aspect in its actual injection target. The physical-capture CLI receiver also preserves this aspect; synthetic API scenarios have no physical touchpad geometry.
+In **Test area** with **Force proportions**, the canvas is centered and sized to the selected touchpad's declared physical X/Y dimensions, normalized with HID units and signed unit exponents. Both the preview and the injection target use this rectangle, with at most pixel-rounding error. Logical coordinate maxima alone are never used as a physical aspect ratio, since X and Y coordinate densities can differ. The physical-capture CLI receiver also preserves this aspect. Synthetic API scenarios have no physical touchpad geometry.
 
-The HID descriptor's logical ranges, physical lengths, counts/mm, equivalent coordinate DPI and field bit widths are available from --probe. The GUI shows physical size, width/height, logical X/Y ranges and DPI in its existing diagnostic output, including before starting capture. These are declared effective sensor dimensions, which can differ from outer glass or vendor-reserved areas. Field bit width describes report storage, not guaranteed measurement accuracy.
+The HID descriptor's logical ranges, physical lengths, counts/mm, equivalent coordinate DPI and field bit widths are available from `--probe`. With `--diagnostics`, the GUI shows physical size, width/height, logical X/Y ranges and DPI even before starting capture. These are declared effective sensor dimensions, which can differ from outer glass or vendor-reserved areas. Field bit width describes report storage, not guaranteed measurement accuracy.
 
 If a device omits valid physical dimensions/length units or declares conflicting coordinate geometry, the GUI shows it as unavailable and does not invent an aspect. Raw-only capture remains available; native injection is blocked until valid physical geometry is available.
 

@@ -35,8 +35,8 @@ fn run() -> Result<(), String> {
         }
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.is_empty() || args == ["--gui"] {
-        return gui::run();
+    if let Some(diagnostics) = gui_diagnostics(&args) {
+        return gui::run(diagnostics);
     }
     if args == ["--gesture-support"] {
         println!(
@@ -63,7 +63,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args == ["--help"] {
-        println!("Pad2Touch (multitouch hardware validation pending)\n  --gui (default: integrated diagnostics, devices, manual / toggle / hold)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--background] [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--background starts raw-only capture minimized without requesting foreground.\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
+        println!("Pad2Touch (multitouch hardware validation pending)\n  --gui (default: devices, mapping, manual / toggle / hold)\n  --diagnostics (launch GUI with diagnostic details and session logs)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--background] [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--background starts raw-only capture minimized without requesting foreground.\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
         return Ok(());
     }
     if args == ["--probe"] {
@@ -71,6 +71,20 @@ fn run() -> Result<(), String> {
     }
     experiment::run(parse_options(&args)?)
 }
+fn gui_diagnostics(args: &[String]) -> Option<bool> {
+    match args {
+        [] => Some(false),
+        [arg] if arg == "--gui" => Some(false),
+        [arg] if arg == "--diagnostics" => Some(true),
+        [a, b]
+            if (a == "--gui" && b == "--diagnostics") || (a == "--diagnostics" && b == "--gui") =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,6 +153,22 @@ mod cli_tests {
     use super::*;
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn gui_diagnostics_requires_an_explicit_launch_flag() {
+        assert_eq!(gui_diagnostics(&[]), Some(false));
+        assert_eq!(gui_diagnostics(&args(&["--gui"])), Some(false));
+        for launch in [
+            &["--diagnostics"][..],
+            &["--gui", "--diagnostics"],
+            &["--diagnostics", "--gui"],
+        ] {
+            assert_eq!(gui_diagnostics(&args(launch)), Some(true));
+        }
+        assert_eq!(
+            gui_diagnostics(&args(&["--capture", "--diagnostics"])),
+            None
+        );
     }
     #[test]
     fn invalid_or_ambiguous_modes_rejected() {

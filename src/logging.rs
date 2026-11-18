@@ -11,17 +11,25 @@ use std::{
 };
 #[derive(Clone)]
 pub struct Log {
-    tx: SyncSender<String>,
+    tx: Option<SyncSender<String>>,
     pub dropped: Arc<AtomicU64>,
     start: Instant,
 }
 impl Log {
+    pub fn disabled() -> Self {
+        Self {
+            tx: None,
+            dropped: Arc::new(AtomicU64::new(0)),
+            start: Instant::now(),
+        }
+    }
+
     #[cfg(test)]
     pub fn memory() -> (Self, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::sync_channel(128);
         (
             Self {
-                tx,
+                tx: Some(tx),
                 dropped: Arc::new(AtomicU64::new(0)),
                 start: Instant::now(),
             },
@@ -47,7 +55,7 @@ impl Log {
         });
         Ok((
             Self {
-                tx,
+                tx: Some(tx),
                 dropped: Arc::new(AtomicU64::new(0)),
                 start: Instant::now(),
             },
@@ -55,8 +63,8 @@ impl Log {
         ))
     }
     pub fn event(&self, s: impl AsRef<str>) {
-        if self
-            .tx
+        let Some(tx) = &self.tx else { return };
+        if tx
             .try_send(format!(
                 "t_us={} {}",
                 self.start.elapsed().as_micros(),

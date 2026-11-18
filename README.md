@@ -13,15 +13,23 @@ Pad2Touch reads absolute finger positions from your touchpad through Windows Raw
 - Touchpad area modes: Force proportions, Full, and a user-selected Portion
 - A Wacom-style diagram shows your screens, the touchpad and the mapped region
 - Native GUI with device picker, Start/Stop, and global Toggle / Hold shortcuts
-- Built-in diagnostic view with per-finger trails and device info (size, DPI, report rate)
+- Built-in **Test area** with per-finger trails and a two-finger scaling preview
 - Separate touchpad and touchscreen system-gesture suppression while capturing, both enabled by default
 
 ## Requirements
 
-- Windows x64 with a Precision Touchpad
-- Rust (stable, MSVC toolchain) with Visual C++ build tools and a Windows SDK
+- Windows x64 (AMD64) or Windows ARM64 with a Precision Touchpad
+- To build from source, install stable Rust with the MSVC toolchain, Visual C++ build tools, and a Windows SDK for your architecture.
 
 ## Getting started
+
+### Download a build
+
+Open the latest successful [CI run for `main`](https://github.com/mouse233/pad2touch/actions/workflows/ci.yml?query=branch%3Amain+is%3Asuccess). Under **Artifacts**, choose `pad2touch-windows-x64-*` for x64 or `pad2touch-windows-arm64-*` for ARM64. Extract the ZIP and run `Pad2Touch.exe`. Each build is a single executable with the Visual C++ runtime linked statically. CI artifacts are available for seven days.
+
+### Build from source
+
+Run these commands with the native Rust MSVC toolchain for your Windows architecture.
 
 ```powershell
 cargo build --release --locked
@@ -31,6 +39,8 @@ cargo build --release --locked
 The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, then click **Start capture**. You can also enable Toggle (Ctrl+Alt+F8–F11) or Hold (Alt). The first valid touch is injected directly, with up to five simultaneous contacts and Windows touch feedback enabled by default. Selected system-gesture overrides last until capture stops, then restore the original settings.
 
 **Ctrl+Alt+Esc** stops capture from anywhere.
+
+Launch with `--diagnostics` to show detailed capture metrics and write session logs to `artifacts`. Gesture recovery files live under `%LOCALAPPDATA%\Pad2Touch\recovery`. See the [GUI guide](docs/gui.md#diagnostics-and-system-gestures).
 
 Command-line modes (probe, raw capture, self-test, …) are available through the helper script:
 
