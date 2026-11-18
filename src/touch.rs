@@ -103,16 +103,18 @@ pub struct Planner {
     armed: bool,
 }
 impl Planner {
-    pub fn new(limit: usize, rect: Rectangle) -> Result<Self, String> {
+    pub fn new(limit: usize, rect: Rectangle, input: NormRect) -> Result<Self, String> {
         if !(1..=5).contains(&limit) {
             return Err("contact capacity must be 1..=5".into());
         }
         Ok(Self {
             limit,
             rect: rect.validate()?,
-            input: NormRect::FULL,
+            input: input.validate()?,
             active: Contacts::new(),
-            armed: false,
+            // The first complete contact frame can start a touch lifetime.
+            // Cancellation and retargeting still require an empty frame.
+            armed: true,
         })
     }
     pub fn active_count(&self) -> usize {
@@ -331,9 +333,14 @@ pub struct Engine<T: Transport> {
     pub cleanup_pending: bool,
 }
 impl<T: Transport> Engine<T> {
-    pub fn new(limit: usize, rect: Rectangle, transport: T) -> Result<Self, String> {
+    pub fn new(
+        limit: usize,
+        rect: Rectangle,
+        input: NormRect,
+        transport: T,
+    ) -> Result<Self, String> {
         Ok(Self {
-            planner: Planner::new(limit, rect)?,
+            planner: Planner::new(limit, rect, input)?,
             transport,
             successes: 0,
             failures: 0,
@@ -481,6 +488,7 @@ pub mod tests {
                 right: 1101,
                 bottom: 1201,
             },
+            NormRect::FULL,
             Fake::default(),
         )
         .unwrap()
@@ -497,16 +505,17 @@ pub mod tests {
             .collect()
     }
     #[test]
-    fn startup_waits_for_all_physical_tips_even_low_confidence() {
+    fn startup_accepts_first_contact_without_an_empty_frame() {
         let mut e = engine(5);
+        assert!(e.is_armed());
         let mut palm = contact(8, 0, 0);
         palm.confidence = false;
         e.apply(&[palm]).unwrap();
-        assert!(!e.is_armed());
-        e.apply(&[]).unwrap();
         assert!(e.is_armed());
+        assert_eq!(e.active_count(), 0);
         e.apply(&[contact(9, 0, 0)]).unwrap();
         assert_eq!(e.active_count(), 1);
+        assert_eq!(ids(&e.transport.accepted[0]), vec![(9, 0, Action::Down)]);
     }
     #[test]
     fn five_downs_are_one_atomic_frame() {
@@ -770,6 +779,7 @@ pub mod tests {
                 right: 100,
                 bottom: 100
             },
+            NormRect::FULL,
             Fake::default()
         )
         .is_err());
@@ -781,6 +791,7 @@ pub mod tests {
                 right: i32::MAX,
                 bottom: 1
             },
+            NormRect::FULL,
             Fake::default()
         )
         .is_err());
@@ -840,6 +851,7 @@ pub mod tests {
                     right: 501,
                     bottom: 1101,
                 },
+                NormRect::FULL,
                 Model {
                     limit,
                     state: BTreeMap::new(),

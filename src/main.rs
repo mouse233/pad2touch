@@ -5,6 +5,8 @@ mod decode;
 mod device_info;
 mod diagram;
 mod experiment;
+mod gesture_backend;
+mod gesture_cache;
 mod gestures;
 mod gui;
 mod hid;
@@ -26,6 +28,12 @@ fn main() {
     }
 }
 fn run() -> Result<(), String> {
+    let mut native_args = std::env::args_os().skip(1);
+    if let Some(mode) = native_args.next() {
+        if let Some(mode @ ("--gesture-worker" | "--gesture-watchdog")) = mode.to_str() {
+            return gesture_backend::run(mode, &native_args.collect::<Vec<_>>());
+        }
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--gui"] {
         return gui::run();

@@ -10,11 +10,11 @@ PadBridge reads absolute finger positions from your touchpad through Windows Raw
 
 - Up to 5 simultaneous contacts, delivered as real `PT_TOUCH` events (not mouse emulation)
 - Map the touchpad to the whole screen, a monitor, a dragged portion of the screen, or an application window (optionally just part of it) — window mappings follow the window as it moves or resizes
-- Touchpad area modes for when shapes differ: keep the pad's shape, stretch it, or use part of the pad to fill the area
+- Touchpad area modes: Force proportions, Full, and a user-selected Portion
 - A Wacom-style diagram shows your screens, the touchpad and the mapped region
 - Native GUI with device picker, Start/Stop, and global Toggle / Hold shortcuts
 - Built-in diagnostic view with per-finger trails and device info (size, DPI, report rate)
-- Optional suppression of Windows' three-/four-finger touchpad gestures while capturing
+- Separate touchpad and touchscreen system-gesture suppression while capturing, both enabled by default
 
 ## Requirements
 
@@ -28,7 +28,7 @@ cargo build --release --locked
 .\target\release\padbridge-phase0.exe
 ```
 
-The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, then click **Start capture** (or enable a shortcut, Ctrl+Alt+F8 – F11). Touch the pad and lift all fingers once to arm injection.
+The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, then click **Start capture**. You can also enable Toggle (Ctrl+Alt+F8–F11) or Hold (Alt). The first valid touch is injected directly, with up to five simultaneous contacts and Windows touch feedback enabled by default. Selected system-gesture overrides last until capture stops, then restore the original settings.
 
 **Ctrl+Alt+Esc** stops capture from anywhere.
 

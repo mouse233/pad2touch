@@ -1,262 +1,249 @@
-//! GUI adapter around the validated bounded PowerShell transaction and watchdog.
-//! Assets and journals remain on disk so recovery survives the GUI process.
-use crate::{experiment::Shared, logging::Log};
+//! Asynchronous GUI adapter for the native gesture worker and its watchdog.
+use crate::{
+    experiment::Shared,
+    gesture_backend::{self, restored, Request, Scope},
+    logging::Log,
+};
 use std::{
     fs,
-    os::windows::process::CommandExt,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{
-    Foundation::FILETIME,
-    System::Threading::{GetCurrentProcess, GetProcessTimes},
-};
+
+/// The GUI may keep an idle worker while Hold is enabled. Its input pipe
+/// closes when the last handle is dropped. An active session keeps a handle
+/// until capture stops and settings have been restored.
+#[derive(Clone)]
+pub struct Backend(Arc<Mutex<Child>>);
+impl Backend {
+    pub fn spawn(prewarm_touchpad: bool) -> Result<Self, String> {
+        let mut command = gesture_backend::command("--gesture-worker")?;
+        let args = [
+            std::process::id().to_string(),
+            gesture_backend::self_started()?.to_string(),
+            prewarm_touchpad.to_string(),
+        ];
+        #[cfg(test)]
+        command.env(
+            "PADBRIDGE_TEST_GESTURE_ARGS",
+            serde_json::to_string(&args).map_err(|e| e.to_string())?,
+        );
+        #[cfg(not(test))]
+        command.args(args);
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not start the native gesture worker: {e}"))?;
+        Ok(Self(Arc::new(Mutex::new(child))))
+    }
+
+    fn running(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .try_wait()
+            .is_ok_and(|status| status.is_none())
+    }
+
+    fn start(&self, request: &Request) -> Result<(), String> {
+        let mut message = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+        message.push(b'\n');
+        let mut child = self.0.lock().unwrap();
+        let input = child
+            .stdin
+            .as_mut()
+            .ok_or("Gesture worker input is unavailable")?;
+        input.write_all(&message).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    fn kill_for_test(&self) {
+        let mut child = self.0.lock().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
 
 pub struct Guard {
-    child: Child,
+    backend: Backend,
     directory: PathBuf,
     monitor_stop: Arc<AtomicBool>,
     monitor: Option<JoinHandle<()>>,
     shared: Shared,
     log: Log,
 }
+
 fn signal_stop(directory: &Path) -> Result<(), String> {
-    fs::write(directory.join("stop-requested.json"), "{\"stop\":true}").map_err(|e| e.to_string())
+    fs::write(directory.join("stop-requested.json"), "{}").map_err(|e| e.to_string())
 }
-fn restored(directory: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(directory.join("restored.json")) else {
-        return false;
-    };
-    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    compact.contains("\"restored\":true")
-        && (!directory.join("touchscreen-required.json").exists()
-            || compact.contains("\"touchscreen_exact\":true")
-            || (compact.contains("\"no_mutation\":true")
-                && !directory.join("mutation-started.json").exists()))
-        && ((compact.contains("\"no_mutation\":true")
-            && !directory.join("mutation-started.json").exists())
-            || (compact.contains("\"registry_exact\":true")
-                && compact.contains("\"cache_exact\":true")))
+
+fn finish_error(directory: &Path) -> Option<String> {
+    let finished = fs::read(directory.join("finished.json")).ok()?;
+    let record: serde_json::Value = serde_json::from_slice(&finished).ok()?;
+    record["error"].as_str().map(str::to_owned)
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.monitor_stop.store(true, Ordering::Relaxed);
-        if let Some(monitor) = self.monitor.take() {
-            let _ = monitor.join();
-        }
-        if self.directory.exists() {
-            let _ = signal_stop(&self.directory);
-        }
-        if self.child.try_wait().ok().flatten().is_none() {
+        self.stop_monitor();
+        let _ = signal_stop(&self.directory);
+        if self.directory.join("mutation-started.json").exists() && !restored(&self.directory) {
             self.shared.lock().unwrap().recovery_pending = true;
         }
     }
 }
-fn owner_start_filetime() -> Result<u64, String> {
-    let mut created = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    if unsafe {
-        GetProcessTimes(
-            GetCurrentProcess(),
-            &mut created,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-    } == 0
-    {
-        return Err(crate::hid::winerr("GetProcessTimes(GUI owner)"));
-    }
-    Ok((created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64)
-}
+
 impl Guard {
     pub fn acquire(
         out: &Path,
         shared: Shared,
         log: Log,
         stop: Arc<AtomicBool>,
-        suppress_touchscreen: bool,
+        scope: Scope,
+        prewarmed: Option<Backend>,
     ) -> Result<Option<Self>, String> {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || !scope.any() {
             return Ok(None);
         }
-        let root = std::env::current_dir()
+        let directory = std::env::current_dir()
             .map_err(|e| e.to_string())?
             .join(out)
-            .join("gesture-backend");
-        let scripts = root.join("experiments");
-        let artifacts = root.join("artifacts");
-        fs::create_dir_all(&scripts)
-            .and_then(|_| fs::create_dir_all(&artifacts))
-            .map_err(|e| e.to_string())?;
-        let script = scripts.join("Test-BackgroundGestureSettings.ps1");
-        fs::write(
-            &script,
-            include_str!("../experiments/Test-BackgroundGestureSettings.ps1"),
-        )
-        .map_err(|e| e.to_string())?;
-        fs::write(
-            artifacts.join("gesture-cache-probe.exe"),
-            include_bytes!(concat!(env!("OUT_DIR"), "/gesture-cache-probe.exe")),
-        )
-        .map_err(|e| e.to_string())?;
-        let directory = artifacts.join("session");
-        let ps7 = PathBuf::from(
-            std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()),
-        )
-        .join("PowerShell/7/pwsh.exe");
-        let shell = if ps7.exists() {
-            ps7
-        } else {
-            PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
-                .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+            .join("gesture-backend/artifacts/session");
+        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let (backend, warm) = match prewarmed.filter(Backend::running) {
+            Some(backend) => (backend, true),
+            None => (Backend::spawn(false)?, false),
         };
-        let stdout = fs::File::create(root.join("stdout.txt")).map_err(|e| e.to_string())?;
-        let stderr = fs::File::create(root.join("stderr.txt")).map_err(|e| e.to_string())?;
-        let mut command = Command::new(shell);
-        command
-            .args(["-NoProfile", "-NonInteractive", "-File"])
-            .arg(&script)
-            .args([
-                "-Mode",
-                "session",
-                "-ExpectedBuild",
-                "26300",
-                "-Seconds",
-                "120",
-                "-RunDirectory",
-            ])
-            .arg(&directory)
-            .arg("-OwnerPid")
-            .arg(std::process::id().to_string())
-            .arg("-OwnerStartedFileTime")
-            .arg(owner_start_filetime()?.to_string())
-            .current_dir(&root)
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr);
-        if suppress_touchscreen {
-            command.arg("-SuppressTouchscreen");
-        }
-        let child = command
-            .spawn()
-            .map_err(|e| format!("Could not start background gesture guard: {e}"))?;
-        shared.lock().unwrap().guard_status =
-            "Preparing background guard and recovery watchdog...".into();
-        log.event("BACKGROUND_GUARD preparing bounded_seconds=120 scope=current-user");
         let mut guard = Self {
-            child,
+            backend,
             directory,
             monitor_stop: Arc::new(AtomicBool::new(false)),
             monitor: None,
             shared,
             log,
         };
+        guard.log.event(format!(
+            "BACKGROUND_GUARD preparing native=true prewarmed={warm} touchpad={} touchscreen={}",
+            scope.touchpad, scope.touchscreen
+        ));
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        guard.backend.start(&Request {
+            directory: guard.directory.clone(),
+            scope,
+        })?;
         let start = Instant::now();
         loop {
             if stop.load(Ordering::Relaxed) {
-                // A directory created before the script starts makes it refuse mutation.
-                fs::create_dir_all(&guard.directory).map_err(|e| e.to_string())?;
                 guard.release()?;
                 return Ok(None);
             }
-            if guard.directory.join("active.json").exists()
-                && !guard.directory.join("restored.json").exists()
-            {
-                guard.shared.lock().unwrap().guard_status = if suppress_touchscreen {
-                    "Background guard ACTIVE: touchpad + touchscreen (120 s maximum)".into()
-                } else {
-                    "Background guard ACTIVE (120 s maximum)".into()
+            if guard.directory.join("finished.json").exists() || !guard.backend.running() {
+                let reason = finish_error(&guard.directory)
+                    .unwrap_or_else(|| "Gesture worker ended before capture started".into());
+                let _ = guard.release();
+                return Err(reason);
+            }
+            if guard.directory.join("active.json").exists() && !restored(&guard.directory) {
+                let label = match scope {
+                    Scope {
+                        touchpad: true,
+                        touchscreen: true,
+                    } => "touchpad + touchscreen",
+                    Scope {
+                        touchpad: true,
+                        touchscreen: false,
+                    } => "touchpad",
+                    _ => "touchscreen",
                 };
+                guard.shared.lock().unwrap().guard_status =
+                    format!("Background guard ACTIVE: {label}");
                 guard.log.event(format!(
-                    "BACKGROUND_GUARD active=true touchscreen={suppress_touchscreen}"
+                    "BACKGROUND_GUARD active=true activation_ms={}",
+                    start.elapsed().as_millis()
                 ));
-                let directory = guard.directory.clone();
-                let shared = guard.shared.clone();
-                let log = guard.log.clone();
-                let shutdown = guard.monitor_stop.clone();
-                guard.monitor = Some(thread::spawn(move || {
-                    let started = Instant::now();
-                    while !shutdown.load(Ordering::Relaxed) {
-                        let failed = directory.join("failed.json").exists();
-                        if failed
-                            || directory.join("expired.json").exists()
-                            || directory.join("restored.json").exists()
-                            || started.elapsed() >= Duration::from_secs(120)
-                        {
-                            let mut s = shared.lock().unwrap();
-                            s.stop_reason = if failed {
-                                "Background gesture guard verification failed; see guard logs"
-                                    .into()
-                            } else {
-                                "Background guard ended or reached its 120 s limit".into()
-                            };
-                            s.guard_status =
-                                "Stopping capture before restoring Windows gestures...".into();
-                            drop(s);
-                            log.event("BACKGROUND_GUARD safety_stop=true");
-                            if failed {
-                                log.event(format!(
-                                    "BACKGROUND_GUARD verification_failed {}",
-                                    fs::read_to_string(directory.join("failed.json"))
-                                        .unwrap_or_default()
-                                ));
-                            }
-                            stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(40));
-                    }
-                }));
+                guard.start_monitor(stop);
                 return Ok(Some(guard));
             }
-            if let Some(status) = guard.child.try_wait().map_err(|e| e.to_string())? {
-                let error = fs::read_to_string(root.join("stderr.txt")).unwrap_or_default();
-                let pending = guard.directory.join("mutation-started.json").exists()
-                    && !restored(&guard.directory);
-                guard.shared.lock().unwrap().recovery_pending = pending;
-                return Err(format!(
-                    "Background guard did not activate ({status}). {}",
-                    error.chars().take(1200).collect::<String>()
-                ));
-            }
-            if start.elapsed() > Duration::from_secs(20) {
-                fs::create_dir_all(&guard.directory).map_err(|e| e.to_string())?;
+            if start.elapsed() > Duration::from_secs(12) {
                 guard.release()?;
                 return Err(
-                    "Background gesture guard startup timed out; capture did not start.".into(),
+                    "Native gesture worker startup timed out; capture did not start.".into(),
                 );
             }
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(8));
         }
     }
-    pub fn release(mut self) -> Result<(), String> {
+
+    fn start_monitor(&mut self, stop: Arc<AtomicBool>) {
+        let directory = self.directory.clone();
+        let shared = self.shared.clone();
+        let log = self.log.clone();
+        let backend = self.backend.clone();
+        let shutdown = self.monitor_stop.clone();
+        self.monitor = Some(thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let stale = fs::metadata(directory.join("heartbeat.json"))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .is_none_or(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(20)));
+                let failed = directory.join("failed.json");
+                let reason = if failed.exists() {
+                    Some("Background gesture settings changed or verification failed")
+                } else if stale {
+                    Some("Background gesture worker stopped responding")
+                } else if directory.join("restored.json").exists() || !backend.running() {
+                    Some("Background gesture worker ended unexpectedly")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    let mut s = shared.lock().unwrap();
+                    s.stop_reason = reason.into();
+                    s.guard_status = "Stopping capture before restoring Windows gestures...".into();
+                    drop(s);
+                    log.event(format!(
+                        "BACKGROUND_GUARD safety_stop=true reason={reason} {}",
+                        fs::read_to_string(failed).unwrap_or_default()
+                    ));
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }));
+    }
+
+    fn stop_monitor(&mut self) {
         self.monitor_stop.store(true, Ordering::Relaxed);
         if let Some(monitor) = self.monitor.take() {
             let _ = monitor.join();
         }
+    }
+
+    pub fn release(mut self) -> Result<(), String> {
+        self.stop_monitor();
         self.shared.lock().unwrap().guard_status = "Restoring Windows gesture settings...".into();
         signal_stop(&self.directory)?;
         let start = Instant::now();
         loop {
-            if self.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            if self.directory.join("finished.json").exists() || !self.backend.running() {
                 let changed = self.directory.join("mutation-started.json").exists();
                 if !changed || restored(&self.directory) {
                     self.shared.lock().unwrap().guard_status = "Windows gestures restored".into();
                     self.log.event("BACKGROUND_GUARD restored=true");
-                    return Ok(());
+                    return finish_error(&self.directory).map_or(Ok(()), Err);
                 }
-                // The independent watchdog may still be completing restoration.
             }
             if start.elapsed() > Duration::from_secs(15) {
                 self.shared.lock().unwrap().recovery_pending = true;
@@ -266,7 +253,7 @@ impl Guard {
                     self.directory.join("original.json").display()
                 ));
             }
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(16));
         }
     }
 }
@@ -318,7 +305,11 @@ mod tests {
             shared.clone(),
             log.clone(),
             Arc::new(AtomicBool::new(false)),
-            true,
+            Scope {
+                touchpad: true,
+                touchscreen: true,
+            },
+            None,
         )
         .unwrap()
         .unwrap();
@@ -340,6 +331,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "changes gesture preferences temporarily, tests both independent scopes and runs beyond the old timeout"]
+    fn native_background_guard_unlimited_and_independent_scopes() {
+        let prewarmed = Backend::spawn(true).unwrap();
+        for (touchpad, touchscreen) in [(true, false), (false, true), (true, true)] {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let out = PathBuf::from(format!("artifacts/gui-guard-unlimited-{stamp}"));
+            let (log, writer) = Log::open(&out).unwrap();
+            let shared = Arc::new(Mutex::new(crate::experiment::Stats::default()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let guard = Guard::acquire(
+                &out,
+                shared.clone(),
+                log.clone(),
+                stop.clone(),
+                Scope {
+                    touchpad,
+                    touchscreen,
+                },
+                Some(prewarmed.clone()),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(Arc::ptr_eq(&guard.backend.0, &prewarmed.0));
+            let directory = guard.directory.clone();
+            let journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.join("original.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                journal["preferences"].as_array().unwrap().len(),
+                if touchpad { 4 } else { 0 }
+            );
+            assert_eq!(!journal["touchscreen"].is_null(), touchscreen);
+            assert_eq!(
+                directory.join("touchscreen-mutation-started.json").exists(),
+                touchscreen
+            );
+            thread::sleep(if touchpad && touchscreen {
+                Duration::from_secs(125)
+            } else {
+                Duration::from_millis(1500)
+            });
+            assert!(
+                !stop.load(Ordering::Relaxed),
+                "{}",
+                shared.lock().unwrap().stop_reason
+            );
+            assert!(!directory.join("restored.json").exists());
+            guard.release().unwrap();
+            assert!(restored(&directory));
+            assert!(!shared.lock().unwrap().recovery_pending);
+            drop(log);
+            writer.join().unwrap().unwrap();
+        }
+        assert!(prewarmed.running());
+    }
+
+    #[test]
     #[ignore = "temporarily changes gesture preferences and kills only its own backend to verify independent watchdog restoration"]
     fn native_background_guard_watchdog_restores_touchscreen() {
         let stamp = std::time::SystemTime::now()
@@ -349,19 +400,22 @@ mod tests {
         let out = PathBuf::from(format!("artifacts/gui-guard-watchdog-test-{stamp}"));
         let (log, writer) = Log::open(&out).unwrap();
         let shared = Arc::new(std::sync::Mutex::new(crate::experiment::Stats::default()));
-        let mut guard = Guard::acquire(
+        let guard = Guard::acquire(
             &out,
             shared.clone(),
             log.clone(),
             Arc::new(AtomicBool::new(false)),
-            true,
+            Scope {
+                touchpad: true,
+                touchscreen: true,
+            },
+            Some(Backend::spawn(true).unwrap()),
         )
         .unwrap()
         .unwrap();
         // Terminate only the transaction process we just created. The separate
         // watchdog must restore both settings paths without that process.
-        guard.child.kill().unwrap();
-        guard.child.wait().unwrap();
+        guard.backend.kill_for_test();
         guard.release().unwrap();
         let directory = out.join("gesture-backend/artifacts/session");
         assert!(directory.join("touchscreen-mutation-started.json").exists());

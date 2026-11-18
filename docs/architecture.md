@@ -77,7 +77,7 @@ Mapping uses the descriptor's logical ranges, normalization, `(length - 1)`, rou
 
 ## Native injection and recovery
 
-The transport initializes `InitializeTouchInjection(capacity, TOUCH_FEEDBACK_NONE)` and submits a POINTER_TOUCH_INFO array once per planned frame. Slot IDs remain inside the initialized capacity. Pressure, orientation, contact area, and custom timestamps are left unspecified.
+The transport initializes `InitializeTouchInjection` with the session capacity and selected feedback mode, then submits a POINTER_TOUCH_INFO array once per planned frame. GUI sessions always use capacity five and default to `TOUCH_FEEDBACK_DEFAULT`; CLI diagnostics retain configurable capacity and no feedback. The initial planner is ready to inject the first valid contact frame without a prior empty report; cancellation, errors, and retargeting still disarm until all physical contacts lift. Slot IDs remain inside the initialized capacity. Pressure, orientation, contact area, and custom timestamps are left unspecified.
 
 | Action | Flags |
 |---|---|

@@ -8,9 +8,9 @@ Run `target\release\padbridge-phase0.exe --gui`, run the executable without argu
 
 The device list shows Precision Touchpad Raw Input collections with VID/PID. Refresh preserves the selected device path when present. Starting rediscovers and matches that path, so reordered indexes cannot silently change the selected source. Configuration is locked during capture and while shortcut activation is enabled. Stop/disarm first to change it. A disconnected or unsupported device produces a visible error.
 
-The application opens idle. Native injection is selected by default, but capture only starts after an explicit action. Clearing **Inject native touch input** selects raw-only capture; no received touch trails are expected then. Contact capacity ranges from one to five, limited by the actual device.
+The application opens idle. Native injection is selected by default, but capture only starts after an explicit action. Clearing **Inject native touch input** selects raw-only capture; no received touch trails are expected then. The GUI always initializes the maximum supported capacity of five contacts; devices with fewer contacts still work. Click Start capture and use the pad directly: no preliminary touch-and-lift is required. The first complete, confident contact frame can begin injection, including contacts already present when capture starts. Errors, cancellation, and mapping changes retain their all-fingers-up recovery gate.
 
-**Show Windows touch feedback** (off by default, available only with injection) makes Windows draw its standard touch visuals at the injected contacts. It initializes injection with `TOUCH_FEEDBACK_DEFAULT` instead of `TOUCH_FEEDBACK_NONE`, so the system **Touch indicator** setting still decides whether the visuals appear. The mode is fixed when a session starts; change it between sessions.
+**Show Windows touch feedback** (on by default, available only with injection) makes Windows draw its standard touch visuals at the injected contacts. It initializes injection with `TOUCH_FEEDBACK_DEFAULT` instead of `TOUCH_FEEDBACK_NONE`, so the system **Touch indicator** setting still decides whether the visuals appear. The mode is fixed when a session starts; change it between sessions.
 
 ## Capture controls
 
@@ -18,9 +18,9 @@ The application opens idle. Native injection is selected by default, but capture
 |---|---|---|
 | Manual start / stop | Click **Start capture**. | **Stop / disarm** stops the session. |
 | Toggle with shortcut | Click **Enable shortcut**, then press the selected global chord. | Press again to stop; the chord remains enabled for another session. |
-| Hold shortcut to capture | Click **Enable shortcut**, then hold the selected chord. | Releasing any chord key requests stop. A new press can start a subsequent session. |
+| Hold Alt to capture | Click **Enable shortcut**, then press and hold Alt. | Release Alt to stop. Press Alt again to start another session. |
 
-Chords are Ctrl+Alt+F8, F9, F10, or F11. Registration uses `RegisterHotKey` with `MOD_NOREPEAT`; an occupied or rejected chord fails visibly and does not arm capture. Hold release samples only the configured chord's current states at approximately 30 ms intervals. It does not record arbitrary keyboard input. A late notification for a released chord cannot start capture. This timing is not a real-time guarantee.
+Toggle uses Ctrl+Alt+F8, F9, F10, or F11. If Windows rejects the chosen chord, PadBridge shows an error before arming. Hold samples Windows' Alt key state at approximately 30 ms intervals and leaves the key available to Windows and other apps. If Alt is already down when you enable Hold, release it and press again.
 
 **Stop / disarm**, Esc while the GUI has focus, and global Ctrl+Alt+Esc all disarm activation and request cleanup. A fresh enable action is needed afterward. The emergency chord's registration result remains visible; if unavailable, use the button or focused-window Esc.
 
@@ -34,19 +34,19 @@ The embedded receiver retains colored trails, two-contact distance scaling, pars
 
 Each session writes `events.log` and `summary.txt` into a fresh `artifacts/gui-*` directory in the launch working directory. The GUI shows the location. Use `scripts\Analyze-Run.ps1` to audit native-injection runs afterward. Machine-specific logs remain local.
 
-“Capture” or “takeover” does not promise exclusive device ownership. Native mouse movement, clicks, and scrolling remain active. The Windows system gestures selector offers Keep system gestures, Foreground guard, and Background guard (experimental). Foreground guard uses the existing foreground-only controller; switching to another application makes it ineligible. Background guard explicitly applies the validated settings-cache transaction described below. Injected touchscreen gestures remain a separate compatibility boundary.
+“Capture” or “takeover” does not promise exclusive device ownership. Native mouse movement, clicks, and scrolling remain active. **Windows system gestures** contains two independent check boxes, both selected by default: **Block touchpad system gestures** suppresses three-/four-finger touchpad swipes and taps, and **Block touchscreen system gestures** suppresses Windows' separate three-/four-finger touchscreen system actions while retaining application multitouch. Either can be used alone, both can be used together, or both can be cleared. The selections apply equally to injecting and raw-only sessions and are locked during capture. Foreground-only gesture ownership remains available through the CLI diagnostic option.
 
 ## Background guard
 
-Background guard temporarily changes four current-user three-/four-finger gesture preferences and refreshes the settings cache. It is an explicit option, off by default, and currently accepts only the validated Windows build 26300.9974. Each activation is bounded to 120 seconds. Expiry stops capture and disarms activation; start again explicitly for another interval.
+The touchpad check box temporarily changes four current-user three-/four-finger gesture preferences and refreshes the settings cache. The touchscreen check box controls the separate live touchscreen state. These overrides currently accept only the validated Windows build 26300.9974. GUI sessions have no fixed duration: selected overrides remain active until capture stops. The standalone experiment's apply mode remains bounded for diagnostic use.
 
 The diagnostic guard line displays the selected background guard's lifecycle independently of foreground controller ownership. During a session, the backend checks the four owned registry values and cached assignments once per second. Cache drift triggers a precise refresh only while all four registry values remain the session's disabled DWORDs. External preference changes, failed verification, or watchdog exit stop capture and trigger restoration; they are recorded in the session's `failed.json` and guard logs. These checks verify settings, not physical suppression or injected touchscreen gestures.
 
-The existing transaction script and independently implemented native cache helper are embedded in the executable. The build compiles that helper; runtime extracts assets and durable recovery journals under the session's local output directory. There is no need to install a separate helper or change PowerShell execution policy. The installed PowerShell runtime must permit local scripts.
+The executable provides both the native gesture worker and the independent recovery process. Manual and Toggle sessions start the worker on demand. Enabling Hold prepares a worker for reuse when a gesture override is selected. The worker stays idle until a capture request and snapshots the current settings for each session. Disarming releases the idle worker.
 
-The input worker starts only after the settings snapshot, independent watchdog, four writes, cache notifications, and readback succeed. On stop, it releases touch contacts before requesting restoration. GUI close waits for verified restoration and log finalization. Unverified recovery blocks further sessions. The script tracks the GUI's process identity; its separate watchdog also covers failure of the transaction process. Recovery assets are retained on disk, with the existing per-user lease excluding overlapping transactions.
+The input worker starts after the settings snapshot is saved, the independent watchdog is ready, and the requested overrides pass readback. On stop, it releases touch contacts before requesting restoration. GUI close waits for verified restoration and log finalization. Unverified recovery blocks further sessions. The watchdog tracks the GUI and worker identities and can restore the snapshot if either process exits. A stalled worker triggers recovery after 30 seconds without progress. The GUI also stops capture if the worker becomes unresponsive. The snapshot stays on disk, and the per-user lease excludes overlapping transactions.
 
-When Background guard is selected with native touch injection, it also disables Windows' separate three-/four-finger touchscreen system gestures before injection starts. The diagnostic line reads `ACTIVE (pad + screen)`. Applications still receive the injected multi-contact stream. Raw-only sessions change only the touchpad preferences. The touchscreen override uses the build-bound, undocumented `SystemParametersInfoW` actions `0x2030` (read) and `0x2031` (write), with flags zero to avoid persisting `HKCU\Control Panel\Desktop\TouchGestureSetting`. The journal records both original live state and the exact presence/type/bytes of that preference. Normal stop, expiry, and the independent watchdog restore the original live state and verify the persistent value was unchanged. External changes are retained and reported for recovery review. The 120-second limit covers both overrides.
+When both check boxes are selected, the diagnostic line reads `ACTIVE (pad + screen)`; touchscreen-only reads `ACTIVE (screen)`. Applications still receive the injected multi-contact stream. Touchscreen-only sessions do not read, change, refresh, or restore touchpad preferences. The touchscreen override uses the build-bound, undocumented `SystemParametersInfoW` actions `0x2030` (read) and `0x2031` (write), with flags zero to avoid persisting `HKCU\Control Panel\Desktop\TouchGestureSetting`. The journal records both original live state and the exact presence/type/bytes of that preference. Normal stop and the independent watchdog restore the original live state and verify the persistent value was unchanged. External changes are retained and reported for recovery review.
 
 The option changes user-wide settings during its interval; native pointer movement remains active. On build 26300.9974, native tests verified the combined live override and exact restoration, three-/four-/five-contact injected downward swipes reaching a separate helper window with balanced DOWN/UP events and no foreground loss or minimization, and independent watchdog restoration after terminating only the transaction backend. Physical touchpad acceptance across gesture directions remains a separate manual check. There is no startup recovery service and no guarantee against machine shutdown or killing all recovery processes.
 
@@ -73,27 +73,27 @@ With a single monitor, the whole desktop and that monitor are the same area, so 
 For every choice except the test area, the right panel shows a mapping diagram below the diagnostic text, similar to pen-tablet control panels:
 
 - **Top:** each monitor drawn in its real arrangement and proportions, with a bezel, a stand under monitors on the bottom row, and a desktop thumbnail.
-- **Bottom:** the touchpad at its declared physical aspect. If the device geometry is unavailable, a 1.6 placeholder is shown and labeled as such. In fill-area mode the unused part of the touchpad is darker.
-- **Red:** the mapped region on the screens (the bounds a session would use), the used part of the touchpad, and four connectors between their corners. In keep-shape mode a thin gray frame shows the selected area, so its unreachable margins are visible.
+- **Bottom:** the touchpad at its declared physical aspect. If the device geometry is unavailable, a 1.6 placeholder is shown and labeled as such. Unused parts of the touchpad are darker.
+- **Red:** the mapped region on the screens, the active part of the touchpad, and four connectors between their corners.
 - **During capture:** each live finger is drawn as a colored dot on the touchpad and, when it is inside the used part, at its mapped position on the screen.
 
 While idle, the region is re-resolved every 250 ms, so moving a target window updates the diagram. During a session the diagram shows the session's current bounds, including retargets. If the target is not configured or not available, the diagram shows the reason instead of a region. The thumbnail is drawn only in this panel; it is never logged or written to disk.
 
-The thumbnail is captured on demand rather than continuously: when the screen area or window selection changes, after an area selection, when the display configuration changes, and when PadBridge is activated again. Reading the composed desktop back from Windows takes about 33 ms (about 7 ms of CPU) on the GUI thread, so periodic capture would make the window hitch; ordinary repaints reuse the existing image at about 0.07 ms per repaint. No capture happens during a session. The image can therefore be slightly out of date, and switching back to PadBridge refreshes it.
+The desktop thumbnail refreshes once per second while the PadBridge main window is active in the foreground and shows the mapping diagram. It pauses when another window takes focus, when PadBridge is minimized, or while an area is being selected. A worker reads the desktop so the GUI can repaint and respond to input independently.
 
 The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. PadBridge's own windows cannot be application targets. Selections are not persisted across launches.
 
 ### Touchpad area
 
-The **Touchpad** list decides what happens when the touchpad's physical shape differs from the screen area's shape:
+The **Touchpad area** list uses the mapping terms from [Wacom's documentation](https://101.wacom.com/userhelp/en/ForceProportions_Full.htm).
 
 | Choice | Touchpad used | Screen area used | Shape | Needs physical geometry |
 |---|---|---|---|---|
-| Whole pad · keep shape (default) | All | A centered region with the pad's shape | Undistorted | Yes |
-| Whole pad · stretch | All | All | Scaled independently on X and Y | No |
-| Part of pad · fill area | A centered part with the area's shape | All | Undistorted | Yes |
+| Force proportions (default) | A centered part with the area's shape | All | Undistorted | Yes |
+| Full | All | All | Scaled independently on X and Y | No |
+| Portion… | The area you draw on the touchpad diagram | All | Scaled independently on X and Y | No |
 
-In fill-area mode, contacts outside the used part are ignored the same way as low-confidence contacts: they are not injected, a finger sliding out is released, and they still count as physically down, so arming still needs all fingers lifted. When a window target is resized, the used part is recomputed for its new shape together with the retarget. Stretch is the only mode that can inject when the device declares no usable physical size; the others refuse with an explanation. The test area honors the same setting.
+For **Portion…**, click **Select pad area…** and drag on the touchpad diagram. After selecting it, you can use that portion with any screen target, including the test area. Fingers outside the active part are ignored for injection, and fingers that slide out are released. With **Force proportions**, resizing a window target also recalculates the active part of the touchpad to match the new shape.
 
 The used touchpad part is logged with each `TARGET`, `TARGET_UPDATE` and `TARGET_RESUME` record (`pad_fit=`, `pad_input=`) and shown in the diagnostics target line.
 

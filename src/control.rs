@@ -12,24 +12,25 @@ pub struct Controller {
     pub mode: TakeoverMode,
     pub enabled: bool,
     pub requested: bool,
+    alt_was_down: bool,
 }
 impl Controller {
-    pub fn enable(&mut self) {
+    pub fn enable(&mut self, alt_down: bool) {
         self.enabled = true;
         self.requested = self.mode == TakeoverMode::Manual;
+        self.alt_was_down = alt_down;
     }
-    pub fn hotkey(&mut self, held: bool) {
-        if self.enabled {
-            match self.mode {
-                TakeoverMode::Toggle => self.requested = !self.requested,
-                TakeoverMode::Hold => self.requested = held,
-                TakeoverMode::Manual => {}
-            }
+    pub fn hotkey(&mut self) {
+        if self.enabled && self.mode == TakeoverMode::Toggle {
+            self.requested = !self.requested;
         }
     }
-    pub fn release(&mut self) {
-        if self.mode == TakeoverMode::Hold {
-            self.requested = false;
+    pub fn sample_alt(&mut self, down: bool) {
+        if self.enabled && self.mode == TakeoverMode::Hold {
+            if !down || !self.alt_was_down {
+                self.requested = down;
+            }
+            self.alt_was_down = down;
         }
     }
     pub fn disarm(&mut self) {
@@ -47,13 +48,19 @@ mod tests {
             mode: TakeoverMode::Hold,
             ..Default::default()
         };
-        c.enable();
-        c.hotkey(true);
+        c.enable(false);
+        c.sample_alt(true);
         assert!(c.requested);
         c.disarm();
-        c.hotkey(true);
+        c.sample_alt(true);
         assert!(!c.requested);
         assert!(!c.enabled);
+        c.enable(true);
+        c.sample_alt(true);
+        assert!(!c.requested);
+        c.sample_alt(false);
+        c.sample_alt(true);
+        assert!(c.requested);
     }
     #[test]
     fn releasing_during_startup_cancels_intent() {
@@ -61,9 +68,9 @@ mod tests {
             mode: TakeoverMode::Hold,
             ..Default::default()
         };
-        c.enable();
-        c.hotkey(true);
-        c.release();
+        c.enable(false);
+        c.sample_alt(true);
+        c.sample_alt(false);
         assert!(!c.requested);
         assert!(c.enabled);
     }
@@ -73,16 +80,16 @@ mod tests {
             mode: TakeoverMode::Toggle,
             ..Default::default()
         };
-        c.enable();
+        c.enable(false);
         assert!(!c.requested);
-        c.hotkey(false);
+        c.hotkey();
         assert!(c.requested);
-        c.hotkey(false);
+        c.hotkey();
         assert!(!c.requested);
-        c.hotkey(false);
+        c.hotkey();
         assert!(c.requested);
         c.disarm();
-        c.hotkey(false);
+        c.hotkey();
         assert!(!c.requested);
     }
 }

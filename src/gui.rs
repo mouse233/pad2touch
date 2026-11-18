@@ -13,7 +13,7 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -28,9 +28,9 @@ const DEVICE: usize = 101;
 const REFRESH: usize = 102;
 const MODE: usize = 103;
 const KEY: usize = 104;
-const CONTACTS: usize = 105;
+const PAD_GESTURES: usize = 105;
 const INJECT: usize = 106;
-const GUARD: usize = 107;
+const SCREEN_GESTURES: usize = 107;
 const TARGET: usize = 108;
 const START: usize = 109;
 const STOP: usize = 110;
@@ -45,6 +45,9 @@ const AREA: usize = 116;
 const TARGET_INFO: usize = 117;
 const PAD_FIT: usize = 118;
 const FEEDBACK: usize = 119;
+const PAD_AREA: usize = 120;
+const HOLD_KEY: usize = 121;
+const SS_CENTERIMAGE: u32 = 0x0200;
 const DEFAULT_CLIENT: (i32, i32) = (820, 618);
 const PREVIEW_MS: u32 = 1500;
 const PANEL_LEFT: i32 = 274;
@@ -90,6 +93,7 @@ struct Gui {
     hotkey_registered: bool,
     emergency_registered: bool,
     session: Option<Session>,
+    prewarmed: Option<crate::background_guard::Backend>,
     shared: Shared,
     rect: RECT,
     buffer: Option<crate::render::BackBuffer>,
@@ -99,13 +103,15 @@ struct Gui {
     windows: Vec<WindowEntry>,
     screen_rect: Option<RECT>,
     window_area: Option<NormRect>,
+    pad_area: Option<NormRect>,
     pending_selection: Option<Pending>,
     session_diagnostic: bool,
     monitors: Vec<mapping::MonitorEntry>,
     choices: Vec<Choice>,
     thumbnail: Option<diagram::Thumbnail>,
-    /// When the next desktop thumbnail may be captured (None: keep current).
-    thumbnail_due: Option<Instant>,
+    thumbnail_next: Instant,
+    thumbnail_job: Option<mpsc::Receiver<Option<diagram::Thumbnail>>>,
+    #[cfg(test)]
     thumbnail_captures: u64,
     /// Idle preview of the mapped region, or why there is none.
     /// (mapped bounds, selected area before fitting, used touchpad part).
@@ -170,6 +176,7 @@ fn choice_label(choice: Choice, monitors: &[mapping::MonitorEntry]) -> String {
 enum Pending {
     Screen,
     WindowArea { handle: usize, client: RECT },
+    Touchpad(RECT),
 }
 thread_local! { static GUI: RefCell<Option<Gui>> = const { RefCell::new(None) }; }
 
@@ -342,6 +349,7 @@ impl Gui {
             hotkey_registered: false,
             emergency_registered: false,
             session: None,
+            prewarmed: None,
             shared: Arc::new(Mutex::new(Stats {
                 capacity: 5,
                 mode: "capture".into(),
@@ -357,12 +365,15 @@ impl Gui {
             windows: Vec::new(),
             screen_rect: None,
             window_area: None,
+            pad_area: None,
             pending_selection: None,
             session_diagnostic: true,
             monitors: Vec::new(),
             choices: Vec::new(),
             thumbnail: None,
-            thumbnail_due: Some(Instant::now()),
+            thumbnail_next: Instant::now(),
+            thumbnail_job: None,
+            #[cfg(test)]
             thumbnail_captures: 0,
             preview: Err(String::new()),
             preview_at: Instant::now(),
@@ -372,7 +383,7 @@ impl Gui {
             "Input device",
             0,
             BS_GROUPBOX as u32,
-            [8, 8, 250, 84],
+            [8, 8, 250, 81],
         )?;
         g.add(
             "COMBOBOX",
@@ -381,55 +392,49 @@ impl Gui {
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
             [18, 28, 166, 180],
         )?;
-        g.add("BUTTON", "Refresh", REFRESH, WS_TABSTOP, [190, 27, 58, 25])?;
-        g.add("STATIC", "Contact capacity:", 0, 0, [18, 65, 126, 16])?;
+        g.add("BUTTON", "Refresh", REFRESH, WS_TABSTOP, [190, 28, 58, 24])?;
         g.add(
-            "COMBOBOX",
-            "",
-            CONTACTS,
-            CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [154, 59, 94, 160],
+            "STATIC",
+            "Up to 5 simultaneous touches",
+            0,
+            SS_CENTERIMAGE,
+            [18, 57, 230, 24],
         )?;
-        g.fill_combo(
-            CONTACTS,
-            &[
-                "1 touch",
-                "2 touches",
-                "3 touches",
-                "4 touches",
-                "5 touches",
-            ],
-        );
-        SendMessageW(g.item(CONTACTS), CB_SETCURSEL, 4, 0);
         g.add(
             "BUTTON",
             "Capture activation",
             0,
             BS_GROUPBOX as u32,
-            [8, 100, 250, 154],
+            [8, 97, 250, 139],
         )?;
         g.add(
             "COMBOBOX",
             "",
             MODE,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [18, 120, 230, 160],
+            [18, 117, 230, 160],
         )?;
         g.fill_combo(
             MODE,
             &[
                 "Manual start / stop",
                 "Toggle with shortcut",
-                "Hold shortcut to capture",
+                "Hold Alt to capture",
             ],
         );
-        g.add("STATIC", "Global shortcut:", 0, 0, [18, 159, 100, 16])?;
+        g.add(
+            "STATIC",
+            "Global shortcut:",
+            0,
+            SS_CENTERIMAGE,
+            [18, 146, 96, 22],
+        )?;
         g.add(
             "COMBOBOX",
             "",
             KEY,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [116, 153, 132, 160],
+            [116, 146, 132, 160],
         )?;
         g.fill_combo(
             KEY,
@@ -441,63 +446,65 @@ impl Gui {
             ],
         );
         g.add(
+            "STATIC",
+            "Alt",
+            HOLD_KEY,
+            SS_CENTERIMAGE,
+            [116, 146, 132, 22],
+        )?;
+        ShowWindow(g.item(HOLD_KEY), SW_HIDE);
+        g.add(
             "BUTTON",
             "Inject native touch input",
             INJECT,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [18, 194, 230, 20],
+            [18, 175, 230, 22],
         )?;
         SendMessageW(g.item(INJECT), BM_SETCHECK, 1, 0);
-        // Off by default: injected touches draw no Windows touch visuals.
         g.add(
             "BUTTON",
             "Show Windows touch feedback",
             FEEDBACK,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            [34, 216, 214, 20],
+            [18, 204, 230, 22],
         )?;
+        SendMessageW(g.item(FEEDBACK), BM_SETCHECK, 1, 0);
         g.add(
             "BUTTON",
             "Windows system gestures",
             0,
             BS_GROUPBOX as u32,
-            [8, 262, 250, 82],
+            [8, 244, 250, 80],
         )?;
         g.add(
-            "COMBOBOX",
-            "",
-            GUARD,
-            CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [18, 282, 230, 160],
+            "BUTTON",
+            "Block touchpad system gestures",
+            PAD_GESTURES,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            [18, 264, 230, 22],
         )?;
-        g.fill_combo(
-            GUARD,
-            &[
-                "Keep system gestures",
-                "Foreground guard",
-                "Background guard (experimental)",
-            ],
-        );
         g.add(
-            "STATIC",
-            "Background: 120 s, restores on stop.",
-            0,
-            0,
-            [18, 319, 230, 16],
+            "BUTTON",
+            "Block touchscreen system gestures",
+            SCREEN_GESTURES,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            [18, 293, 230, 22],
         )?;
+        SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
+        SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
         g.add(
             "BUTTON",
             "Screen area",
             0,
             BS_GROUPBOX as u32,
-            [8, 352, 250, 142],
+            [8, 332, 250, 168],
         )?;
         g.add(
             "COMBOBOX",
             "",
             TARGET,
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 372, 230, 240],
+            [18, 352, 230, 240],
         )?;
         g.fill_targets();
         g.add(
@@ -505,49 +512,61 @@ impl Gui {
             "",
             WINDOW,
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            [18, 402, 230, 240],
+            [18, 381, 230, 240],
         )?;
         g.add(
             "BUTTON",
             "Select area…",
             AREA,
             WS_TABSTOP,
-            [18, 431, 96, 25],
+            [18, 410, 96, 24],
         )?;
-        g.add("STATIC", "Touchpad:", 0, 0, [18, 467, 64, 16])?;
+        g.add(
+            "STATIC",
+            "Touchpad area:",
+            0,
+            SS_CENTERIMAGE,
+            [18, 439, 96, 22],
+        )?;
         g.add(
             "COMBOBOX",
             "",
             PAD_FIT,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP,
-            [84, 461, 164, 160],
+            [116, 439, 132, 160],
         )?;
-        g.fill_combo(
-            PAD_FIT,
-            &[
-                "Whole pad · keep shape",
-                "Whole pad · stretch",
-                "Part of pad · fill area",
-            ],
-        );
+        g.fill_combo(PAD_FIT, &["Force proportions", "Full", "Portion…"]);
         SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 0, 0);
-        g.add("STATIC", "", TARGET_INFO, 0x4000, [120, 436, 128, 16])?;
+        g.add(
+            "BUTTON",
+            "Select pad area…",
+            PAD_AREA,
+            WS_TABSTOP,
+            [18, 468, 230, 24],
+        )?;
+        g.add(
+            "STATIC",
+            "",
+            TARGET_INFO,
+            SS_CENTERIMAGE,
+            [116, 410, 132, 24],
+        )?;
         g.add(
             "BUTTON",
             "Start capture",
             START,
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            [8, 502, 122, 26],
+            [8, 508, 122, 26],
         )?;
         g.add(
             "BUTTON",
             "Stop / disarm",
             STOP,
             WS_TABSTOP,
-            [136, 502, 122, 26],
+            [136, 508, 122, 26],
         )?;
         // Four lines: the state plus up to three wrapped lines of detail.
-        g.status = g.add("STATIC", "", STATUS, 0, [8, 538, 250, 64])?;
+        g.status = g.add("STATIC", "", STATUS, 0, [8, 544, 250, 64])?;
         let emergency_label = g.add(
             "STATIC",
             "Emergency stop: Ctrl + Alt + Esc (or Esc here)",
@@ -1006,8 +1025,8 @@ impl Gui {
     unsafe fn pad_fit(&self) -> mapping::PadFit {
         match self.selection(PAD_FIT) {
             1 => mapping::PadFit::Stretch,
-            2 => mapping::PadFit::FillArea,
-            _ => mapping::PadFit::KeepShape,
+            2 => mapping::PadFit::Portion(self.pad_area),
+            _ => mapping::PadFit::FillArea,
         }
     }
     /// Resolve the configured target exactly as a session would.
@@ -1016,8 +1035,7 @@ impl Gui {
         let fit = self.pad_fit();
         if self.aspect().is_none() && self.checked(INJECT) && fit.needs_shape() {
             return Err(
-                "Touchpad shape unavailable: choose Touchpad area \"Whole pad · stretch\" or clear injection."
-                    .into(),
+                "Touchpad shape unavailable: choose Touchpad area Full or clear injection.".into(),
             );
         }
         target.resolve_fitted(self.panel, self.aspect(), fit)
@@ -1032,6 +1050,15 @@ impl Gui {
             Ok((fitted.bounds, selected, fitted.input))
         });
     }
+    unsafe fn diagram_area(&self, rc: &RECT) -> RECT {
+        RECT {
+            left: self.px(16),
+            top: self.px(190),
+            right: rc.right - self.px(16),
+            bottom: rc.bottom - self.px(12),
+        }
+    }
+
     /// Diagnostic text, then (for screen/window targets) the mapping diagram.
     unsafe fn paint_panel(&mut self, hwnd: HWND, dc: HDC, rc: &RECT) {
         let diagram = match &self.session {
@@ -1042,12 +1069,7 @@ impl Gui {
             experiment::paint_diagnostics(hwnd, dc, rc, &self.shared, self.rect, self.dpi, true);
             return;
         }
-        let area = RECT {
-            left: self.px(16),
-            top: self.px(190),
-            right: rc.right - self.px(16),
-            bottom: rc.bottom - self.px(12),
-        };
+        let area = self.diagram_area(rc);
         let mut origin = POINT::default();
         ClientToScreen(hwnd, &mut origin);
         let text_limit = RECT {
@@ -1081,12 +1103,6 @@ impl Gui {
             }
         };
         let monitors: Vec<RECT> = self.monitors.iter().map(|m| m.rect).collect();
-        let capture =
-            self.session.is_none() && self.thumbnail_due.is_some_and(|due| Instant::now() >= due);
-        if capture {
-            self.thumbnail_due = None;
-            self.thumbnail_captures += 1;
-        }
         diagram::paint(
             dc,
             area,
@@ -1101,15 +1117,50 @@ impl Gui {
                 message: &message,
                 dpi: self.dpi,
             },
-            &mut self.thumbnail,
-            capture,
+            self.thumbnail.as_ref(),
         );
     }
-    /// Ask for a fresh desktop thumbnail shortly (after overlays or window
-    /// animations have left the screen). Never captured during a session.
-    fn request_thumbnail(&mut self) {
-        let due = Instant::now() + Duration::from_millis(150);
-        self.thumbnail_due = Some(self.thumbnail_due.map_or(due, |d| d.min(due)));
+    unsafe fn tick_thumbnail(&mut self) {
+        let foreground = GetForegroundWindow() == self.hwnd
+            && IsIconic(self.hwnd) == 0
+            && !overlay::active()
+            && self.choice() != Choice::Diagnostic;
+        if let Some(job) = &self.thumbnail_job {
+            let result = job.try_recv();
+            if matches!(result, Err(mpsc::TryRecvError::Empty)) {
+                return;
+            }
+            self.thumbnail_job = None;
+            if let Ok(Some(thumbnail)) = result {
+                if foreground {
+                    self.thumbnail = Some(thumbnail);
+                    InvalidateRect(self.panel, null(), 0);
+                }
+            }
+        }
+        let now = Instant::now();
+        if foreground && now >= self.thumbnail_next {
+            self.thumbnail_next = now + Duration::from_secs(1);
+            let virt = mapping::virtual_screen();
+            let hwnd = self.hwnd as usize;
+            let (tx, rx) = mpsc::channel();
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                    let result = (GetForegroundWindow() == hwnd as HWND)
+                        .then(|| diagram::Thumbnail::capture(virt).ok())
+                        .flatten();
+                    let _ = tx.send(result);
+                })
+                .is_ok()
+            {
+                self.thumbnail_job = Some(rx);
+                #[cfg(test)]
+                {
+                    self.thumbnail_captures += 1;
+                }
+            }
+        }
     }
     unsafe fn refresh_windows(&mut self) {
         let previous = self.selected_window();
@@ -1186,6 +1237,17 @@ impl Gui {
             self.last_status = "Area selection cancelled.".into();
             return;
         };
+        if let Some(Pending::Touchpad(surface)) = pending {
+            match NormRect::from_screen(surface, selected) {
+                Ok(area) => {
+                    self.pad_area = Some(area);
+                    self.last_status = "Touchpad area selected.".into();
+                    self.refresh_preview_rect();
+                }
+                Err(error) => self.last_status = error,
+            }
+            return;
+        }
         let applied = match pending {
             Some(Pending::Screen) => {
                 mapping::validate_screen_rect(selected, mapping::virtual_screen())
@@ -1205,11 +1267,45 @@ impl Gui {
                     })
                 }
             }
-            None => Ok(()),
+            Some(Pending::Touchpad(_)) | None => Ok(()),
         };
         if let Err(e) = applied.and_then(|_| self.show_target_preview()) {
             self.last_status = e;
         }
+    }
+    unsafe fn select_pad_area(&mut self) -> Result<(), String> {
+        if self.session.is_some()
+            || self.controller.enabled
+            || overlay::active()
+            || self.choice() == Choice::Diagnostic
+        {
+            return Err("The touchpad area cannot be selected right now.".into());
+        }
+        let mut rc = RECT::default();
+        GetClientRect(self.panel, &mut rc);
+        let monitors: Vec<RECT> = self.monitors.iter().map(|monitor| monitor.rect).collect();
+        let layout = diagram::layout(
+            self.diagram_area(&rc),
+            mapping::virtual_screen(),
+            &monitors,
+            self.aspect().unwrap_or(1.6),
+            self.dpi,
+        )
+        .ok_or("The touchpad diagram is unavailable.")?;
+        let mut origin = POINT::default();
+        if ClientToScreen(self.panel, &mut origin) == 0 {
+            return Err(winerr("Locate the touchpad diagram"));
+        }
+        let mut bounds = layout.surface;
+        OffsetRect(&mut bounds, origin.x, origin.y);
+        overlay::begin(
+            self.hwnd,
+            bounds,
+            "Drag to select the active touchpad area.",
+        )?;
+        self.pending_selection = Some(Pending::Touchpad(bounds));
+        self.last_status = "Selecting touchpad area…".into();
+        Ok(())
     }
     /// Flash the resolved (aspect-fitted) injection bounds on the desktop.
     unsafe fn show_target_preview(&mut self) -> Result<(), String> {
@@ -1274,7 +1370,7 @@ impl Gui {
             2 => TakeoverMode::Hold,
             _ => TakeoverMode::Manual,
         };
-        if self.controller.mode != TakeoverMode::Manual {
+        if self.controller.mode == TakeoverMode::Toggle {
             if RegisterHotKey(
                 self.hwnd,
                 HOTKEY,
@@ -1290,19 +1386,29 @@ impl Gui {
             }
             self.hotkey_registered = true;
         }
-        self.controller.enable();
-        self.last_status = "Shortcut enabled. Press it to capture.".into();
+        self.controller
+            .enable(self.controller.mode == TakeoverMode::Hold && Self::alt_down());
+        if self.controller.mode == TakeoverMode::Hold
+            && (self.checked(PAD_GESTURES) || self.checked(SCREEN_GESTURES))
+        {
+            self.prewarmed =
+                crate::background_guard::Backend::spawn(self.checked(PAD_GESTURES)).ok();
+        }
+        self.last_status = if self.controller.mode == TakeoverMode::Hold {
+            "Hold Alt to capture. Release Alt to stop.".into()
+        } else {
+            "Shortcut enabled. Press it to capture.".into()
+        };
     }
     unsafe fn key(&self) -> u32 {
         VK_F8 as u32 + self.selection(KEY) as u32
     }
-    unsafe fn held(&self) -> bool {
-        [VK_CONTROL as i32, VK_MENU as i32, self.key() as i32]
-            .iter()
-            .all(|&key| GetAsyncKeyState(key) < 0)
+    unsafe fn alt_down() -> bool {
+        GetAsyncKeyState(VK_MENU as i32) < 0
     }
     unsafe fn disarm(&mut self, reason: &str) {
         self.controller.disarm();
+        self.prewarmed = None;
         overlay::cancel();
         if self.hotkey_registered {
             UnregisterHotKey(self.hwnd, HOTKEY);
@@ -1337,7 +1443,7 @@ impl Gui {
             Ok(g) => spec.resolve_fitted(self.panel, Some(g.aspect()?), fit)?,
             Err(error) if self.checked(INJECT) && fit.needs_shape() => {
                 return Err(format!(
-                    "Cannot preserve the physical touchpad aspect: {error}. Choose Touchpad area \"Whole pad · stretch\" to inject without it."
+                    "Cannot preserve the physical touchpad aspect: {error}. Choose Touchpad area Full to inject without it."
                 ))
             }
             Err(_) => spec.resolve_fitted(self.panel, None, fit)?,
@@ -1353,10 +1459,10 @@ impl Gui {
             target,
             experiment::SessionSettings {
                 inject: self.checked(INJECT),
-                capacity: self.selection(CONTACTS) + 1,
-                suppress_gestures: self.selection(GUARD) == 1,
-                background_guard: self.selection(GUARD) == 2,
+                suppress_touchpad: self.checked(PAD_GESTURES),
+                suppress_touchscreen: self.checked(SCREEN_GESTURES),
                 touch_feedback: self.checked(FEEDBACK),
+                prewarmed: self.prewarmed.clone(),
             },
             out.clone(),
         )?;
@@ -1375,23 +1481,20 @@ impl Gui {
             wide(&format!("Logs: {}", out.display())).as_ptr(),
         );
         self.last_status = if spec.is_diagnostic() {
-            "Starting. Touch the pad, then lift all fingers to arm.".into()
+            "Starting capture.".into()
         } else {
             let warning = spec
                 .window_handle()
                 .and_then(mapping::integrity_warning)
                 .map(|w| format!(" {w}"))
                 .unwrap_or_default();
-            format!(
-                "Mapping to {}. Lift all fingers to arm.{warning}",
-                mapping::describe(target.bounds)
-            )
+            format!("Mapping to {}.{warning}", mapping::describe(target.bounds))
         };
         Ok(())
     }
     unsafe fn tick(&mut self) {
-        if self.controller.enabled && self.controller.mode == TakeoverMode::Hold && !self.held() {
-            self.controller.release();
+        if self.controller.enabled && self.controller.mode == TakeoverMode::Hold {
+            self.controller.sample_alt(Self::alt_down());
         }
         if let Some(session) = self.session.as_ref() {
             if !self.controller.requested && !session.stopping() {
@@ -1447,6 +1550,7 @@ impl Gui {
         let mut s = self.shared.lock().unwrap();
         s.foreground = GetForegroundWindow() == self.hwnd;
         drop(s);
+        self.tick_thumbnail();
         self.update_controls();
         InvalidateRect(self.panel, null(), 0);
     }
@@ -1472,7 +1576,14 @@ impl Gui {
         let locked =
             self.session.is_some() || self.controller.enabled || self.closing || overlay::active();
         for id in [
-            DEVICE, REFRESH, MODE, CONTACTS, INJECT, GUARD, TARGET, PAD_FIT,
+            DEVICE,
+            REFRESH,
+            MODE,
+            INJECT,
+            PAD_GESTURES,
+            SCREEN_GESTURES,
+            TARGET,
+            PAD_FIT,
         ] {
             EnableWindow(self.item(id), i32::from(!locked));
         }
@@ -1483,6 +1594,15 @@ impl Gui {
             i32::from(!locked && self.checked(INJECT)),
         );
         let choice = self.choice();
+        let portion = matches!(self.pad_fit(), mapping::PadFit::Portion(_));
+        ShowWindow(
+            self.item(PAD_AREA),
+            if portion { SW_SHOWNA } else { SW_HIDE },
+        );
+        EnableWindow(
+            self.item(PAD_AREA),
+            i32::from(!locked && choice != Choice::Diagnostic),
+        );
         EnableWindow(
             self.item(WINDOW),
             i32::from(!locked && choice.uses_window()),
@@ -1508,11 +1628,22 @@ impl Gui {
             },
         );
         set_text(self.item(TARGET_INFO), &self.target_info());
-        let target_error = self.target().err();
-        EnableWindow(
-            self.item(KEY),
-            i32::from(!locked && self.selection(MODE) != 0),
+        let target_error = if portion && self.pad_area.is_none() {
+            Some(if choice == Choice::Diagnostic {
+                "Choose a screen or window to define a touchpad portion first.".into()
+            } else {
+                "Click Select pad area… and drag on the touchpad diagram.".into()
+            })
+        } else {
+            self.target().err()
+        };
+        let mode = self.selection(MODE);
+        ShowWindow(self.item(KEY), if mode == 2 { SW_HIDE } else { SW_SHOWNA });
+        ShowWindow(
+            self.item(HOLD_KEY),
+            if mode == 2 { SW_SHOWNA } else { SW_HIDE },
         );
+        EnableWindow(self.item(KEY), i32::from(!locked && mode == 1));
         EnableWindow(
             self.item(START),
             i32::from(
@@ -1548,8 +1679,12 @@ impl Gui {
             let s = self.shared.lock().unwrap();
             if s.armed {
                 "Capturing"
+            } else if s.guard_status.starts_with("Preparing") {
+                "Preparing capture"
+            } else if s.raw == 0 {
+                "Capturing"
             } else {
-                "Lift all fingers to arm"
+                "Lift all fingers to resume"
             }
         } else if self.controller.enabled {
             "Shortcut ready"
@@ -1686,17 +1821,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             FillRect(w as HDC, &rc, (COLOR_BTNFACE + 1) as HBRUSH);
             return 0;
         }
-        // Returning to PadBridge: the desktop may have changed. Default
-        // processing still runs so keyboard focus is restored normally.
-        WM_ACTIVATE if (w & 0xffff) as u32 != WA_INACTIVE => {
-            GUI.with(|slot| {
-                if let Ok(mut slot) = slot.try_borrow_mut() {
-                    if let Some(g) = slot.as_mut() {
-                        g.request_thumbnail();
-                    }
-                }
-            });
-        }
         WM_COMMAND
         | WM_HOTKEY
         | WM_TIMER
@@ -1739,15 +1863,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                                 }
                                 g.refresh_preview_rect();
                                 g.refresh_diagram_preview();
-                                g.request_thumbnail();
                             }
                             WINDOW if notification == CBN_DROPDOWN => g.refresh_windows(),
                             WINDOW if notification == CBN_SELCHANGE => {
                                 g.window_area = None;
                                 g.refresh_diagram_preview();
-                                g.request_thumbnail();
                             }
                             AREA if notification == BN_CLICKED => g.area_action(),
+                            PAD_AREA if notification == BN_CLICKED => {
+                                if let Err(error) = g.select_pad_area() {
+                                    g.last_status = error;
+                                }
+                            }
                             PAD_FIT if notification == CBN_SELCHANGE => {
                                 g.refresh_preview_rect();
                                 g.refresh_diagram_preview();
@@ -1761,8 +1888,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         g.disarm("Global emergency stop requested.")
                     }
                     WM_HOTKEY if w == HOTKEY as usize => {
-                        let held = g.held();
-                        g.controller.hotkey(held);
+                        g.controller.hotkey();
                         g.tick();
                     }
                     WM_TIMER => g.tick(),
@@ -1776,7 +1902,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     overlay::WM_SELECTION_DONE => {
                         g.selection_done();
                         g.refresh_diagram_preview();
-                        g.request_thumbnail();
                         g.update_controls();
                     }
                     WM_DISPLAYCHANGE => {
@@ -1787,7 +1912,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             g.fill_targets();
                         }
                         g.thumbnail = None;
-                        g.request_thumbnail();
                         g.refresh_diagram_preview();
                     }
                     WM_ENTERSIZEMOVE => {
@@ -1986,6 +2110,8 @@ mod tests {
             let mut g = Gui::new(hwnd).unwrap();
             g.refresh_devices();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             SendMessageW(g.item(MODE), CB_SETCURSEL, 1, 0);
             let (start, stop) = (g.item(START), g.item(STOP));
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
@@ -2098,6 +2224,8 @@ mod tests {
             let g = Gui::new(hwnd).unwrap();
             // Raw-only: previews need no physical geometry.
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
             with(|g| {
                 g.layout();
@@ -2378,6 +2506,8 @@ mod tests {
             );
             let g = Gui::new(hwnd).unwrap();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             let panel = g.panel;
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
             with(|g| {
@@ -2399,7 +2529,7 @@ mod tests {
             });
 
             choose(hwnd, Choice::Monitor(0));
-            // Let the requested thumbnail capture (150 ms) happen.
+            // Paint an unactivated window without requesting desktop readback.
             pump_for(Duration::from_millis(250));
             InvalidateRect(panel, null(), 0);
             pump_for(Duration::from_millis(100));
@@ -2449,33 +2579,36 @@ mod tests {
             std::fs::create_dir_all("artifacts").unwrap();
             save_client_bitmap(hwnd, "artifacts/diagram-monitor.bmp");
 
-            // The thumbnail is captured on demand, not on every repaint.
+            // Repainting alone has no desktop readback side effect.
+            assert_eq!(with(|g| g.thumbnail_captures), 0);
+            ShowWindow(hwnd, SW_SHOW);
+            use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+            let thread = GetCurrentThreadId();
+            let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+            let attached = foreground_thread != 0
+                && foreground_thread != thread
+                && AttachThreadInput(thread, foreground_thread, 1) != 0;
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(thread, foreground_thread, 0);
+            }
+            assert_eq!(GetForegroundWindow(), hwnd);
+            SetTimer(hwnd, 1, 30, None);
+            pump_for(Duration::from_millis(400));
             let captured = with(|g| {
-                assert!(g.thumbnail.is_some(), "first diagram captures a thumbnail");
-                assert!(g.thumbnail_due.is_none());
+                assert!(g.thumbnail.is_some(), "foreground captures a thumbnail");
+                assert_eq!(g.thumbnail_captures, 1);
                 g.thumbnail_captures
             });
-            for _ in 0..20 {
-                InvalidateRect(panel, null(), 0);
-                pump_for(Duration::from_millis(75));
-            }
-            assert_eq!(with(|g| g.thumbnail_captures), captured, "idle repaints");
-            // Resizing reuses (scales) the existing thumbnail.
+            pump_for(Duration::from_millis(900));
+            assert_eq!(with(|g| g.thumbnail_captures), captured + 1);
+            ShowWindow(hwnd, SW_MINIMIZE);
+            pump_for(Duration::from_millis(1200));
+            assert_eq!(with(|g| g.thumbnail_captures), captured + 1);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let mut original = RECT::default();
             GetWindowRect(hwnd, &mut original);
-            SetWindowPos(hwnd, null_mut(), 0, 0, 1100, 760, SWP_NOMOVE | SWP_NOZORDER);
-            pump_for(Duration::from_millis(300));
-            assert_eq!(with(|g| g.thumbnail_captures), captured, "resize");
-            // Changing the screen area requests exactly one new capture.
             choose(hwnd, Choice::ScreenPortion);
-            pump_for(Duration::from_millis(300));
-            InvalidateRect(panel, null(), 0);
-            pump_for(Duration::from_millis(100));
-            assert_eq!(
-                with(|g| g.thumbnail_captures),
-                captured + 1,
-                "selection change"
-            );
             // Restore the size the remaining pixel checks were computed for.
             SetWindowPos(
                 hwnd,
@@ -2517,10 +2650,46 @@ mod tests {
                         assert_eq!(mapping::tuple(t.bounds), mapping::tuple(monitors[0].rect));
                         assert_eq!(t.input, NormRect::FULL);
                     } else {
-                        assert!(resolved.err().unwrap().contains("stretch"));
+                        let error = resolved.err().unwrap();
+                        assert!(error.contains(if index == 0 {
+                            "Full"
+                        } else {
+                            "Select pad area"
+                        }));
                     }
                 }
                 SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+                SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+                SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
+                SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 2, 0);
+                g.select_pad_area().unwrap();
+            });
+            let picker = FindWindowW(wide("PadBridgeSelectionOverlay").as_ptr(), null());
+            assert!(!picker.is_null());
+            let mut picker_bounds = RECT::default();
+            GetClientRect(picker, &mut picker_bounds);
+            let point = |x: i32, y: i32| ((y << 16) | x) as LPARAM;
+            SendMessageW(
+                picker,
+                WM_LBUTTONDOWN,
+                1,
+                point(picker_bounds.right / 4, picker_bounds.bottom / 4),
+            );
+            SendMessageW(
+                picker,
+                WM_LBUTTONUP,
+                0,
+                point(picker_bounds.right * 3 / 4, picker_bounds.bottom * 3 / 4),
+            );
+            pump_for(Duration::from_millis(100));
+            with(|g| {
+                let target = g.resolve_target().unwrap();
+                assert_eq!(
+                    mapping::tuple(target.bounds),
+                    mapping::tuple(monitors[0].rect)
+                );
+                assert!((target.input.left - 0.25).abs() < 0.02);
+                assert!((target.input.right - 0.75).abs() < 0.02);
                 SendMessageW(g.item(PAD_FIT), CB_SETCURSEL, 0, 0);
             });
 
@@ -2547,10 +2716,10 @@ mod tests {
             let dc = GetDCEx(hwnd, null_mut(), DCX_CACHE);
             let background = GetSysColor(COLOR_BTNFACE);
             for (x, y) in [
-                (140, 67),
-                (244, 87),
+                (228, 70),
+                (225, 83),
                 (250, 214),
-                (240, 314),
+                (227, 318),
                 (252, 378),
                 (260, 230),
                 (600, 12),
@@ -2582,11 +2751,19 @@ mod tests {
                 assert!(g.rect.left - origin.x >= g.px(16));
                 assert!(g.rect.top - origin.y >= g.px(190));
                 let aspect = geometry.aspect().unwrap();
+                let input = g
+                    .target()
+                    .unwrap()
+                    .resolve_fitted(g.panel, Some(aspect), g.pad_fit())
+                    .unwrap()
+                    .input;
+                let active_aspect =
+                    aspect * (input.right - input.left) / (input.bottom - input.top);
                 assert!(
                     ((g.rect.right - g.rect.left) as f64
-                        - (g.rect.bottom - g.rect.top) as f64 * aspect)
+                        - (g.rect.bottom - g.rect.top) as f64 * active_aspect)
                         .abs()
-                        <= aspect.max(1.0)
+                        <= active_aspect.max(1.0)
                 );
             }
             let mut client = RECT::default();
@@ -2646,6 +2823,15 @@ mod tests {
                 null(),
             );
             let mut gui = Gui::new(hwnd).unwrap();
+            assert!(gui.checked(FEEDBACK), "touch feedback defaults to enabled");
+            assert!(
+                gui.checked(PAD_GESTURES),
+                "touchpad guard defaults to enabled"
+            );
+            assert!(
+                gui.checked(SCREEN_GESTURES),
+                "touchscreen guard defaults to enabled"
+            );
             gui.refresh_devices();
             let dpi = gui.dpi;
             let expected = (gui.px(DEFAULT_CLIENT.0), gui.px(DEFAULT_CLIENT.1));
@@ -2719,7 +2905,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "temporarily changes four gesture settings via the GUI session, captures raw input only, and verifies restoration"]
+    #[ignore = "temporarily blocks touchpad and touchscreen gestures via the GUI, captures raw input only, and verifies restoration"]
     fn native_gui_background_guard_session_restores() {
         unsafe {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -2747,7 +2933,6 @@ mod tests {
             let mut g = Gui::new(hwnd).unwrap();
             g.refresh_devices();
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
-            SendMessageW(g.item(GUARD), CB_SETCURSEL, 2, 0);
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
             GUI.with(|slot| slot.borrow_mut().as_mut().unwrap().layout());
             SetTimer(hwnd, 1, 30, None);
@@ -2759,7 +2944,7 @@ mod tests {
                 assert!(g.session.is_some(), "{}", g.last_status);
                 let s = g.shared.lock().unwrap();
                 assert!(
-                    s.guard_status.contains("ACTIVE"),
+                    s.guard_status.contains("ACTIVE: touchpad + touchscreen"),
                     "{} / {}",
                     s.guard_status,
                     s.error
@@ -2898,6 +3083,8 @@ mod tests {
             g.refresh_devices();
             assert!(!g.devices.is_empty(), "requires a local Precision Touchpad");
             SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+            SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             GUI.with(|slot| *slot.borrow_mut() = Some(g));
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
@@ -2983,22 +3170,82 @@ mod tests {
                 assert!(!g.controller.enabled);
                 assert!(!g.hotkey_registered);
             });
-            // A late Hold notification after the chord has been released cannot start.
+            // A stale Toggle notification cannot start an Alt Hold session.
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
                 SendMessageW(g.item(MODE), CB_SETCURSEL, 2, 0);
+                SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
+                SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
             });
+            let send_alt = |flags| {
+                let event = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_LMENU,
+                            dwFlags: flags,
+                            ..Default::default()
+                        },
+                    },
+                };
+                assert_eq!(SendInput(1, &event, size_of::<INPUT>() as i32), 1);
+            };
+            struct ReleaseAlt<F: Fn(u32)>(F);
+            impl<F: Fn(u32)> Drop for ReleaseAlt<F> {
+                fn drop(&mut self) {
+                    (self.0)(KEYEVENTF_KEYUP);
+                }
+            }
+            assert!(!Gui::alt_down());
+            send_alt(0);
+            let initial_alt = ReleaseAlt(send_alt);
+            pump_for(Duration::from_millis(60));
+            assert!(Gui::alt_down());
             SendMessageW(hwnd, WM_COMMAND, START, 0);
             SendMessageW(hwnd, WM_HOTKEY, HOTKEY as usize, 0);
             pump_for(Duration::from_millis(100));
             GUI.with(|slot| assert!(slot.borrow().as_ref().unwrap().session.is_none()));
+            drop(initial_alt);
+            pump_for(Duration::from_millis(80));
+            for _ in 0..2 {
+                send_alt(0);
+                let alt = ReleaseAlt(send_alt);
+                pump_for(Duration::from_secs(2));
+                GUI.with(|slot| {
+                    let slot = slot.borrow();
+                    let g = slot.as_ref().unwrap();
+                    assert!(g.prewarmed.is_some());
+                    assert!(g.session.is_some(), "{}", g.last_status);
+                    assert!(g
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .guard_status
+                        .contains("ACTIVE: touchpad + touchscreen"));
+                });
+                drop(alt);
+                pump_for(Duration::from_millis(1500));
+                GUI.with(|slot| {
+                    let slot = slot.borrow();
+                    let g = slot.as_ref().unwrap();
+                    assert!(g.session.is_none(), "{}", g.last_status);
+                    assert!(g.controller.enabled);
+                    assert!(!g.restart_blocked);
+                    assert_eq!(
+                        g.shared.lock().unwrap().guard_status,
+                        "Windows gestures restored"
+                    );
+                });
+            }
             SendMessageW(hwnd, WM_HOTKEY, EMERGENCY as usize, 0);
             // Closing an active session must keep the receiver alive for drain.
             GUI.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let g = slot.as_mut().unwrap();
                 SendMessageW(g.item(MODE), CB_SETCURSEL, 0, 0);
+                SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 0, 0);
+                SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 0, 0);
             });
             SendMessageW(hwnd, WM_COMMAND, START, 0);
             pump_for(Duration::from_millis(250));

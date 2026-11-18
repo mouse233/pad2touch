@@ -183,7 +183,7 @@ pub fn fit_aspect(area: RECT, aspect: f64) -> Result<RECT, String> {
 
 /// How the touchpad's shape is reconciled with the screen area's shape
 /// (the "Touchpad area" setting).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PadFit {
     /// Whole touchpad, undistorted: the screen area is letterboxed.
     #[default]
@@ -193,6 +193,8 @@ pub enum PadFit {
     /// Whole screen area, undistorted: only a centered part of the touchpad
     /// with the area's shape is used; touches outside it are ignored.
     FillArea,
+    /// A selected portion of the pad maps to the whole target.
+    Portion(Option<NormRect>),
 }
 impl PadFit {
     pub fn label(self) -> &'static str {
@@ -200,11 +202,12 @@ impl PadFit {
             Self::KeepShape => "keep-shape",
             Self::Stretch => "stretch",
             Self::FillArea => "fill-area",
+            Self::Portion(_) => "portion",
         }
     }
     /// Whether the touchpad's physical shape is needed to map undistorted.
     pub fn needs_shape(self) -> bool {
-        self != Self::Stretch
+        matches!(self, Self::KeepShape | Self::FillArea)
     }
 }
 
@@ -247,6 +250,10 @@ pub fn fit_pad(area: RECT, aspect: Option<f64>, fit: PadFit) -> Result<(RECT, No
     match (fit, aspect) {
         (PadFit::KeepShape, Some(a)) => Ok((fit_aspect(area, a)?, NormRect::FULL)),
         (PadFit::FillArea, Some(a)) => Ok((area, pad_crop(a, area)?)),
+        (PadFit::Portion(Some(input)), _) => Ok((area, input.validate()?)),
+        (PadFit::Portion(None), _) => {
+            Err("Click Select pad area… and drag on the touchpad diagram.".into())
+        }
         _ => Ok((area, NormRect::FULL)),
     }
 }

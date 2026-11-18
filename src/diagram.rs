@@ -2,9 +2,7 @@
 //! thumbnail), the touchpad below at its physical aspect, and red connectors
 //! from the touchpad surface to the mapped screen region.
 //!
-//! Reading the composed desktop back from DWM takes about two frames
-//! (~33 ms, ~7 ms CPU), so the thumbnail is captured only when the caller
-//! asks for it; ordinary repaints reuse it, scaled if the panel resized.
+//! Desktop readback runs on a worker. Paint only uses completed thumbnails.
 //!
 //! Layout is pure and unit-tested; painting uses plain GDI on the caller's
 //! back buffer. The thumbnail is only drawn on screen, never logged or saved.
@@ -206,11 +204,18 @@ pub struct Thumbnail {
     pub width: i32,
     pub virt: RECT,
 }
+// Ownership is transferred once, after GdiFlush. The memory DC was created
+// from a screen DC (not NULL), and no GDI handle is accessed concurrently.
+unsafe impl Send for Thumbnail {}
 impl Thumbnail {
-    pub unsafe fn capture(virt: RECT, width: i32, height: i32) -> Result<Self, String> {
-        if width < 1 || height < 1 {
+    pub unsafe fn capture(virt: RECT) -> Result<Self, String> {
+        let (w, h) = crate::mapping::size(virt);
+        if w < 1 || h < 1 {
             return Err("empty thumbnail".into());
         }
+        let scale = 640.0 / w.max(h) as f64;
+        let width = (w as f64 * scale).round().max(1.0) as i32;
+        let height = (h as f64 * scale).round().max(1.0) as i32;
         let screen = GetDC(null_mut());
         if screen.is_null() {
             return Err(winerr("GetDC(screen)"));
@@ -245,6 +250,7 @@ impl Thumbnail {
             virt.bottom - virt.top,
             SRCCOPY,
         );
+        let flushed = GdiFlush();
         ReleaseDC(null_mut(), screen);
         let thumb = Self {
             dc,
@@ -253,7 +259,7 @@ impl Thumbnail {
             width,
             virt,
         };
-        if ok == 0 {
+        if ok == 0 || flushed == 0 {
             return Err(winerr("StretchBlt(desktop thumbnail)"));
         }
         Ok(thumb)
@@ -321,29 +327,19 @@ pub unsafe fn paint(
     dc: HDC,
     area: RECT,
     scene: &Scene,
-    thumbnail: &mut Option<Thumbnail>,
-    capture: bool,
+    thumbnail: Option<&Thumbnail>,
 ) -> Option<Layout> {
     let px = |n: i32| (n as i64 * scene.dpi.max(96) as i64 / 96) as i32;
     let aspect = scene.pad_aspect.unwrap_or(1.6);
     let l = layout(area, scene.virt, scene.monitors, aspect, scene.dpi)?;
     let saved = SaveDC(dc);
-    // Monitors with a desktop thumbnail, captured only on request.
-    if capture {
-        let shot = l.screen.rect(scene.virt);
-        *thumbnail =
-            Thumbnail::capture(scene.virt, shot.right - shot.left, shot.bottom - shot.top).ok();
-    }
     for (neck, base) in &l.stands {
         fill(dc, neck, STAND);
         fill(dc, base, STAND);
     }
     for (s, m) in l.screens.iter().zip(scene.monitors) {
         fill(dc, &inset(*s, -l.bezel), BEZEL);
-        match thumbnail
-            .as_ref()
-            .and_then(|t| Some((t, t.source(scene.virt, *m)?)))
-        {
+        match thumbnail.and_then(|t| Some((t, t.source(scene.virt, *m)?))) {
             Some((t, src)) => {
                 SetStretchBltMode(dc, HALFTONE);
                 StretchBlt(
