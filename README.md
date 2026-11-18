@@ -40,7 +40,7 @@ The GUI opens idle. Pick a touchpad, a **Screen area** and a **Touchpad** mode, 
 
 **Ctrl+Alt+Esc** stops capture from anywhere.
 
-Launch with `--diagnostics` to show detailed capture metrics and write session logs to `artifacts`. Gesture recovery files live under `%LOCALAPPDATA%\Pad2Touch\recovery`. See the [GUI guide](docs/gui.md#diagnostics-and-system-gestures).
+Launch with `--diagnostics` to show detailed capture metrics and write session logs to `artifacts/runs/`. Gesture recovery files live under `%LOCALAPPDATA%\Pad2Touch\recovery`. See the [GUI guide](docs/gui.md#diagnostics-and-system-gestures).
 
 Command-line modes (probe, raw capture, self-test, …) are available through the helper script:
 
@@ -73,7 +73,7 @@ Default tests never open windows or inject input. See the [testing guide](docs/t
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Background capture & gesture suppression research](docs/background-gesture-feasibility.md)
-- [Design spec (Chinese)](docs/Pad2Touch.md)
+- [Technical whitepaper](docs/Pad2Touch.md)
 
 ## Acknowledgments
 
@@ -83,4 +83,4 @@ Thanks also to the [windows-rs](https://github.com/microsoft/windows-rs) project
 
 ## License
 
-[MIT](LICENSE). Pad2Touch has no telemetry or network features. The mapping diagram's desktop thumbnail is only drawn on screen, never saved. Logs written to `artifacts/` may contain device paths — review them before sharing.
+[MIT](LICENSE). Pad2Touch has no telemetry or network features. The mapping diagram's desktop thumbnail is only drawn on screen, never saved. Logs written to `artifacts/runs/` may contain device paths. Review them before sharing.

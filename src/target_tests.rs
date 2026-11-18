@@ -495,7 +495,7 @@ fn native_background_guard_preserves_injected_multitouch() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let out = std::path::PathBuf::from(format!("artifacts/touchscreen-guard-test-{stamp}"));
+    let out = std::path::PathBuf::from(format!("artifacts/runs/touchscreen-guard-test-{stamp}"));
     let (log, writer) = Log::open(&out).unwrap();
     let shared = Arc::new(Mutex::new(crate::experiment::Stats::default()));
     let guard = crate::background_guard::Guard::acquire(

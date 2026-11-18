@@ -1,13 +1,13 @@
 # Optional local recording tests
 
-Physical touchpad recordings and Windows HID preparsed data are local diagnostic materials. `.gitignore` excludes them from the repository; only the test logic and this documentation are tracked.
+Physical touchpad recordings and Windows HID preparsed data are local diagnostic materials. All files and subdirectories under `tests/fixtures/` are ignored except this README. The replay tests live in `src/hid.rs`.
 
 A normal checkout can build and run `cargo test --locked` without any recordings. Two recording tests are ignored by default, and their inputs are read at runtime rather than embedded during compilation.
 
 On a machine retaining the expected private fixture set:
 
 ```powershell
-cargo test --locked -- --include-ignored
+cargo test --locked hid::recorded_tests:: -- --ignored
 ```
 
 The optional tests expect these local files:

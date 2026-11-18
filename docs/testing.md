@@ -1,6 +1,14 @@
 # Testing guide
 
-This guide contains reusable procedures, not results from a particular machine. Keep observations, acceptance decisions, screenshots, raw input, and generated reports under ignored local directories such as `artifacts/`.
+This guide contains reusable testing procedures. Keep machine-specific output in the ignored `artifacts/` directory.
+
+| Directory | Contents |
+| --- | --- |
+| `artifacts/runs/` | Capture logs, summaries, and per-run analysis. Direct CLI capture and self-test can specify a different location with `--out`. |
+| `artifacts/screenshots/` | Images from interactive GUI checks. |
+| `artifacts/local-reports/` | Local observations and reports spanning one or more runs. |
+| `artifacts/experiments/` | Standalone experiment output and its compiled helper. |
+| `artifacts/delivery/` | Locally assembled delivery packages. Cargo build output stays in `target/`. |
 
 ## Offline checks
 
@@ -55,7 +63,7 @@ cargo test --locked native_gui_phase3_target_selection_without_capture -- --igno
 cargo test --locked native_gui_mapping_diagram_draws_region_and_touchpad -- --ignored --test-threads=1
 ```
 
-They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of Pad2Touch's own windows, target destruction, and GUI selection of every mode. The diagram check renders the panel and verifies the red region frame, touchpad surface and pad body at the positions computed by the pure layout, and that idle repaints and resizing reuse the desktop thumbnail while a screen area change captures exactly one new one. It also writes `artifacts/diagram-*.bmp` for visual review; these images include a desktop thumbnail, so review them before sharing. None needs a touchpad or injects touch.
+They cover overlay drag/cancel and the outline placement, window listing, client-area resolution (title bar excluded), aspect fitting, move/resize retargeting, minimize/hide pause and resume, occlusion sampling, rejection of Pad2Touch's own windows, target destruction, and GUI selection of every mode. The diagram check renders the panel and verifies the red region frame, touchpad surface and pad body at the positions computed by the pure layout, and that idle repaints and resizing reuse the desktop thumbnail while a screen area change captures exactly one new one. It also writes `artifacts/screenshots/diagram-*.bmp` for visual review. These images include a desktop thumbnail, so review them before sharing. None needs a touchpad or injects touch.
 
 The following check **submits native touch input** into the helper window, once with a Per-Monitor-V2 host and once with a DPI-unaware host:
 
@@ -167,7 +175,7 @@ Add `-SuppressSystemGestures` to check coexistence with the controller. Start wi
 ## Interpret logs
 
 ```powershell
-.\scripts\Analyze-Run.ps1 -RunDirectory artifacts\YOUR_RUN
+.\scripts\Analyze-Run.ps1 -RunDirectory artifacts\runs\YOUR_RUN
 ```
 
 Review `summary.txt` and `analysis.json`, including parse failures, incomplete frames, injection errors, log loss, receiver lifecycle errors, remaining contacts, and cleanup status. Injection batch counts need not equal received message counts because Windows can coalesce UPDATE messages.

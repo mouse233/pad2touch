@@ -2,22 +2,22 @@
 /target/
 /artifacts/
 /dist/
-
-# Machine-specific test reports must never be published with project docs.
-/local-reports/
-/test-results/
-/docs/*-results.md
-/docs/*-report.md
-/docs/*-reports.md
 *.exe
 *.dll
 *.pdb
 *.zip
 *.log
 
+# Machine-specific test reports must never be published with project docs.
+/local-reports/
+/test-results/
+/docs/**/*-results.md
+/docs/**/*-report.md
+/docs/**/*-reports.md
+
 # Physical-device recordings stay local. Optional tests load these at runtime.
-/tests/fixtures/*.bin
-/tests/fixtures/*.hex
+/tests/fixtures/*
+!/tests/fixtures/README.md
 
 # Credentials, environment overrides and private machine configuration
 .env

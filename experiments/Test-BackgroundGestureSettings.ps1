@@ -13,7 +13,12 @@ param(
 )
 $ErrorActionPreference='Stop'
 $repoPath=Split-Path -Parent $PSScriptRoot
-$helper=Join-Path $repoPath 'artifacts\gesture-cache-probe.exe'
+$helper=Join-Path $repoPath 'artifacts\experiments\gesture-cache-probe.exe'
+if(!(Test-Path -LiteralPath $helper -PathType Leaf)){
+    # Older checkouts may still have the helper needed for recovery.
+    $legacyHelper=Join-Path $repoPath 'artifacts\gesture-cache-probe.exe'
+    if(Test-Path -LiteralPath $legacyHelper -PathType Leaf){$helper=$legacyHelper}
+}
 $captureExe=if($CaptureExecutable){[IO.Path]::GetFullPath($CaptureExecutable)}else{Join-Path $repoPath 'target\release\Pad2Touch.exe'}
 $subkey='Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad'
 $names=@('ThreeFingerTapEnabled','FourFingerTapEnabled','ThreeFingerSlideEnabled','FourFingerSlideEnabled')
@@ -244,7 +249,7 @@ if($Mode -eq 'self-test'){
     Write-Output 'restoration_decision_tests=6 passed; disabled_ownership_tests=4 passed; deadline_roundtrip_tests=2 passed; unlimited_session_tests=8 passed; touchscreen_restore_tests=7 passed; registry_access=false'
     return
 }
-if(!(Test-Path -LiteralPath $helper)){throw 'Compile experiments/gesture-cache-probe.rs into artifacts/gesture-cache-probe.exe first'}
+if(!(Test-Path -LiteralPath $helper -PathType Leaf)){throw 'Compile experiments/gesture-cache-probe.rs into artifacts/experiments/gesture-cache-probe.exe first'}
 if($Mode -eq 'restore'){Restore-Preferences $Journal;return}
 if($Mode -eq 'watchdog'){
     $j=Read-Journal $Journal

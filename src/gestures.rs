@@ -347,7 +347,7 @@ pub fn check_native_controller() -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_nanos();
-    let out = std::path::PathBuf::from(format!("artifacts/gesture-check-{stamp}"));
+    let out = std::path::PathBuf::from(format!("artifacts/runs/gesture-check-{stamp}"));
     let (log, writer) = Log::open(&out)?;
     let guard = Guard::create(log.clone());
     let result = match guard {

@@ -122,7 +122,7 @@ Missing DOWN/UP events, incorrect coordinates, incomplete batches, logged errors
 
 ## Documentation and privacy
 
-Repository documentation describes architecture and reusable testing procedures in English. The original [Chinese whitepaper](Pad2Touch.md) is retained as a specification. Machine-specific reports, checklists containing observations, raw logs, screenshots, and recorded fixtures stay in ignored local directories.
+The [technical whitepaper](Pad2Touch.md) records the design, current implementation status, and release acceptance criteria. Machine-specific reports, checklists containing observations, raw logs, screenshots, and recorded fixtures stay in ignored local directories.
 
 Tapview was used only as a technical reference. Its unconfirmed source license was not treated as permission to copy code. See [third-party notices](third-party-notices.md) and the root LICENSE.
 

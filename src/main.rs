@@ -98,7 +98,7 @@ fn parse_options(args: &[String]) -> Result<experiment::Options, String> {
         background: false,
         device: 0,
         seconds: 60,
-        out: format!("artifacts/run-{stamp}").into(),
+        out: format!("artifacts/runs/run-{stamp}").into(),
     };
     let mut i = 0;
     while i < args.len() {
@@ -201,6 +201,16 @@ mod cli_tests {
             assert!(o.inject);
             assert_eq!(o.seconds, 120);
         }
+    }
+    #[test]
+    fn capture_defaults_to_the_run_directory_and_preserves_explicit_output() {
+        let default = parse_options(&args(&["--capture"])).unwrap();
+        assert_eq!(
+            default.out.parent(),
+            Some(std::path::Path::new("artifacts/runs"))
+        );
+        let explicit = parse_options(&args(&["--self-test", "--out", "custom-run"])).unwrap();
+        assert_eq!(explicit.out, std::path::Path::new("custom-run"));
     }
     #[test]
     fn gesture_guard_is_explicit_and_can_be_exercised_without_hardware() {

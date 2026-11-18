@@ -28,7 +28,7 @@ try {
     if($Inject -and $Mode -ne 'capture'){throw '-Inject is only used with capture; self-test injects automatically'}
     if($Background -and ($Mode -ne 'capture' -or $Inject)){throw '-Background requires raw-only -Mode capture; omit -Inject'}
     $stamp=Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-    $runPath=Join-Path $repoPath "artifacts\phase12-$Mode-$Contacts-$stamp"
+    $runPath=Join-Path $repoPath "artifacts\runs\$Mode-$Contacts-$stamp-$PID"
     $runArgs=@("--$Mode",'--contacts',"$Contacts",'--seconds',"$Seconds",'--out',$runPath)
     if($Mode -eq 'capture'){$runArgs+=@('--device',"$Device");if($Inject){$runArgs+='--inject'}}
     if($SuppressSystemGestures){$runArgs+='--suppress-system-gestures'}

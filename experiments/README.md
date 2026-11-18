@@ -7,10 +7,10 @@ The GUI's explicit **Background guard (experimental)** selection embeds this tra
 ## Build and read-only inspection
 
 ```powershell
-New-Item -ItemType Directory artifacts -Force | Out-Null
-rustc --edition 2021 -D warnings -O experiments\gesture-cache-probe.rs -o artifacts\gesture-cache-probe.exe
-.\artifacts\gesture-cache-probe.exe
-.\artifacts\gesture-cache-probe.exe --read-cache
+New-Item -ItemType Directory artifacts\experiments -Force | Out-Null
+rustc --edition 2021 -D warnings -O experiments\gesture-cache-probe.rs -o artifacts\experiments\gesture-cache-probe.exe
+.\artifacts\experiments\gesture-cache-probe.exe
+.\artifacts\experiments\gesture-cache-probe.exe --read-cache
 .\experiments\Test-BackgroundGestureSettings.ps1 -Mode probe
 .\experiments\Test-BackgroundGestureSettings.ps1 -Mode self-test
 ```
@@ -27,7 +27,7 @@ First review the read-only output and the actual Windows build. The following te
 
 ```powershell
 cargo build --release --locked
-.\experiments\Test-BackgroundGestureSettings.ps1 -Mode apply -ExpectedBuild YOUR_REVIEWED_BUILD -Seconds 75 -RunDirectory artifacts\YOUR_NEW_EXPERIMENT
+.\experiments\Test-BackgroundGestureSettings.ps1 -Mode apply -ExpectedBuild YOUR_REVIEWED_BUILD -Seconds 75 -RunDirectory artifacts\experiments\YOUR_NEW_EXPERIMENT
 ```
 
 For a physical test, add `-WaitForStart`: an operator-controlled dialog appears before any settings change, and the timed test starts only after OK. A start tone and a successful-restoration tone distinguish the interval from ordinary restored operation. Begin the gestures promptly and lift all fingers before the ending tone. `-CaptureExecutable` can pin a previously validated capture binary while unrelated development continues in the checkout.
@@ -54,7 +54,7 @@ Deadline normalization preserves UTC and subsecond precision for both ISO string
 After the experiment, confirm `restored.json` reports exact registry/cache restoration and check ordinary gestures physically. Preserve the entire local directory until recovery is verified. To retry recovery explicitly:
 
 ```powershell
-.\experiments\Test-BackgroundGestureSettings.ps1 -Mode restore -Journal artifacts\YOUR_EXPERIMENT\original.json
+.\experiments\Test-BackgroundGestureSettings.ps1 -Mode restore -Journal artifacts\experiments\YOUR_EXPERIMENT\original.json
 ```
 
 Do not run concurrent experiments, edit preferences during one, replace the helper binary mid-run, or start a new experiment before an earlier journal has been recovered. A change to the same zero value cannot be distinguished from the experiment's own write. The watchdog is a separate best-effort process, not a guarantee against logoff, machine shutdown, killed recovery processes, Explorer failure, or incompatible undocumented interfaces. Forced-termination recovery needs its own test. There is no installed persistent recovery service or automatic startup recovery.

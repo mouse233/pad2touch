@@ -299,7 +299,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let out = PathBuf::from(format!("artifacts/gui-guard-test-{stamp}"));
+        let out = PathBuf::from(format!("artifacts/runs/gui-guard-test-{stamp}"));
         let (log, writer) = Log::open(&out).unwrap();
         let shared = Arc::new(std::sync::Mutex::new(crate::experiment::Stats::default()));
         let guard = Guard::acquire(
@@ -341,7 +341,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let out = PathBuf::from(format!("artifacts/gui-guard-unlimited-{stamp}"));
+            let out = PathBuf::from(format!("artifacts/runs/gui-guard-unlimited-{stamp}"));
             let (log, writer) = Log::open(&out).unwrap();
             let shared = Arc::new(Mutex::new(crate::experiment::Stats::default()));
             let stop = Arc::new(AtomicBool::new(false));
@@ -399,7 +399,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let out = PathBuf::from(format!("artifacts/gui-guard-watchdog-test-{stamp}"));
+        let out = PathBuf::from(format!("artifacts/runs/gui-guard-watchdog-test-{stamp}"));
         let (log, writer) = Log::open(&out).unwrap();
         let shared = Arc::new(std::sync::Mutex::new(crate::experiment::Stats::default()));
         let guard = Guard::acquire(
