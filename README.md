@@ -18,10 +18,18 @@ Pad2Touch reads absolute finger positions from your touchpad through Windows Raw
 
 ## Requirements
 
-- Windows x64 with a Precision Touchpad
-- Rust (stable, MSVC toolchain) with Visual C++ build tools and a Windows SDK
+- Windows x64 (AMD64) or Windows ARM64 with a Precision Touchpad
+- To build from source, install stable Rust with the MSVC toolchain, Visual C++ build tools, and a Windows SDK for your architecture.
 
 ## Getting started
+
+### Download a build
+
+Open the latest successful [CI run for `main`](https://github.com/mouse233/pad2touch/actions/workflows/ci.yml?query=branch%3Amain+is%3Asuccess). Under **Artifacts**, choose `pad2touch-windows-x64-*` for x64 or `pad2touch-windows-arm64-*` for ARM64. Extract the ZIP and run `Pad2Touch.exe`. CI artifacts are available for seven days.
+
+### Build from source
+
+Run these commands with the native Rust MSVC toolchain for your Windows architecture.
 
 ```powershell
 cargo build --release --locked
