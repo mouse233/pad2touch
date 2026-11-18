@@ -66,7 +66,7 @@ jobs:
         run: rustup run stable-${{ matrix.target }} cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Upload build for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pad2touch-windows-${{ matrix.arch }}-${{ github.sha }}
           path: target/${{ matrix.target }}/release/Pad2Touch.exe
