@@ -109,7 +109,7 @@ During a session the worker re-resolves window targets every 16 ms:
 - Minimized, hidden or cloaked (another virtual desktop): contacts are released and frames are ignored until the window returns (`TARGET_PAUSE` / `TARGET_RESUME`).
 - Closed: the session stops (`TARGET_LOST`) and activation is disarmed.
 
-Because Windows routes injected touch by screen position, every non-cleanup DOWN/UPDATE point is hit-tested first; a point covered by another window cancels the sequence (`INJECT_BLOCKED`) instead of touching the wrong application. The diagnostics line also samples a 3×3 grid every 250 ms and reports `COVERED at n/9 sample points` as an early warning. Starting or enabling a shortcut warns if the target runs at a higher integrity level, because UIPI may reject injected input there.
+Because Windows routes injected touch by screen position, every non-cleanup DOWN/UPDATE point is hit-tested first; a point covered by another window cancels the sequence (`INJECT_BLOCKED`) instead of touching the wrong application. Popups of the target itself (windows it owns, and caption-less popups of its process such as menus, drop-down lists and tooltips) count as the target. A blocked point is not a session error: lift all fingers to continue, and Toggle or Hold stays enabled. The diagnostics line also samples a 3×3 grid every 250 ms and reports `COVERED at n/9 sample points` as an early warning. Starting or enabling a shortcut warns if the target runs at a higher integrity level, because UIPI may reject injected input there.
 
 The Foreground guard only applies while Pad2Touch itself is foreground, so it is normally inactive while you work in a target application; Background guard is the relevant option there.
 
