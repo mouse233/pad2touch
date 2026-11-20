@@ -337,7 +337,7 @@ fn review_lease(lease: &Path) -> Result<()> {
                 .ok_or("Previous gesture journal has no directory")?;
             if !restored(dir) {
                 return Err(format!(
-                    "Previous gesture restoration is unverified: {}",
+                    "Previous gesture restoration is unverified: {}. Restart Pad2Touch and accept the recovery prompt, or run `Pad2Touch.exe --recover-gestures`.",
                     previous.journal.display()
                 ));
             }
@@ -727,6 +727,93 @@ fn recover(directory: &Path) -> Result<()> {
     write_json(&done, &Completion::new(changed))
 }
 
+/// Held by a gesture worker for the whole settings transaction.
+const SESSION_LOCK: &str = r"Local\PadBridgeGestureCacheExperiment";
+
+fn lease_path() -> Result<PathBuf> {
+    Ok(std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("Local AppData is unavailable")?
+        .join("PadBridge/ExperimentalGestureCache/active.json"))
+}
+
+fn recently_active(directory: &Path) -> bool {
+    fs::metadata(directory.join("heartbeat.json"))
+        .and_then(|m| m.modified())
+        .is_ok_and(|time| {
+            time.elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(30))
+        })
+}
+
+/// Session journals whose settings were never verified as restored, for
+/// example after a machine shutdown, a crash, or termination of every
+/// recovery process. `skip_live` leaves out journals whose worker heartbeat
+/// is recent, so the GUI does not offer recovery for a session that another
+/// instance or its watchdog is still handling.
+pub fn pending_recoveries(skip_live: bool) -> Vec<PathBuf> {
+    let Ok(root) = recovery_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut pending: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|directory| {
+            directory.join("original.json").is_file()
+                && !restored(directory)
+                && !(skip_live && recently_active(directory))
+        })
+        .collect();
+    pending.sort();
+    pending
+}
+
+/// `--recover-gestures`: restore every unverified journal with the same
+/// transaction the watchdog uses. External changes are preserved, exactly
+/// as in watchdog recovery.
+pub fn recover_all() -> Result<()> {
+    // A running worker holds this lock until its own restoration finishes, so
+    // recovery never races an active capture session.
+    let Ok(_session) = Lock::acquire(SESSION_LOCK, 0) else {
+        return Err(
+            "Pad2Touch gesture blocking is running. Stop capture, then retry.".into(),
+        );
+    };
+    let pending = pending_recoveries(false);
+    let mut failures = Vec::new();
+    for directory in &pending {
+        match recover(directory) {
+            Ok(()) => println!("restored={}", directory.display()),
+            Err(error) => {
+                println!("failed={} error={error}", directory.display());
+                failures.push(format!("{}: {error}", directory.display()));
+            }
+        }
+    }
+    let lease = lease_path()?;
+    if let Err(error) = review_lease(&lease) {
+        failures.push(format!(
+            "{error} If that journal no longer exists, or you already changed these gestures in Windows Settings, check the touchpad and touchscreen gesture settings, then delete {}",
+            lease.display()
+        ));
+    }
+    if failures.is_empty() {
+        println!(
+            "gesture_recovery={}",
+            if pending.is_empty() {
+                "nothing_pending"
+            } else {
+                "restored"
+            }
+        );
+        Ok(())
+    } else {
+        Err(format!("Gesture recovery is incomplete.\n{}", failures.join("\n")))
+    }
+}
+
 fn watchdog(args: &[OsString]) -> Result<()> {
     let [directory, backend_pid, backend_started, owner_pid, owner_started] = args else {
         return Err("Invalid gesture watchdog arguments".into());
@@ -805,11 +892,8 @@ impl Worker {
         if request.scope.touchpad && self.cache.is_none() {
             self.cache = Some(open_touchpad_cache()?);
         }
-        let lease = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or("Local AppData is unavailable")?
-            .join("PadBridge/ExperimentalGestureCache/active.json");
-        let _global = Lock::acquire(r"Local\PadBridgeGestureCacheExperiment", 0)?;
+        let lease = lease_path()?;
+        let _global = Lock::acquire(SESSION_LOCK, 0)?;
         review_lease(&lease)?;
 
         let access = Access::open(request.scope, self.cache.as_ref())?;

@@ -276,6 +276,47 @@ impl HitPolicy {
             Self::Any => true,
         }
     }
+
+    /// Hit-test a desktop point. Menus, drop-down lists, tooltips and owned
+    /// dialogs are separate top-level windows, so `GA_ROOT` never reaches a
+    /// window target from them; they still belong to the target application
+    /// and must not be treated as occluders. Returns the hit window and its
+    /// root when the point is rejected.
+    pub fn hit_test(self, point: POINT) -> Result<(), (usize, usize)> {
+        unsafe {
+            let hit = WindowFromPoint(point);
+            let root = if hit.is_null() {
+                std::ptr::null_mut()
+            } else {
+                GetAncestor(hit, GA_ROOT)
+            };
+            if self.accepts(hit as usize, root as usize) {
+                return Ok(());
+            }
+            if let Self::SameRoot(target) = self {
+                if !root.is_null() && belongs_to_target(target as HWND, root) {
+                    return Ok(());
+                }
+            }
+            Err((hit as usize, root as usize))
+        }
+    }
+}
+
+/// A top-level window owned by the target, or a caption-less popup created
+/// by the target's own process (an unowned menu, for example).
+unsafe fn belongs_to_target(target: HWND, root: HWND) -> bool {
+    if GetAncestor(root, GA_ROOTOWNER) == target {
+        return true;
+    }
+    let (mut target_pid, mut root_pid) = (0u32, 0u32);
+    GetWindowThreadProcessId(target, &mut target_pid);
+    GetWindowThreadProcessId(root, &mut root_pid);
+    let style = GetWindowLongW(root, GWL_STYLE) as u32;
+    target_pid != 0
+        && root_pid == target_pid
+        && style & WS_POPUP != 0
+        && style & WS_CAPTION != WS_CAPTION
 }
 
 pub const TEST_AREA_INSET: i32 = 16;
