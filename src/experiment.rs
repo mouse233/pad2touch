@@ -1392,13 +1392,15 @@ impl Worker {
         if self.mode == "capture" {
             self.rates.frame(start, scan, live > 0);
         }
-        self.log.event(format!(
-            "FRAME active={live} records={} contacts={contacts:?} foreground_scope={} scan_time={}",
-            contacts.len(),
-            scope.label(),
-            scan.map(|v| v.to_string())
-                .unwrap_or_else(|| "unavailable".into())
-        ));
+        if self.log.enabled() {
+            self.log.event(format!(
+                "FRAME active={live} records={} contacts={contacts:?} foreground_scope={} scan_time={}",
+                contacts.len(),
+                scope.label(),
+                scan.map(|v| v.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ));
+        }
         let signal = {
             let mut s = self.shared.lock().unwrap();
             s.frames += 1;
@@ -1505,14 +1507,16 @@ impl Worker {
                 .raw(scope, delivery_code == RIM_INPUTSINK as usize);
             self.last_raw = Instant::now();
             self.shared.lock().unwrap().raw += 1;
-            self.log.event(format!(
-                "RAW handle=0x{handle:X} foreground_scope={} delivery_code={delivery_code} hex={}",
-                scope.label(),
-                report
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<String>()
-            ));
+            if self.log.enabled() {
+                self.log.event(format!(
+                    "RAW handle=0x{handle:X} foreground_scope={} delivery_code={delivery_code} hex={}",
+                    scope.label(),
+                    report
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<String>()
+                ));
+            }
             match self.device.as_ref().unwrap().parse(&self.fields, &report) {
                 Ok(Some(r)) => {
                     let frame_scan = r.scan;

@@ -62,6 +62,11 @@ impl Log {
             handle,
         ))
     }
+    /// Lets hot paths skip formatting records nobody will write.
+    pub fn enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
     pub fn event(&self, s: impl AsRef<str>) {
         let Some(tx) = &self.tx else { return };
         if tx
