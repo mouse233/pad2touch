@@ -275,6 +275,52 @@ pub fn run(diagnostics: bool) -> Result<(), String> {
     result
 }
 
+/// Gesture settings changed by a session that ended without verified
+/// restoration (shutdown, crash, killed processes) stay changed, and the
+/// gesture lease then blocks every later override. Offer recovery at startup.
+/// It runs in a child process, like the gesture worker, so the GUI thread's
+/// COM state is not involved.
+unsafe fn offer_gesture_recovery(hwnd: HWND) {
+    let pending = crate::gesture_backend::pending_recoveries(true);
+    if pending.is_empty() {
+        return;
+    }
+    let caption = wide("Pad2Touch gesture recovery");
+    let question = format!(
+        "An earlier Pad2Touch session changed Windows gesture settings and ended before they were restored ({} session journal(s)). Three- and four-finger gestures may still be turned off.\n\nRestore the saved settings now?",
+        pending.len()
+    );
+    if MessageBoxW(
+        hwnd,
+        wide(&question).as_ptr(),
+        caption.as_ptr(),
+        MB_YESNO | MB_ICONWARNING,
+    ) != IDYES
+    {
+        return;
+    }
+    let outcome = crate::gesture_backend::command("--recover-gestures")
+        .and_then(|mut command| command.output().map_err(|e| e.to_string()))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            }
+        });
+    let (text, icon) = match outcome {
+        Ok(()) => (
+            "Windows gesture settings were restored.".to_owned(),
+            MB_ICONINFORMATION,
+        ),
+        Err(error) => (
+            format!("Recovery failed:\n\n{error}\n\nRetry: Pad2Touch.exe --recover-gestures"),
+            MB_ICONERROR,
+        ),
+    };
+    MessageBoxW(hwnd, wide(&text).as_ptr(), caption.as_ptr(), MB_OK | icon);
+}
+
 fn run_window(diagnostics: bool) -> Result<(), String> {
     experiment::EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
     unsafe {
@@ -328,6 +374,7 @@ fn run_window(diagnostics: bool) -> Result<(), String> {
         // A launcher may set STARTUPINFO.wShowWindow=SW_HIDE for the console.
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        offer_gesture_recovery(hwnd);
         let mut msg = MSG::default();
         let mut result = Ok(());
         loop {
