@@ -4,7 +4,7 @@
 
 Pad2Touch reads finger positions through Windows Raw Input and injects up to five simultaneous contacts at corresponding desktop coordinates. It runs in user mode without a custom driver or changes to the target app.
 
-> **Experimental.** Settings reset between launches.
+> **Experimental.** Settings are saved to `%LOCALAPPDATA%\Pad2Touch\settings.json` and restored on the next launch.
 
 <img src="docs/images/pad2touch-control-panel.png" alt="Pad2Touch Control Panel showing the touchpad mapped to a screen" width="640">
 

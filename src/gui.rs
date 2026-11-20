@@ -6,6 +6,7 @@ use crate::{
     hid::{self, winerr, Device},
     mapping::{self, MappingTarget, NormRect, WindowEntry},
     overlay,
+    settings::{self, Area, Fit, Rect, Settings, Target as SavedTarget, TargetKind},
 };
 use std::{
     cell::RefCell,
@@ -313,10 +314,15 @@ fn run_window(diagnostics: bool) -> Result<(), String> {
             }
         };
         GUI.with(|slot| *slot.borrow_mut() = Some(gui));
+        // Devices come first: a restored selection is matched by device path.
+        let stored = settings::load();
         GUI.with(|slot| {
             let mut slot = slot.borrow_mut();
             let gui = slot.as_mut().unwrap();
             gui.refresh_devices();
+            if let Some(stored) = &stored {
+                gui.apply_settings(stored);
+            }
             gui.layout();
             gui.update_controls();
         });
@@ -1756,6 +1762,116 @@ impl Gui {
             .unwrap_or(self.hwnd);
         SetFocus(next);
     }
+    /// Apply a stored snapshot to the controls. Values that no longer fit this
+    /// machine (a display that is gone, a missing pad area) keep their defaults
+    /// instead of failing the launch.
+    unsafe fn apply_settings(&mut self, stored: &Settings) {
+        for (id, value) in [
+            (INJECT, stored.inject),
+            (FEEDBACK, stored.touch_feedback),
+            (PAD_GESTURES, stored.suppress_touchpad),
+            (SCREEN_GESTURES, stored.suppress_touchscreen),
+        ] {
+            if let Some(value) = value {
+                SendMessageW(self.item(id), BM_SETCHECK, usize::from(value), 0);
+            }
+        }
+        if let Some(mode) = stored.start_mode {
+            let mode = TakeoverMode::from(mode);
+            if let Some(index) = START_MODES.iter().position(|&(entry, _)| entry == mode) {
+                SendMessageW(self.item(MODE), CB_SETCURSEL, index, 0);
+            }
+        }
+        // Only the four validated chords exist; anything else is ignored.
+        if let Some(shortcut) = stored
+            .shortcut
+            .filter(|vk| (VK_F8 as u32..=VK_F11 as u32).contains(vk))
+        {
+            SendMessageW(
+                self.item(KEY),
+                CB_SETCURSEL,
+                (shortcut - VK_F8 as u32) as usize,
+                0,
+            );
+        }
+        if let Some(index) = stored
+            .device
+            .as_ref()
+            .and_then(|path| self.devices.iter().position(|d| &d.path == path))
+        {
+            SendMessageW(self.item(DEVICE), CB_SETCURSEL, index, 0);
+            self.select_device_info();
+        }
+        self.screen_rect = stored.screen_rect.and_then(|r| {
+            mapping::validate_screen_rect(RECT::from(r), mapping::virtual_screen()).ok()
+        });
+        self.window_area = stored.window_area.and_then(Area::norm_rect);
+        self.pad_area = stored.pad_area.and_then(Area::norm_rect);
+        if let Some(fit) = stored.pad_fit {
+            let fit = match fit {
+                // Portion without a usable pad area cannot map anything.
+                Fit::Portion if self.pad_area.is_none() => Fit::FillArea,
+                fit => fit,
+            };
+            SendMessageW(self.item(PAD_FIT), CB_SETCURSEL, fit.selection(), 0);
+        }
+        if let Some(target) = &stored.target {
+            let choice = match (target.kind, &target.monitor) {
+                (TargetKind::Desktop, _) => Some(Choice::Desktop),
+                (TargetKind::Monitor, Some(device)) => self
+                    .monitors
+                    .iter()
+                    .position(|m| &m.device == device)
+                    .map(Choice::Monitor),
+                (TargetKind::Monitor, None) => None,
+                (TargetKind::ScreenPortion, _) => self.screen_rect.map(|_| Choice::ScreenPortion),
+                // A window handle cannot survive a restart, so only the kind is
+                // restored and the list starts empty.
+                (TargetKind::Window, _) => Some(Choice::Window),
+                (TargetKind::TestArea, _) => Some(Choice::Diagnostic),
+            };
+            if let Some(choice) = choice {
+                self.select_choice(choice);
+            }
+            if choice == Some(Choice::Window) {
+                SendMessageW(self.item(WINDOW), CB_SETCURSEL, usize::MAX, 0);
+            }
+        }
+        self.refresh_preview_rect();
+        self.refresh_diagram_preview();
+    }
+    /// Snapshot the controls for the next launch. Purely a read of the current
+    /// state, so it is safe beside a locked (capturing) GUI.
+    unsafe fn save_settings(&self) {
+        let target = match self.choice() {
+            Choice::Desktop => SavedTarget::kind(TargetKind::Desktop),
+            Choice::Monitor(i) => SavedTarget {
+                kind: TargetKind::Monitor,
+                monitor: self.monitors.get(i).map(|m| m.device.clone()),
+            },
+            Choice::ScreenPortion => SavedTarget::kind(TargetKind::ScreenPortion),
+            Choice::Window => SavedTarget::kind(TargetKind::Window),
+            Choice::Diagnostic => SavedTarget::kind(TargetKind::TestArea),
+        };
+        settings::save(&Settings {
+            format: settings::FORMAT,
+            device: self
+                .devices
+                .get(self.selection(DEVICE))
+                .map(|d| d.path.clone()),
+            inject: Some(self.checked(INJECT)),
+            touch_feedback: Some(self.checked(FEEDBACK)),
+            suppress_touchpad: Some(self.checked(PAD_GESTURES)),
+            suppress_touchscreen: Some(self.checked(SCREEN_GESTURES)),
+            start_mode: Some(self.selected_mode().into()),
+            shortcut: Some(self.key()),
+            target: Some(target),
+            screen_rect: self.screen_rect.map(Rect::from),
+            window_area: self.window_area.map(Area::from),
+            pad_area: self.pad_area.map(Area::from),
+            pad_fit: Some(Fit::from_selection(self.selection(PAD_FIT))),
+        });
+    }
     unsafe fn update_controls(&self) {
         let locked =
             self.session.is_some() || self.controller.enabled || self.closing || overlay::active();
@@ -2086,6 +2202,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             _ => {}
                         }
                         g.update_controls();
+                        // Check boxes fall into the no-op arm above; saving here
+                        // covers every persisted control from one place. Window
+                        // and Area reset a stale part rectangle.
+                        if matches!(
+                            id,
+                            DEVICE
+                                | MODE
+                                | KEY
+                                | PAD_GESTURES
+                                | INJECT
+                                | SCREEN_GESTURES
+                                | TARGET
+                                | PAD_FIT
+                                | FEEDBACK
+                                | WINDOW
+                                | AREA
+                        ) && matches!(notification, BN_CLICKED | CBN_SELCHANGE)
+                        {
+                            g.save_settings();
+                        }
                     }
                     WM_HOTKEY if w == EMERGENCY as usize => {
                         g.disarm("Global emergency stop requested.")
@@ -2096,6 +2232,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     WM_TIMER => g.tick(),
                     WM_CLOSE => {
+                        // Controls still hold their values here, including while
+                        // a session defers the actual destroy.
+                        g.save_settings();
                         g.closing = true;
                         g.disarm("Closing after contact cleanup.");
                         if g.session.is_none() {
@@ -2104,6 +2243,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     overlay::WM_SELECTION_DONE => {
                         g.selection_done();
+                        // The only writer of the dragged rectangles.
+                        g.save_settings();
                         g.refresh_diagram_preview();
                         g.update_controls();
                     }

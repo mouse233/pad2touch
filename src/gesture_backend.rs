@@ -316,12 +316,13 @@ pub fn restored(directory: &Path) -> bool {
         .is_ok_and(|record| record.trusted(directory))
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_slice(&data).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+/// Atomic JSON publish; the caller creates the parent directory.
+pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let data = serde_json::to_string(value).map_err(|e| e.to_string())?;
     publish(path, &data)
 }
@@ -644,12 +645,18 @@ pub fn command(mode: &str) -> Result<Command> {
     Ok(cmd)
 }
 
-pub fn recovery_root() -> Result<PathBuf> {
+/// The per-user Pad2Touch directory; journals and GUI settings both live below
+/// it.
+pub fn appdata_root() -> Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or("Local AppData is unavailable")?;
-    Ok(local.join("Pad2Touch").join("recovery"))
+    Ok(local.join("Pad2Touch"))
+}
+
+pub fn recovery_root() -> Result<PathBuf> {
+    Ok(appdata_root()?.join("recovery"))
 }
 
 // The worker and watchdog accept only directories below the per-user recovery root.

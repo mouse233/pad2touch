@@ -26,7 +26,7 @@ Toggle uses Ctrl+Alt+F8, F9, F10, or F11. If Windows rejects the chosen chord, P
 
 Stop waits for the worker, then processes receiver messages for at least 300 ms. Another session waits for that drain. Test area trails remain visible after stopping. Unresolved injected or received contacts prevent another session. Worker failures and safety stops disarm activation instead of automatically restarting capture.
 
-With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the Pad2Touch window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are not persisted across launches; Always-on, tray management, and startup recovery are not implemented.
+With the Test area target, moving, resizing, minimizing, or changing the display stops active touch injection; restore/place the GUI before starting. Application targets follow their own window instead (see below), and the Pad2Touch window may then be moved or minimized freely. A display configuration change stops every injecting session. Raw-only sessions can remain active while minimized or behind another application. Settings are saved to `%LOCALAPPDATA%\Pad2Touch\settings.json` whenever they change and restored on the next launch; Always-on, tray management, and startup recovery are not implemented.
 
 ## Diagnostics and system gestures
 
@@ -81,7 +81,7 @@ While idle, the region is re-resolved every 250 ms, so moving a target window up
 
 The desktop thumbnail refreshes once per second while the Pad2Touch main window is active in the foreground and shows the mapping diagram. It pauses when another window takes focus, when Pad2Touch is minimized, or while an area is being selected. A worker reads the desktop so the GUI can repaint and respond to input independently.
 
-The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. Pad2Touch's own windows cannot be application targets. Selections are not persisted across launches.
+The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. Pad2Touch's own windows cannot be application targets. The **Application window** choice is restored on the next launch, but the window itself is not: window handles do not survive a restart, so choose the window again before starting.
 
 ### Touchpad area
 
