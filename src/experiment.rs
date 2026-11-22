@@ -3,6 +3,7 @@ use crate::{
     hid::{self, winerr, Device},
     injection::Injector,
     logging::Log,
+    touch::FrameOutcome,
 };
 use std::{
     cell::RefCell,
@@ -1367,20 +1368,13 @@ impl Worker {
         self.pending_since = None;
         self.capture.reset_fragments();
     }
-    /// A point covered by another window cancels the touch sequence
-    /// (`INJECT_BLOCKED`) and waits for all fingers to lift, but it is not a
-    /// worker failure: it must not end the session with an error, which
-    /// would also disarm the Toggle or Hold shortcut.
-    fn injection_result(&mut self, blocked_before: u64, result: Result<(), String>) {
-        let Err(error) = result else { return };
-        let occluded = self
-            .injector
-            .as_ref()
-            .is_some_and(|i| i.blocked() > blocked_before && !i.cleanup_pending());
-        if occluded {
-            self.log.event(format!("INJECT_OCCLUDED {error}"));
-        } else {
-            self.error(error);
+    fn injection_result(&mut self, result: Result<FrameOutcome, String>) {
+        match result {
+            Ok(FrameOutcome::Accepted) => {}
+            Ok(FrameOutcome::Occluded) => {
+                self.log.event("INJECT_OCCLUDED waiting_for_all_fingers_up")
+            }
+            Err(error) => self.error(error),
         }
     }
     fn accept(&mut self, contacts: Vec<Contact>, start: Instant, scan: Option<u32>) {
@@ -1433,9 +1427,8 @@ impl Worker {
         let paused = self.tracker.as_ref().is_some_and(|t| t.paused());
         if let Some(i) = self.injector.as_mut().filter(|_| !paused) {
             let before = i.successes();
-            let blocked = i.blocked();
             let result = i.frame(&contacts);
-            self.injection_result(blocked, result);
+            self.injection_result(result);
             let elapsed = start.elapsed().as_micros();
             if self
                 .injector
@@ -1621,9 +1614,8 @@ impl Worker {
             }
         }
         if let Some(i) = &mut self.injector {
-            let blocked = i.blocked();
             let result = i.keepalive();
-            self.injection_result(blocked, result);
+            self.injection_result(result);
         }
         self.sync_stats();
     }

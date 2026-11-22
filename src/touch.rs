@@ -319,6 +319,12 @@ impl Failure {
         *self == Self::Win32(87)
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    Accepted,
+    Occluded,
+}
+
 pub trait Transport {
     fn inject(&mut self, frame: &Frame) -> Result<(), Failure>;
     fn retry_delay(&mut self) {}
@@ -372,7 +378,9 @@ impl<T: Transport> Engine<T> {
                     self.transport.retry_delay();
                 }
                 Err(e) => {
-                    self.failures += 1;
+                    if e != Failure::TargetUnavailable {
+                        self.failures += 1;
+                    }
                     self.planner.armed = false;
                     if e.cancels_all() {
                         self.planner.active.clear();
@@ -415,7 +423,14 @@ impl<T: Transport> Engine<T> {
             Err(cleanup) => format!("{cause}; {cleanup}"),
         }
     }
-    pub fn apply(&mut self, input: &[Contact]) -> Result<(), String> {
+    fn frame_failure(&mut self, operation: &str, failure: Failure) -> Result<FrameOutcome, String> {
+        match self.cancel() {
+            Ok(()) if failure == Failure::TargetUnavailable => Ok(FrameOutcome::Occluded),
+            Ok(()) => Err(format!("touch {operation} failed: {failure:?}")),
+            Err(cleanup) => Err(format!("touch {operation} failed: {failure:?}; {cleanup}")),
+        }
+    }
+    pub fn apply(&mut self, input: &[Contact]) -> Result<FrameOutcome, String> {
         if self.cleanup_pending {
             self.cancel()?;
             return Err("cleanup recovered; waiting for a new empty physical frame".into());
@@ -423,25 +438,24 @@ impl<T: Transport> Engine<T> {
         let (plan, armed) = self.planner.plan(input).map_err(|e| self.fail(e))?;
         for frame in plan {
             if let Err(e) = self.send(frame) {
-                let msg = self.fail(format!("touch frame failed: {e:?}"));
-                return Err(msg);
+                return self.frame_failure("frame", e);
             }
         }
         self.planner.armed = armed;
-        Ok(())
+        Ok(FrameOutcome::Accepted)
     }
-    pub fn keepalive(&mut self) -> Result<(), String> {
+    pub fn keepalive(&mut self) -> Result<FrameOutcome, String> {
         if self.cleanup_pending {
-            return self.cancel();
+            self.cancel()?;
+            return Ok(FrameOutcome::Accepted);
         }
         if self.active_count() > 0 {
             let frame = Planner::update_frame(&self.planner.active, false);
             if let Err(e) = self.send(frame) {
-                let msg = self.fail(format!("touch keepalive failed: {e:?}"));
-                return Err(msg);
+                return self.frame_failure("keepalive", e);
             }
         }
-        Ok(())
+        Ok(FrameOutcome::Accepted)
     }
 }
 
@@ -1023,13 +1037,56 @@ pub mod tests {
         }
     }
     #[test]
-    fn keepalive_and_target_failures_cancel_all() {
-        for failure in [Failure::Win32(5), Failure::TargetUnavailable] {
+    fn keepalive_failures_cancel_all() {
+        let mut e = armed(5);
+        e.apply(&[contact(7, 0, 0), contact(8, 500, 500)]).unwrap();
+        e.transport.errors.push_back(Some(Failure::Win32(5)));
+        assert!(e.keepalive().is_err());
+        assert_eq!(e.active_count(), 0);
+        assert_eq!(e.failures, 1);
+        assert!(!e.is_armed());
+    }
+
+    #[test]
+    fn occlusion_cancels_active_contacts_and_rearms_only_after_empty_frame() {
+        for keepalive in [false, true] {
             let mut e = armed(5);
-            e.apply(&[contact(7, 0, 0), contact(8, 500, 500)]).unwrap();
-            e.transport.errors.push_back(Some(failure));
-            assert!(e.keepalive().is_err());
+            let contacts = [contact(7, 0, 0)];
+            e.apply(&contacts).unwrap();
+            e.transport
+                .errors
+                .push_back(Some(Failure::TargetUnavailable));
+            let outcome = if keepalive {
+                e.keepalive()
+            } else {
+                e.apply(&contacts)
+            };
+            assert_eq!(outcome, Ok(FrameOutcome::Occluded));
+            assert_eq!(e.failures, 0);
             assert_eq!(e.active_count(), 0);
+            assert!(!e.cleanup_pending);
+            assert!(!e.is_armed());
+            e.apply(&contacts).unwrap();
+            assert_eq!(e.active_count(), 0);
+            e.apply(&[]).unwrap();
+            e.apply(&contacts).unwrap();
+            assert_eq!(e.active_count(), 1);
+        }
+    }
+
+    #[test]
+    fn occlusion_reports_cleanup_failure_even_when_win32_drops_all_contacts() {
+        for code in [5, 87] {
+            let mut e = armed(5);
+            let contacts = [contact(7, 0, 0)];
+            e.apply(&contacts).unwrap();
+            e.transport
+                .errors
+                .extend([Some(Failure::TargetUnavailable), Some(Failure::Win32(code))]);
+            let error = e.keepalive().unwrap_err();
+            assert!(error.contains("touch cancellation failed"));
+            assert_eq!(e.failures, 1);
+            assert_eq!(e.cleanup_pending, code != 87);
             assert!(!e.is_armed());
         }
     }

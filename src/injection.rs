@@ -4,7 +4,7 @@ use crate::{
     hid::winerr,
     logging::Log,
     mapping::{HitPolicy, NormRect},
-    touch::{Action, Engine, Failure, Frame, Rectangle, Transport},
+    touch::{Action, Engine, Failure, Frame, FrameOutcome, Rectangle, Transport},
 };
 use std::{
     thread,
@@ -159,7 +159,7 @@ impl Injector {
             log,
         })
     }
-    pub fn frame(&mut self, input: &[Contact]) -> Result<(), String> {
+    pub fn frame(&mut self, input: &[Contact]) -> Result<FrameOutcome, String> {
         let before = self.engine.successes;
         let result = self.engine.apply(input);
         if self.engine.successes != before {
@@ -178,7 +178,7 @@ impl Injector {
     pub fn blocked(&self) -> u64 {
         self.engine.transport.blocked
     }
-    pub fn keepalive(&mut self) -> Result<(), String> {
+    pub fn keepalive(&mut self) -> Result<FrameOutcome, String> {
         if self.last_sent.elapsed() >= Duration::from_millis(16) {
             let before = self.engine.successes;
             let result = self.engine.keepalive();
@@ -187,7 +187,7 @@ impl Injector {
             }
             result
         } else {
-            Ok(())
+            Ok(FrameOutcome::Accepted)
         }
     }
     pub fn has_active(&self) -> bool {

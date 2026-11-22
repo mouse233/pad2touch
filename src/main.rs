@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
         return gestures::check_native_controller();
     }
     if args == ["--recover-gestures"] {
-        return gesture_backend::recover_all();
+        return gesture_backend::recover_pending();
     }
     if args.first().is_some_and(|s| s == "--verify-log") {
         if args.len() != 2 {

@@ -12,7 +12,7 @@ use crate::{
         self, tuple, Decision, HitPolicy, MappingTarget, NormRect, Observation, ResolvedTarget,
         Tracker,
     },
-    touch::tests::contact,
+    touch::{tests::contact, FrameOutcome},
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -300,15 +300,7 @@ unsafe fn cover(r: RECT) -> HWND {
 fn covered(target: &ResolvedTarget) -> usize {
     mapping::sample_points(target.bounds, 3)
         .into_iter()
-        .filter(|&p| unsafe {
-            let hit = WindowFromPoint(p);
-            let root = if hit.is_null() {
-                null_mut()
-            } else {
-                GetAncestor(hit, GA_ROOT)
-            };
-            !target.hit.accepts(hit as usize, root as usize)
-        })
+        .filter(|&p| target.hit.hit_test(p).is_err())
         .count()
 }
 
@@ -726,7 +718,11 @@ fn native_touch_injection_lands_in_external_window_at_mapped_positions() {
                 bottom: center.y + 30,
             });
             assert!(wait_for(|| covered(&rect_target) > 0));
-            assert!(injector.frame(&[contact(6, 500, 500)]).is_err());
+            assert_eq!(
+                injector.frame(&[contact(6, 500, 500)]),
+                Ok(FrameOutcome::Occluded)
+            );
+            assert_eq!(injector.failures(), 0);
             assert_eq!((injector.active_count(), injector.blocked()), (0, 1));
             assert!(host.touches(Duration::from_millis(250)).is_empty());
             DestroyWindow(occluder);

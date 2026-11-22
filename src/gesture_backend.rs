@@ -150,21 +150,23 @@ impl Drop for Key {
 struct Lock(HANDLE);
 impl Lock {
     fn acquire(name: &str, timeout_ms: u32) -> Result<Self> {
+        Self::try_acquire(name, timeout_ms)?.ok_or_else(|| format!("Could not acquire {name}"))
+    }
+
+    fn try_acquire(name: &str, timeout_ms: u32) -> Result<Option<Self>> {
         let mutex = unsafe { CreateMutexW(null(), 0, wide(name).as_ptr()) };
         if mutex.is_null() {
             return Err(io::Error::last_os_error().to_string());
         }
-        if matches!(
-            unsafe { WaitForSingleObject(mutex, timeout_ms) },
-            WAIT_OBJECT_0 | WAIT_ABANDONED
-        ) {
-            Ok(Self(mutex))
-        } else {
-            unsafe {
-                CloseHandle(mutex);
-            }
-            Err(format!("Could not acquire {name}"))
+        let result = match unsafe { WaitForSingleObject(mutex, timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => return Ok(Some(Self(mutex))),
+            WAIT_TIMEOUT => Ok(None),
+            _ => Err(format!("{name}: {}", io::Error::last_os_error())),
+        };
+        unsafe {
+            CloseHandle(mutex);
         }
+        result
     }
 }
 impl Drop for Lock {
@@ -326,26 +328,32 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     publish(path, &data)
 }
 
-fn review_lease(lease: &Path) -> Result<()> {
-    match fs::read(lease) {
-        Ok(data) => {
-            let previous: Lease = serde_json::from_slice(&data)
-                .map_err(|e| format!("Previous gesture lease is invalid: {e}"))?;
-            let dir = previous
-                .journal
-                .parent()
-                .ok_or("Previous gesture journal has no directory")?;
-            if !restored(dir) {
-                return Err(format!(
-                    "Previous gesture restoration is unverified: {}. Restart Pad2Touch and accept the recovery prompt, or run `Pad2Touch.exe --recover-gestures`.",
-                    previous.journal.display()
-                ));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_error(error)),
+fn pending_journal(lease: &Path) -> Result<Option<PathBuf>> {
+    let data = match fs::read(lease) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let previous: Lease = serde_json::from_slice(&data)
+        .map_err(|e| format!("Previous gesture lease is invalid: {e}"))?;
+    if previous.journal.file_name() != Some(OsStr::new("original.json")) {
+        return Err("Previous gesture lease has an invalid journal path".into());
     }
+    let dir = previous
+        .journal
+        .parent()
+        .ok_or("Previous gesture journal has no directory")?;
+    Ok((!restored(dir)).then(|| dir.to_owned()))
+}
+
+fn review_lease(lease: &Path) -> Result<()> {
+    if let Some(dir) = pending_journal(lease)? {
+        return Err(format!(
+            "Previous gesture restoration is unverified: {}. Restart Pad2Touch and accept the recovery prompt, or run `Pad2Touch.exe --recover-gestures`.",
+            dir.join("original.json").display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -737,81 +745,42 @@ fn lease_path() -> Result<PathBuf> {
         .join("PadBridge/ExperimentalGestureCache/active.json"))
 }
 
-fn recently_active(directory: &Path) -> bool {
-    fs::metadata(directory.join("heartbeat.json"))
-        .and_then(|m| m.modified())
-        .is_ok_and(|time| {
-            time.elapsed()
-                .is_ok_and(|age| age < Duration::from_secs(30))
-        })
+fn recovery_error(lease: &Path, error: String) -> String {
+    format!(
+        "{error}\nIf the journal is missing or you changed the settings yourself, verify your touchpad and touchscreen gesture settings in Windows Settings, then delete {}",
+        lease.display()
+    )
 }
 
-/// Session journals whose settings were never verified as restored, for
-/// example after a machine shutdown, a crash, or termination of every
-/// recovery process. `skip_live` leaves out journals whose worker heartbeat
-/// is recent, so the GUI does not offer recovery for a session that another
-/// instance or its watchdog is still handling.
-pub fn pending_recoveries(skip_live: bool) -> Vec<PathBuf> {
-    let Ok(root) = recovery_root() else {
-        return Vec::new();
+pub fn recovery_needed() -> Result<bool> {
+    // The worker holds this mutex throughout the transaction. An abandoned
+    // mutex is acquired immediately, even if the last heartbeat is recent.
+    let Some(_session) = Lock::try_acquire(SESSION_LOCK, 0)? else {
+        return Ok(false);
     };
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut pending: Vec<_> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|directory| {
-            directory.join("original.json").is_file()
-                && !restored(directory)
-                && !(skip_live && recently_active(directory))
-        })
-        .collect();
-    pending.sort();
-    pending
-}
-
-/// `--recover-gestures`: restore every unverified journal with the same
-/// transaction the watchdog uses. External changes are preserved, exactly
-/// as in watchdog recovery.
-pub fn recover_all() -> Result<()> {
-    // A running worker holds this lock until its own restoration finishes, so
-    // recovery never races an active capture session.
-    let Ok(_session) = Lock::acquire(SESSION_LOCK, 0) else {
-        return Err(
-            "Pad2Touch gesture blocking is running. Stop capture, then retry.".into(),
-        );
-    };
-    let pending = pending_recoveries(false);
-    let mut failures = Vec::new();
-    for directory in &pending {
-        match recover(directory) {
-            Ok(()) => println!("restored={}", directory.display()),
-            Err(error) => {
-                println!("failed={} error={error}", directory.display());
-                failures.push(format!("{}: {error}", directory.display()));
-            }
-        }
-    }
     let lease = lease_path()?;
-    if let Err(error) = review_lease(&lease) {
-        failures.push(format!(
-            "{error} If that journal no longer exists, or you already changed these gestures in Windows Settings, check the touchpad and touchscreen gesture settings, then delete {}",
-            lease.display()
-        ));
-    }
-    if failures.is_empty() {
-        println!(
-            "gesture_recovery={}",
-            if pending.is_empty() {
-                "nothing_pending"
-            } else {
-                "restored"
-            }
-        );
+    pending_journal(&lease)
+        .map(|pending| pending.is_some())
+        .map_err(|error| recovery_error(&lease, error))
+}
+
+pub fn recover_pending() -> Result<()> {
+    let Some(_session) = Lock::try_acquire(SESSION_LOCK, 0)? else {
+        return Err("Pad2Touch gesture blocking is running. Stop capture, then retry.".into());
+    };
+    let lease = lease_path()?;
+    let recover_current = || -> Result<()> {
+        if let Some(directory) = pending_journal(&lease)? {
+            validate_directory(&directory)?;
+            recover(&directory)?;
+            println!("restored={}", directory.display());
+            println!("gesture_recovery=restored");
+        } else {
+            println!("gesture_recovery=nothing_pending");
+        }
         Ok(())
-    } else {
-        Err(format!("Gesture recovery is incomplete.\n{}", failures.join("\n")))
-    }
+    };
+    recover_current().map_err(|error| recovery_error(&lease, error))
 }
 
 fn watchdog(args: &[OsString]) -> Result<()> {
@@ -1159,9 +1128,101 @@ mod tests {
     }
 
     #[test]
+    fn standalone_recovery_only_processes_the_current_lease() {
+        let appdata = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("pad2touch-lease-test-{}", guid().unwrap()));
+        let root = appdata.join("Pad2Touch/recovery");
+        let lease = appdata.join("PadBridge/ExperimentalGestureCache/active.json");
+        fs::create_dir_all(lease.parent().unwrap()).unwrap();
+        let snapshot = Snapshot {
+            pad: None,
+            screen: Some(ScreenSnapshot {
+                preference: None,
+                runtime: 1,
+            }),
+        };
+        let make_journal = |directory: &Path| {
+            fs::create_dir_all(directory).unwrap();
+            write_json(
+                &directory.join("original.json"),
+                &snapshot.journal(guid().unwrap()),
+            )
+            .unwrap();
+        };
+        let stale = root.join("stale");
+        let current = root.join("current");
+        let outside = appdata.join("outside");
+        for directory in [&stale, &current, &outside] {
+            make_journal(directory);
+        }
+        // These transactions never changed settings, so the recovery process
+        // can exercise selection and completion without touching real settings.
+        let write_lease = |directory: &Path| {
+            write_json(
+                &lease,
+                &Lease {
+                    journal: directory.join("original.json"),
+                },
+            )
+            .unwrap();
+        };
+        let run_child = |mode| {
+            command(mode)
+                .unwrap()
+                .env("LOCALAPPDATA", &appdata)
+                .output()
+                .unwrap()
+        };
+        let recover = || run_child("--recover-gestures");
+        let recovery_needed = || {
+            let output = run_child("recovery-needed");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).contains("recovery_needed=true")
+        };
+
+        write_lease(&outside);
+        assert!(!recover().status.success());
+        assert!(!restored(&outside));
+        write_lease(&current);
+        durable(&current.join("heartbeat.json"), "{}").unwrap();
+        {
+            let _active = Lock::acquire(SESSION_LOCK, 5000).unwrap();
+            assert!(!recovery_needed());
+            assert!(!recover().status.success());
+            assert!(!restored(&current));
+        }
+        assert!(
+            recovery_needed(),
+            "a fresh heartbeat can outlive its worker"
+        );
+
+        let output = recover();
+        assert!(output.status.success(), "{output:?}");
+        assert!(restored(&current));
+        assert!(!restored(&stale));
+        review_lease(&lease).unwrap();
+
+        fs::remove_file(&lease).unwrap();
+        assert!(!recovery_needed());
+        assert!(recover().status.success());
+        assert!(!restored(&stale));
+        fs::remove_dir_all(appdata).unwrap();
+    }
+
+    #[test]
     #[ignore = "internal child process entry point for native gesture integration tests"]
     fn child_process() {
         let mode = std::env::var("PAD2TOUCH_TEST_GESTURE_CHILD").unwrap();
+        match mode.as_str() {
+            "--recover-gestures" => return super::recover_pending().unwrap(),
+            "recovery-needed" => {
+                println!("recovery_needed={}", super::recovery_needed().unwrap());
+                return;
+            }
+            _ => {}
+        }
         let args: Vec<String> =
             serde_json::from_str(&std::env::var("PAD2TOUCH_TEST_GESTURE_ARGS").unwrap()).unwrap();
         super::run(&mode, &args.into_iter().map(Into::into).collect::<Vec<_>>()).unwrap();
