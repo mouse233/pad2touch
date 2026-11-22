@@ -1,6 +1,17 @@
 use crate::decode::{Field, Report};
 use std::{mem::size_of, ptr::null_mut};
-use windows_sys::Win32::{Devices::HumanInterfaceDevice::*, Foundation::*, UI::Input::*};
+use windows_sys::Win32::{
+    Devices::{
+        DeviceAndDriverInstallation::{
+            CM_Get_DevNode_PropertyW, CM_Get_Device_Interface_PropertyW, CM_Locate_DevNodeW,
+            CM_LOCATE_DEVNODE_NORMAL, CONFIGRET, CR_BUFFER_SMALL, CR_SUCCESS,
+        },
+        HumanInterfaceDevice::*,
+        Properties::{DEVPKEY_Device_InstanceId, DEVPKEY_NAME, DEVPROP_TYPE_STRING},
+    },
+    Foundation::*,
+    UI::Input::*,
+};
 
 pub fn winerr(api: &str) -> String {
     format!("{api}: Win32 error {}", unsafe { GetLastError() })
@@ -101,6 +112,31 @@ impl Device {
     }
     pub fn pp(&self) -> PHIDP_PREPARSED_DATA {
         self.pp.as_ptr() as isize
+    }
+    pub fn name(&self) -> Option<String> {
+        let path: Vec<u16> = self.path.encode_utf16().chain([0]).collect();
+        let interface_property = |key| {
+            device_property_string(|kind, buffer, size| unsafe {
+                CM_Get_Device_Interface_PropertyW(path.as_ptr(), key, kind, buffer, size, 0)
+            })
+        };
+        if let Some(name) = interface_property(&DEVPKEY_NAME) {
+            return Some(name);
+        }
+
+        // A Raw Input path identifies the HID interface. Its owning device
+        // can have a display name even when the interface itself has none.
+        let instance = interface_property(&DEVPKEY_Device_InstanceId)?;
+        let instance: Vec<u16> = instance.encode_utf16().chain([0]).collect();
+        let mut node = 0;
+        if unsafe { CM_Locate_DevNodeW(&mut node, instance.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) }
+            != CR_SUCCESS
+        {
+            return None;
+        }
+        device_property_string(|kind, buffer, size| unsafe {
+            CM_Get_DevNode_PropertyW(node, &DEVPKEY_NAME, kind, buffer, size, 0)
+        })
     }
     pub fn summary(&self) -> String {
         format!("handle=0x{:X} VID={:04X} PID={:04X} usage={:02X}:{:02X} input_bytes={} value_caps={} button_caps={} path={}", self.handle, self.vid, self.pid, self.caps.UsagePage, self.caps.Usage, self.caps.InputReportByteLength, self.caps.NumberInputValueCaps, self.caps.NumberInputButtonCaps, self.path)
@@ -232,6 +268,26 @@ impl Device {
         crate::decode::decode(fields, report[0], &entries)
     }
 }
+fn device_property_string(
+    mut query: impl FnMut(*mut u32, *mut u8, *mut u32) -> CONFIGRET,
+) -> Option<String> {
+    let mut kind = 0;
+    let mut bytes = 0;
+    if query(&mut kind, null_mut(), &mut bytes) != CR_BUFFER_SMALL {
+        return None;
+    }
+    let mut value = vec![0u16; (bytes as usize).div_ceil(2)];
+    if query(&mut kind, value.as_mut_ptr().cast(), &mut bytes) != CR_SUCCESS
+        || kind != DEVPROP_TYPE_STRING
+    {
+        return None;
+    }
+    let end = value.iter().position(|&unit| unit == 0)?;
+    let value = String::from_utf16_lossy(&value[..end]);
+    let name = value.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 pub fn discover() -> Result<Vec<Device>, String> {
     unsafe {
         let mut count = 0;
@@ -337,6 +393,9 @@ pub fn probe() -> Result<(), String> {
     );
     for (i, d) in devices.iter().enumerate() {
         println!("device[{i}]: {}", d.summary());
+        if let Some(name) = d.name() {
+            println!("  Name: {name}");
+        }
         match d.geometry().and_then(|g| g.description()) {
             Ok(info) => println!("  {info}"),
             Err(error) => println!("  Physical geometry unavailable: {error}"),

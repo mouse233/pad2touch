@@ -260,10 +260,6 @@ unsafe fn register(class: &str, proc: WNDPROC, style: WNDCLASS_STYLES) -> Result
 }
 
 pub fn run(diagnostics: bool) -> Result<(), String> {
-    // Detach this process only; command-line capture and verification keep stdout.
-    unsafe {
-        windows_sys::Win32::System::Console::FreeConsole();
-    }
     let result = run_window(diagnostics);
     if let Err(error) = &result {
         unsafe {
@@ -332,8 +328,6 @@ fn run_window(diagnostics: bool) -> Result<(), String> {
             DestroyWindow(hwnd);
             return Err(winerr("SetTimer(GUI)"));
         }
-        ShowWindow(hwnd, SW_SHOW);
-        // A launcher may set STARTUPINFO.wShowWindow=SW_HIDE for the console.
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
         let mut msg = MSG::default();
@@ -962,6 +956,12 @@ impl Gui {
         if rc.right <= 0 || rc.bottom <= 0 {
             return;
         }
+        SendMessageW(
+            self.item(DEVICE),
+            CB_SETDROPPEDWIDTH,
+            self.px(340) as WPARAM,
+            0,
+        );
         // Only controls whose bounds change are moved, and Windows' own
         // invalidation is used: only uncovered background is erased, and resized
         // group boxes and the panel repaint from back buffers.
@@ -1065,11 +1065,27 @@ impl Gui {
             Ok(devices) => {
                 self.devices = devices;
                 SendMessageW(self.item(DEVICE), CB_RESETCONTENT, 0, 0);
-                for (i, d) in self.devices.iter().enumerate() {
-                    let label = if self.diagnostics {
-                        format!("{} · VID {:04X} / PID {:04X}", i + 1, d.vid, d.pid)
+                let labels: Vec<_> = self
+                    .devices
+                    .iter()
+                    .map(|device| match device.name() {
+                        Some(name) if self.diagnostics => {
+                            format!("{name} ({:04X}:{:04X})", device.vid, device.pid)
+                        }
+                        Some(name) => name,
+                        None => format!("Touchpad ({:04X}:{:04X})", device.vid, device.pid),
+                    })
+                    .collect();
+                for (i, label) in labels.iter().enumerate() {
+                    let label = if labels
+                        .iter()
+                        .filter(|other| *other == label)
+                        .nth(1)
+                        .is_some()
+                    {
+                        format!("{} · {label}", i + 1)
                     } else {
-                        format!("Precision Touchpad {}", i + 1)
+                        label.clone()
                     };
                     SendMessageW(
                         self.item(DEVICE),

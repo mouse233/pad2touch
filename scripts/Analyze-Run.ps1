@@ -8,7 +8,7 @@ if($lines | Select-String -Pattern ' RUN format=2 ' -Quiet){
     # The verifier's JSON and exit status carry the result. Capture its stderr
     # separately so PowerShell 5 does not turn an expected failed audit into a
     # terminating NativeCommandError before analysis.json can be written.
-    $analysis=& $exePath --verify-log (Join-Path $runPath 'events.log') 2> (Join-Path $runPath 'verification-stderr.txt')
+    $analysis=& $exePath --verify-log (Join-Path $runPath 'events.log') 2> (Join-Path $runPath 'verification-stderr.txt') | Write-Output
     $code=$LASTEXITCODE
     $analysis | Set-Content -LiteralPath (Join-Path $runPath 'analysis.json') -Encoding utf8
     $analysis

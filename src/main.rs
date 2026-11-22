@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod background_guard;
 mod capture;
 mod control;
@@ -38,6 +40,12 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if let Some(diagnostics) = gui_diagnostics(&args) {
         return gui::run(diagnostics);
+    }
+    // Command-line modes can use the caller's console without creating one.
+    // Windows preserves redirected handles supplied by the caller.
+    unsafe {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        AttachConsole(ATTACH_PARENT_PROCESS);
     }
     if args == ["--gesture-support"] {
         println!(

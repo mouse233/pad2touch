@@ -15,16 +15,17 @@ $exePath=Join-Path $repoPath 'target\release\Pad2Touch.exe'
 if(!(Test-Path -LiteralPath $exePath)){throw 'Build first: cargo build --release --locked'}
 Push-Location -LiteralPath $repoPath
 try {
+    # Pipe output so PowerShell waits for the GUI-subsystem executable and sets $LASTEXITCODE.
     if($Diagnostics -and $Mode -ne 'gui'){throw '-Diagnostics is only used with -Mode gui'}
     if($Mode -eq 'gui'){
         if($Inject -or $SuppressSystemGestures -or $Background){throw 'Use the GUI controls for injection and foreground gesture ownership; -Background is a CLI capture diagnostic'}
         $guiArgs=@('--gui')
         if($Diagnostics){$guiArgs+='--diagnostics'}
-        & $exePath @guiArgs
+        & $exePath @guiArgs | Write-Output
         if($LASTEXITCODE -ne 0){throw 'Pad2Touch GUI failed'}
         return
     }
-    if($Mode -eq 'probe'){& $exePath --probe;if($LASTEXITCODE -ne 0){throw 'Device discovery failed'};return}
+    if($Mode -eq 'probe'){& $exePath --probe | Write-Output;if($LASTEXITCODE -ne 0){throw 'Device discovery failed'};return}
     if($Inject -and $Mode -ne 'capture'){throw '-Inject is only used with capture; self-test injects automatically'}
     if($Background -and ($Mode -ne 'capture' -or $Inject)){throw '-Background requires raw-only -Mode capture; omit -Inject'}
     $stamp=Get-Date -Format 'yyyyMMdd-HHmmss-fff'
@@ -33,7 +34,7 @@ try {
     if($Mode -eq 'capture'){$runArgs+=@('--device',"$Device");if($Inject){$runArgs+='--inject'}}
     if($SuppressSystemGestures){$runArgs+='--suppress-system-gestures'}
     if($Background){$runArgs+='--background'}
-    & $exePath @runArgs
+    & $exePath @runArgs | Write-Output
     $experimentCode=$LASTEXITCODE
     Write-Output "Local results: $runPath"
     if($Inject -or $Mode -eq 'self-test'){
