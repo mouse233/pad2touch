@@ -6,6 +6,7 @@ use crate::{
     hid::{self, winerr, Device},
     mapping::{self, MappingTarget, NormRect, WindowEntry},
     overlay,
+    settings::{self, Area, Fit, Settings, Target as SavedTarget, TargetKind},
 };
 use std::{
     cell::RefCell,
@@ -142,9 +143,11 @@ struct Gui {
     closing: bool,
     restart_blocked: bool,
     last_status: String,
+    settings_path: Option<PathBuf>,
     windows: Vec<WindowEntry>,
     screen_rect: Option<RECT>,
     window_area: Option<NormRect>,
+    pending_window_area: Option<NormRect>,
     pad_area: Option<NormRect>,
     pending_selection: Option<Pending>,
     session_diagnostic: bool,
@@ -313,10 +316,15 @@ fn run_window(diagnostics: bool) -> Result<(), String> {
             }
         };
         GUI.with(|slot| *slot.borrow_mut() = Some(gui));
+        // Devices come first: a restored selection is matched by device path.
         GUI.with(|slot| {
             let mut slot = slot.borrow_mut();
             let gui = slot.as_mut().unwrap();
             gui.refresh_devices();
+            gui.settings_path = settings::user_path();
+            if let Some(stored) = gui.settings_path.as_deref().and_then(settings::load) {
+                gui.apply_settings(&stored);
+            }
             gui.layout();
             gui.update_controls();
         });
@@ -406,9 +414,11 @@ impl Gui {
             closing: false,
             restart_blocked: false,
             last_status: String::new(),
+            settings_path: None,
             windows: Vec::new(),
             screen_rect: None,
             window_area: None,
+            pending_window_area: None,
             pad_area: None,
             pending_selection: None,
             session_diagnostic: true,
@@ -1376,6 +1386,20 @@ impl Gui {
             }
         }
     }
+    unsafe fn window_selection_changed(&mut self) {
+        self.window_area = None;
+        if let Some(handle) = self.selected_window() {
+            if let Some(area) = self.pending_window_area.take() {
+                let target = MappingTarget::WindowRectangle { handle, area };
+                if target.resolve(self.panel).is_ok() {
+                    self.window_area = Some(area);
+                }
+            } else {
+                self.save_setting(|stored| stored.window_area = None);
+            }
+        }
+        self.refresh_diagram_preview();
+    }
     /// Select area… / Show area. Selection completes later via WM_SELECTION_DONE,
     /// so no nested message loop runs while GUI state is borrowed.
     unsafe fn area_action(&mut self) {
@@ -1391,6 +1415,7 @@ impl Gui {
             .map(|_| self.pending_selection = Some(Pending::Screen)),
             Choice::Window if self.window_area.is_some() => {
                 self.window_area = None;
+                self.save_setting(|stored| stored.window_area = None);
                 self.refresh_diagram_preview();
                 self.show_target_preview()
             }
@@ -1430,6 +1455,7 @@ impl Gui {
             match NormRect::from_screen(surface, selected) {
                 Ok(area) => {
                     self.pad_area = Some(area);
+                    self.save_setting(|stored| stored.pad_area = Some(area.into()));
                     self.last_status = "Touchpad area selected.".into();
                     self.refresh_preview_rect();
                 }
@@ -1438,10 +1464,10 @@ impl Gui {
             return;
         }
         let applied = match pending {
-            Some(Pending::Screen) => {
-                mapping::validate_screen_rect(selected, mapping::virtual_screen())
-                    .map(|r| self.screen_rect = Some(r))
-            }
+            Some(Pending::Screen) => mapping::validate_screen_target(selected).map(|r| {
+                self.screen_rect = Some(r);
+                self.save_setting(|stored| stored.screen_rect = Some(r.into()));
+            }),
             Some(Pending::WindowArea { handle, client }) => {
                 if self.selected_window() != Some(handle) {
                     Err("The window selection changed during area selection.".into())
@@ -1452,6 +1478,7 @@ impl Gui {
                             return Err("Selected area is too small.".into());
                         }
                         self.window_area = Some(area);
+                        self.save_setting(|stored| stored.window_area = Some(area.into()));
                         Ok(())
                     })
                 }
@@ -1519,6 +1546,7 @@ impl Gui {
                 .get(i)
                 .map_or("Disconnected".into(), |m| at(m.rect)),
             Choice::ScreenPortion => self.screen_rect.map_or("Not selected".into(), at),
+            Choice::Window if self.pending_window_area.is_some() => "Saved part".into(),
             Choice::Window => self.window_area.map_or("Whole window".into(), |a| {
                 format!(
                     "{:.0}–{:.0}% × {:.0}–{:.0}%",
@@ -1755,6 +1783,101 @@ impl Gui {
             .find(|&h| IsWindowEnabled(h) != 0)
             .unwrap_or(self.hwnd);
         SetFocus(next);
+    }
+    /// Apply a stored snapshot to the controls. Values that no longer fit this
+    /// machine (a display that is gone, a missing pad area) keep their defaults
+    /// instead of failing the launch.
+    unsafe fn apply_settings(&mut self, stored: &Settings) {
+        for (id, value) in [
+            (INJECT, stored.inject),
+            (FEEDBACK, stored.touch_feedback),
+            (PAD_GESTURES, stored.suppress_touchpad),
+            (SCREEN_GESTURES, stored.suppress_touchscreen),
+        ] {
+            if let Some(value) = value {
+                SendMessageW(self.item(id), BM_SETCHECK, usize::from(value), 0);
+            }
+        }
+        if let Some(mode) = stored.start_mode {
+            let mode = TakeoverMode::from(mode);
+            if let Some(index) = START_MODES.iter().position(|&(entry, _)| entry == mode) {
+                SendMessageW(self.item(MODE), CB_SETCURSEL, index, 0);
+            }
+        }
+        // Only the four validated chords exist; anything else is ignored.
+        if let Some(shortcut) = stored
+            .shortcut
+            .filter(|vk| (VK_F8 as u32..=VK_F11 as u32).contains(vk))
+        {
+            SendMessageW(
+                self.item(KEY),
+                CB_SETCURSEL,
+                (shortcut - VK_F8 as u32) as usize,
+                0,
+            );
+        }
+        if let Some(index) = stored
+            .device
+            .as_ref()
+            .and_then(|path| self.devices.iter().position(|d| &d.path == path))
+        {
+            SendMessageW(self.item(DEVICE), CB_SETCURSEL, index, 0);
+            self.select_device_info();
+        }
+        self.screen_rect = stored
+            .screen_rect
+            .and_then(|r| mapping::validate_screen_target(r.into()).ok());
+        self.pending_window_area = stored.window_area.and_then(Area::norm_rect);
+        self.pad_area = stored.pad_area.and_then(Area::norm_rect);
+        if let Some(fit) = stored.pad_fit {
+            let fit = match fit {
+                // Portion without a usable pad area cannot map anything.
+                Fit::Portion if self.pad_area.is_none() => Fit::FillArea,
+                fit => fit,
+            };
+            SendMessageW(self.item(PAD_FIT), CB_SETCURSEL, fit.selection(), 0);
+        }
+        if let Some(target) = &stored.target {
+            let choice = match (target.kind, &target.monitor) {
+                (TargetKind::Desktop, _) => Some(Choice::Desktop),
+                (TargetKind::Monitor, Some(device)) => self
+                    .monitors
+                    .iter()
+                    .position(|m| &m.device == device)
+                    .map(Choice::Monitor),
+                (TargetKind::Monitor, None) => None,
+                (TargetKind::ScreenPortion, _) => self.screen_rect.map(|_| Choice::ScreenPortion),
+                // A window handle cannot survive a restart, so only the kind is
+                // restored and the list starts empty.
+                (TargetKind::Window, _) => Some(Choice::Window),
+                (TargetKind::TestArea, _) => Some(Choice::Diagnostic),
+            };
+            if let Some(choice) = choice {
+                self.select_choice(choice);
+            }
+            if choice == Some(Choice::Window) {
+                SendMessageW(self.item(WINDOW), CB_SETCURSEL, usize::MAX, 0);
+            }
+        }
+        self.refresh_preview_rect();
+        self.refresh_diagram_preview();
+    }
+    unsafe fn saved_target(&self) -> SavedTarget {
+        match self.choice() {
+            Choice::Desktop => SavedTarget::kind(TargetKind::Desktop),
+            Choice::Monitor(i) => SavedTarget {
+                kind: TargetKind::Monitor,
+                monitor: self.monitors.get(i).map(|m| m.device.clone()),
+            },
+            Choice::ScreenPortion => SavedTarget::kind(TargetKind::ScreenPortion),
+            Choice::Window => SavedTarget::kind(TargetKind::Window),
+            Choice::Diagnostic => SavedTarget::kind(TargetKind::TestArea),
+        }
+    }
+    fn save_setting(&self, edit: impl FnOnce(&mut Settings)) {
+        if let Some(path) = &self.settings_path {
+            let _ = settings::update(path, edit);
+        }
     }
     unsafe fn update_controls(&self) {
         let locked =
@@ -2059,6 +2182,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             REFRESH if notification == BN_CLICKED => g.refresh_devices(),
                             DEVICE if notification == CBN_SELCHANGE => {
                                 g.select_device_info();
+                                let path =
+                                    g.devices.get(g.selection(DEVICE)).map(|d| d.path.clone());
+                                g.save_setting(|stored| stored.device = path);
                             }
                             TARGET if notification == CBN_SELCHANGE => {
                                 if g.choice().uses_window() {
@@ -2066,11 +2192,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                                 }
                                 g.refresh_preview_rect();
                                 g.refresh_diagram_preview();
+                                g.save_setting(|stored| stored.target = Some(g.saved_target()));
                             }
                             WINDOW if notification == CBN_DROPDOWN => g.refresh_windows(),
                             WINDOW if notification == CBN_SELCHANGE => {
-                                g.window_area = None;
-                                g.refresh_diagram_preview();
+                                g.window_selection_changed();
                             }
                             AREA if notification == BN_CLICKED => g.area_action(),
                             PAD_AREA if notification == BN_CLICKED => {
@@ -2081,8 +2207,37 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             PAD_FIT if notification == CBN_SELCHANGE => {
                                 g.refresh_preview_rect();
                                 g.refresh_diagram_preview();
+                                g.save_setting(|stored| {
+                                    stored.pad_fit =
+                                        Some(Fit::from_selection(g.selection(PAD_FIT)));
+                                });
                             }
-                            MODE | KEY if notification == CBN_SELCHANGE => {}
+                            MODE if notification == CBN_SELCHANGE => {
+                                g.save_setting(|stored| {
+                                    stored.start_mode = Some(g.selected_mode().into());
+                                });
+                            }
+                            KEY if notification == CBN_SELCHANGE => {
+                                g.save_setting(|stored| stored.shortcut = Some(g.key()));
+                            }
+                            INJECT if notification == BN_CLICKED => {
+                                g.save_setting(|stored| stored.inject = Some(g.checked(INJECT)));
+                            }
+                            FEEDBACK if notification == BN_CLICKED => {
+                                g.save_setting(|stored| {
+                                    stored.touch_feedback = Some(g.checked(FEEDBACK));
+                                });
+                            }
+                            PAD_GESTURES if notification == BN_CLICKED => {
+                                g.save_setting(|stored| {
+                                    stored.suppress_touchpad = Some(g.checked(PAD_GESTURES));
+                                });
+                            }
+                            SCREEN_GESTURES if notification == BN_CLICKED => {
+                                g.save_setting(|stored| {
+                                    stored.suppress_touchscreen = Some(g.checked(SCREEN_GESTURES));
+                                });
+                            }
                             _ => {}
                         }
                         g.update_controls();

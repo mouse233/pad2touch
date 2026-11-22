@@ -41,6 +41,7 @@ secrets.json
 # Machine-specific editor, agent and OS files
 /.agents/
 /.codex/
+/.commandcode/
 /.idea/
 /.vscode/
 Thumbs.db

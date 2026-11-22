@@ -1,6 +1,6 @@
 # Architecture
 
-Pad2Touch is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and Phase 3 targets: application windows, rectangles inside windows, and desktop rectangles. Persistent configuration and release-level recovery remain outside this implementation. The CLI receiver remains available.
+Pad2Touch is a Windows user-mode bridge from Precision Touchpad HID reports to native touch injection. The current MVP has a native GUI with an embedded diagnostic receiver and Phase 3 targets: application windows, rectangles inside windows, and desktop rectangles. The GUI persists its own settings in `%LOCALAPPDATA%\Pad2Touch\settings.json`; release-level recovery remains outside this implementation. The CLI receiver remains available.
 
 ## Modules
 
@@ -26,6 +26,7 @@ Pad2Touch is a Windows user-mode bridge from Precision Touchpad HID reports to n
 | `experiment.rs` | Own the input worker, receiver window, diagnostics, contact trails, and coordinated shutdown. |
 | `verify.rs` | Audit batch completeness, contact lifecycles, and received coordinates without injecting input. |
 | `logging.rs` | Write diagnostics through a bounded queue and count dropped records. |
+| `settings.rs` | Persist the GUI's own control state as a versioned per-user JSON file, tolerating a missing, stale, or corrupt one. |
 
 Raw Input processing and injection run serially on one worker thread. The receiver processes pointer messages on a separate thread. Painting copies a bounded display snapshot and releases the statistics lock before GDI calls. A cached memory DC/bitmap receives background, text, trails, and active contacts; one BitBlt then presents the completed frame. The standalone CLI receiver suppresses background erasure. The native GUI parent paints the system dialog background, supplies the same system brush to native labels/group boxes, and batches child positions before invalidating all children. Its diagnostic child continues to use a back buffer. Buffer resources are replaced on size changes and released on shutdown. Log writing runs on its own thread; queue overflow is reported rather than treated as complete evidence.
 
@@ -37,7 +38,7 @@ The API routes these gestures to an eligible foreground controller instead of th
 
 IUnknown-based typed delegates subscribe to PointerPressed, PointerMoved, PointerReleased, and GlobalActionPerformed before enabling. Pointer callbacks query ICoreWindowEventArgs, set Handled, and verify its readback; actions have no Handled property and are consumed by the registered action handler. Tokens are revoked before releasing the controller. Atomic reference counts own the delegates, and their shared data consists only of a thread-safe logger and event counter. Actual receipt, sampled movement, handler failures, and receiver activation/minimization are logged. The receiver distinguishes foreground eligibility from merely having enabled the controller. None of these observations guarantees that every physical or injected gesture was suppressed.
 
-No user settings are saved or changed, so there is no registry snapshot or persistent preference to restore after termination. Ownership is process-foreground scoped: background controllers are ignored. The implementation uses the published UniversalApiContract v19 interface prefix from the Windows SDK and checks IsSupported at runtime because the API is experimental. It does not extend support to older systems by undocumented registry writes.
+No Windows gesture preferences are saved or changed, so there is no registry snapshot or persistent preference to restore after termination. (The GUI's own control state is a separate, per-user JSON file; see `settings.rs`.) Ownership is process-foreground scoped: background controllers are ignored. The implementation uses the published UniversalApiContract v19 interface prefix from the Windows SDK and checks IsSupported at runtime because the API is experimental. It does not extend support to older systems by undocumented registry writes.
 
 Touchpad gesture ownership is distinct from Windows' touchscreen gesture handling, including handling of injected PT_TOUCH input. Remaining conflicts must be diagnosed at the appropriate layer rather than attributing all lost receiver lifetimes to the physical touchpad.
 

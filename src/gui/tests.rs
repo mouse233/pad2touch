@@ -340,8 +340,39 @@ fn native_gui_phase3_target_selection_without_capture() {
         drag((width / 4, height / 4), (width * 3 / 4, height * 3 / 4));
         with(|g| assert!(g.pad_area.is_some()));
 
+        // A restored part waits for the first explicit window selection.
+        let part = NormRect {
+            left: 0.25,
+            top: 0.25,
+            right: 0.75,
+            bottom: 0.75,
+        };
+        let index = with(|g| {
+            g.apply_settings(&Settings {
+                target: Some(SavedTarget::kind(TargetKind::Window)),
+                window_area: Some(part.into()),
+                ..Settings::default()
+            });
+            assert!(g.target().is_err(), "no window chosen yet");
+            assert_eq!(g.target_info(), "Saved part");
+            g.windows
+                .iter()
+                .position(|w| w.handle == host.hwnd)
+                .unwrap()
+        });
+        choose(hwnd, WINDOW, index);
+        with(|g| {
+            assert!(g.pending_window_area.is_none());
+            assert_eq!(
+                g.target().unwrap(),
+                MappingTarget::WindowRectangle {
+                    handle: host.hwnd,
+                    area: part,
+                }
+            );
+        });
+
         // A closed target window is dropped from the selection.
-        choose(hwnd, TARGET, index_of(Choice::Window));
         host.close();
         SendMessageW(
             hwnd,
