@@ -133,6 +133,32 @@ pub fn validate_screen_rect(r: RECT, virtual_screen: RECT) -> Result<RECT, Strin
     Ok(r)
 }
 
+/// Validate a screen target against the current physical desktop at selection,
+/// restore, and capture time.
+pub fn validate_screen_target(bounds: RECT) -> Result<RECT, String> {
+    require_physical_coordinates()?;
+    let bounds = validate_screen_rect(bounds, unsafe { virtual_screen() })?;
+    validate_screen_coverage(bounds, |p| {
+        !unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_null()
+    })?;
+    Ok(bounds)
+}
+
+fn validate_screen_coverage(
+    bounds: RECT,
+    on_monitor: impl Fn(POINT) -> bool,
+) -> Result<(), String> {
+    for p in sample_points(bounds, 3) {
+        if !on_monitor(p) {
+            return Err(format!(
+                "Screen rectangle point ({}, {}) is not on any display. Select the area again.",
+                p.x, p.y
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Points used for occlusion sampling and monitor coverage checks.
 pub fn sample_points(r: RECT, per_axis: i32) -> Vec<POINT> {
     let n = per_axis.max(2);
@@ -526,16 +552,7 @@ impl MappingTarget {
                 })
             },
             Self::ScreenRectangle { bounds } => {
-                require_physical_coordinates()?;
-                let bounds = validate_screen_rect(bounds, unsafe { virtual_screen() })?;
-                for p in sample_points(bounds, 3) {
-                    if unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_null() {
-                        return Err(format!(
-                            "Screen rectangle point ({}, {}) is not on any display. Select the area again.",
-                            p.x, p.y
-                        ));
-                    }
-                }
+                let bounds = validate_screen_target(bounds)?;
                 Ok(ResolvedTarget {
                     spec: self,
                     window: 0,
@@ -957,6 +974,16 @@ mod tests {
         assert!(validate_screen_rect(rect(0, 0, 15, 300), desktop).is_err());
         assert!(validate_screen_rect(rect(0, 0, 300, 10), desktop).is_err());
         assert!(validate_screen_rect(rect(300, 0, 0, 300), desktop).is_err());
+    }
+    #[test]
+    fn screen_target_rejects_a_gap_after_moving_a_shorter_monitor() {
+        let area = rect(2000, 100, 2200, 300);
+        let desktop = rect(0, 0, 3200, 1080);
+        assert!(validate_screen_rect(area, desktop).is_ok());
+        let covered =
+            |top| validate_screen_coverage(area, |p| p.x < 1920 || (top..top + 720).contains(&p.y));
+        assert!(covered(0).is_ok());
+        assert!(covered(360).unwrap_err().contains("not on any display"));
     }
     #[test]
     fn normalized_window_area_follows_client_moves_and_dpi_scaling() {

@@ -7,7 +7,7 @@
 use crate::{control::TakeoverMode, gesture_backend, mapping::NormRect};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::Foundation::RECT;
@@ -197,35 +197,37 @@ pub fn path(root: &Path) -> PathBuf {
     root.join("settings.json")
 }
 
-fn settings_path() -> Result<PathBuf, String> {
-    gesture_backend::appdata_root().map(|root| path(&root))
+pub fn user_path() -> Option<PathBuf> {
+    gesture_backend::appdata_root().ok().map(|root| path(&root))
 }
 
 /// The stored settings, or `None` when there is no usable file. Never fails the
 /// launch: defaults stay in place for a missing, unreadable, stale or corrupt
 /// file.
-pub fn load() -> Option<Settings> {
-    load_from(&settings_path().ok()?)
-}
-
-pub fn save(settings: &Settings) {
-    if let Ok(path) = settings_path() {
-        let _ = save_to(&path, settings);
-    }
-}
-
-fn load_from(path: &Path) -> Option<Settings> {
+pub fn load(path: &Path) -> Option<Settings> {
     let settings: Settings = gesture_backend::read_json(path).ok()?;
     (settings.format == FORMAT).then_some(settings)
 }
 
-/// Atomic publish through the recovery journal's temp-file + rename writer. The
-/// parent directory is created on first save.
-fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
+/// Apply one user edit to the latest preferences. Lock a separate file because
+/// publishing JSON replaces the settings file itself.
+pub fn update(path: &Path, edit: impl FnOnce(&mut Settings)) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    gesture_backend::write_json(path, settings)
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    let mut settings = load(path).unwrap_or_default();
+    edit(&mut settings);
+    settings.format = FORMAT;
+    gesture_backend::write_json(path, &settings)
 }
 
 #[cfg(test)]
@@ -296,9 +298,8 @@ mod tests {
     fn a_full_snapshot_round_trips() {
         let dir = scratch("roundtrip");
         let file = path(&dir);
-        let original = full();
-        save_to(&file, &original).unwrap();
-        assert_eq!(load_from(&file), Some(original));
+        update(&file, |settings| *settings = full()).unwrap();
+        assert_eq!(load(&file), Some(full()));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -311,10 +312,52 @@ mod tests {
             inject: Some(true),
             ..Settings::default()
         };
-        save_to(&file, &sparse).unwrap();
+        update(&file, |settings| settings.inject = sparse.inject).unwrap();
         let text = fs::read_to_string(&file).unwrap();
         assert!(!text.contains("null"), "{text}");
-        assert_eq!(load_from(&file), Some(sparse));
+        assert_eq!(load(&file), Some(sparse));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_edits_keep_saved_device_and_monitor_and_leave_gesture_defaults_unset() {
+        let dir = scratch("edit");
+        let file = path(&dir);
+        let Settings { device, target, .. } = full();
+        update(&file, |settings| {
+            settings.device = device.clone();
+            settings.target = target.clone();
+        })
+        .unwrap();
+        update(&file, |settings| settings.touch_feedback = Some(false)).unwrap();
+        let expected = Settings {
+            format: FORMAT,
+            device,
+            target,
+            touch_feedback: Some(false),
+            ..Settings::default()
+        };
+        assert_eq!(load(&file), Some(expected));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn overlapping_edits_keep_both_changes() {
+        let dir = scratch("overlap");
+        let file = path(&dir);
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                update(&file, |settings| settings.suppress_touchpad = Some(false)).unwrap();
+            });
+            start.wait();
+            update(&file, |settings| settings.suppress_touchscreen = Some(true)).unwrap();
+            first.join().unwrap();
+        });
+        let saved = load(&file).unwrap();
+        assert_eq!(saved.suppress_touchpad, Some(false));
+        assert_eq!(saved.suppress_touchscreen, Some(true));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -338,10 +381,10 @@ mod tests {
         let dir = scratch("corrupt");
         let file = path(&dir);
         fs::write(&file, b"{ not json").unwrap();
-        assert_eq!(load_from(&file), None);
+        assert_eq!(load(&file), None);
         fs::write(&file, br#"{"format":99,"inject":false}"#).unwrap();
-        assert_eq!(load_from(&file), None);
-        assert_eq!(load_from(&path(&dir.join("missing"))), None);
+        assert_eq!(load(&file), None);
+        assert_eq!(load(&path(&dir.join("missing"))), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -350,7 +393,7 @@ mod tests {
         let dir = scratch("create");
         let nested = dir.join("nested");
         let file = path(&nested);
-        save_to(&file, &full()).unwrap();
+        update(&file, |settings| *settings = full()).unwrap();
         assert!(file.is_file());
         let leftovers: Vec<String> = fs::read_dir(&nested)
             .unwrap()

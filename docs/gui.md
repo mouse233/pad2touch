@@ -81,7 +81,7 @@ While idle, the region is re-resolved every 250 ms, so moving a target window up
 
 The desktop thumbnail refreshes once per second while the Pad2Touch main window is active in the foreground and shows the mapping diagram. It pauses when another window takes focus, when Pad2Touch is minimized, or while an area is being selected. A worker reads the desktop so the GUI can repaint and respond to input independently.
 
-The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. Pad2Touch's own windows cannot be application targets. The **Application window** choice is restored on the next launch, but the window itself is not: window handles do not survive a restart, so choose the window again before starting.
+The window list contains visible, uncloaked, unowned top-level windows of other processes, refreshed whenever the list opens. Titles are shown for selection only; logs record the handle, mode and physical bounds, never window titles. Pad2Touch's own windows cannot be application targets. After a restart, choose the application window before starting. A saved part is applied to the first window you choose if it fits that window. Choose **Whole window** to clear the saved part.
 
 ### Touchpad area
 
