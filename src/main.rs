@@ -57,6 +57,9 @@ fn run() -> Result<(), String> {
     if args == ["--gesture-check"] {
         return gestures::check_native_controller();
     }
+    if args == ["--recover-gestures"] {
+        return gesture_backend::recover_pending();
+    }
     if args.first().is_some_and(|s| s == "--verify-log") {
         if args.len() != 2 {
             return Err("usage: --verify-log PATH_TO_EVENTS_LOG".into());
@@ -72,7 +75,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args == ["--help"] {
-        println!("Pad2Touch (multitouch hardware validation pending)\n  --gui (default: devices, mapping, manual / toggle / hold)\n  --diagnostics (launch GUI with diagnostic details and session logs)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --capture [--background] [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--background starts raw-only capture minimized without requesting foreground.\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
+        println!("Pad2Touch (multitouch hardware validation pending)\n  --gui (default: devices, mapping, manual / toggle / hold)\n  --diagnostics (launch GUI with diagnostic details and session logs)\n  --probe\n  --gesture-support (read-only capability check)\n  --gesture-check (brief native controller activation/readback/release)\n  --recover-gestures (restore gesture settings left changed by an interrupted session)\n  --capture [--background] [--inject] [--suppress-system-gestures] [--contacts 1..5] [--device 0] [--seconds 60] [--out NEW_DIRECTORY]\n  --self-test [--suppress-system-gestures] [--contacts 1..5] [--seconds 40] [--out NEW_DIRECTORY]\n  --verify-log PATH_TO_EVENTS_LOG\n--background starts raw-only capture minimized without requesting foreground.\nGesture suppression requires a supported foreground-process API; capture without --inject isolates physical gestures.\n--contacts 1: single-contact MVP; default 5: synchronized multitouch.\nSelf-test injects SYNTHETIC coordinates into a real Windows receiver; run manually.\nNo GUI or injection is started by cargo test or --verify-log. ESC releases all contacts and stops.");
         return Ok(());
     }
     if args == ["--probe"] {

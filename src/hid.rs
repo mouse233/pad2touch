@@ -290,21 +290,30 @@ fn device_property_string(
 
 pub fn discover() -> Result<Vec<Device>, String> {
     unsafe {
-        let mut count = 0;
-        if GetRawInputDeviceList(
-            null_mut(),
-            &mut count,
-            size_of::<RAWINPUTDEVICELIST>() as u32,
-        ) == u32::MAX
-        {
-            return Err(winerr("GetRawInputDeviceList(size)"));
+        // The device count can grow between the size query and the copy, for
+        // example while a Bluetooth device connects. Query again in that case.
+        let mut list = Vec::new();
+        let mut got = u32::MAX;
+        for _ in 0..4 {
+            let mut count = 0;
+            if GetRawInputDeviceList(
+                null_mut(),
+                &mut count,
+                size_of::<RAWINPUTDEVICELIST>() as u32,
+            ) == u32::MAX
+            {
+                return Err(winerr("GetRawInputDeviceList(size)"));
+            }
+            list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+            got = GetRawInputDeviceList(
+                list.as_mut_ptr(),
+                &mut count,
+                size_of::<RAWINPUTDEVICELIST>() as u32,
+            );
+            if got != u32::MAX || GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+                break;
+            }
         }
-        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
-        let got = GetRawInputDeviceList(
-            list.as_mut_ptr(),
-            &mut count,
-            size_of::<RAWINPUTDEVICELIST>() as u32,
-        );
         if got == u32::MAX {
             return Err(winerr("GetRawInputDeviceList"));
         }
@@ -325,7 +334,9 @@ pub fn discover() -> Result<Vec<Device>, String> {
                 &mut n,
             ) == u32::MAX
             {
-                return Err(winerr("RIDI_DEVICEINFO"));
+                // Any HID device can disappear after listing. An unrelated
+                // device must not hide every touchpad, so skip this entry.
+                continue;
             }
             let hi = info.Anonymous.hid;
             if hi.usUsagePage != 0x0D || hi.usUsage != 0x05 {

@@ -3,6 +3,7 @@ use crate::{
     hid::{self, winerr, Device},
     injection::Injector,
     logging::Log,
+    touch::FrameOutcome,
 };
 use std::{
     cell::RefCell,
@@ -1367,6 +1368,15 @@ impl Worker {
         self.pending_since = None;
         self.capture.reset_fragments();
     }
+    fn injection_result(&mut self, result: Result<FrameOutcome, String>) {
+        match result {
+            Ok(FrameOutcome::Accepted) => {}
+            Ok(FrameOutcome::Occluded) => {
+                self.log.event("INJECT_OCCLUDED waiting_for_all_fingers_up")
+            }
+            Err(error) => self.error(error),
+        }
+    }
     fn accept(&mut self, contacts: Vec<Contact>, start: Instant, scan: Option<u32>) {
         if self.stop.load(Ordering::Relaxed) || EXIT.load(Ordering::Relaxed) {
             return;
@@ -1376,13 +1386,15 @@ impl Worker {
         if self.mode == "capture" {
             self.rates.frame(start, scan, live > 0);
         }
-        self.log.event(format!(
-            "FRAME active={live} records={} contacts={contacts:?} foreground_scope={} scan_time={}",
-            contacts.len(),
-            scope.label(),
-            scan.map(|v| v.to_string())
-                .unwrap_or_else(|| "unavailable".into())
-        ));
+        if self.log.enabled() {
+            self.log.event(format!(
+                "FRAME active={live} records={} contacts={contacts:?} foreground_scope={} scan_time={}",
+                contacts.len(),
+                scope.label(),
+                scan.map(|v| v.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ));
+        }
         let signal = {
             let mut s = self.shared.lock().unwrap();
             s.frames += 1;
@@ -1415,9 +1427,8 @@ impl Worker {
         let paused = self.tracker.as_ref().is_some_and(|t| t.paused());
         if let Some(i) = self.injector.as_mut().filter(|_| !paused) {
             let before = i.successes();
-            if let Err(e) = i.frame(&contacts) {
-                self.error(e);
-            }
+            let result = i.frame(&contacts);
+            self.injection_result(result);
             let elapsed = start.elapsed().as_micros();
             if self
                 .injector
@@ -1489,14 +1500,16 @@ impl Worker {
                 .raw(scope, delivery_code == RIM_INPUTSINK as usize);
             self.last_raw = Instant::now();
             self.shared.lock().unwrap().raw += 1;
-            self.log.event(format!(
-                "RAW handle=0x{handle:X} foreground_scope={} delivery_code={delivery_code} hex={}",
-                scope.label(),
-                report
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<String>()
-            ));
+            if self.log.enabled() {
+                self.log.event(format!(
+                    "RAW handle=0x{handle:X} foreground_scope={} delivery_code={delivery_code} hex={}",
+                    scope.label(),
+                    report
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<String>()
+                ));
+            }
             match self.device.as_ref().unwrap().parse(&self.fields, &report) {
                 Ok(Some(r)) => {
                     let frame_scan = r.scan;
@@ -1601,9 +1614,8 @@ impl Worker {
             }
         }
         if let Some(i) = &mut self.injector {
-            if let Err(e) = i.keepalive() {
-                self.error(e);
-            }
+            let result = i.keepalive();
+            self.injection_result(result);
         }
         self.sync_stats();
     }
@@ -1688,15 +1700,7 @@ impl Worker {
         let points = crate::mapping::sample_points(self.target.bounds, 3);
         let covered = points
             .iter()
-            .filter(|&&p| unsafe {
-                let hit = WindowFromPoint(p);
-                let root = if hit.is_null() {
-                    null_mut()
-                } else {
-                    GetAncestor(hit, GA_ROOT)
-                };
-                !self.target.hit.accepts(hit as usize, root as usize)
-            })
+            .filter(|&&p| self.target.hit.hit_test(p).is_err())
             .count();
         let sample = (covered, points.len());
         if self.last_occlusion != Some(sample) {

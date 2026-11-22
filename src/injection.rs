@@ -4,10 +4,9 @@ use crate::{
     hid::winerr,
     logging::Log,
     mapping::{HitPolicy, NormRect},
-    touch::{Action, Engine, Failure, Frame, Rectangle, Transport},
+    touch::{Action, Engine, Failure, Frame, FrameOutcome, Rectangle, Transport},
 };
 use std::{
-    ptr::null_mut,
     thread,
     time::{Duration, Instant},
 };
@@ -38,23 +37,6 @@ struct WindowsTransport {
     batch: u64,
     blocked: u64,
 }
-impl WindowsTransport {
-    /// Windows routes injected touch by screen hit testing. Non-cleanup DOWN and
-    /// UPDATE events are only submitted where the target owns the point.
-    unsafe fn owner(&self, point: POINT) -> Result<(), (usize, usize)> {
-        let hit = WindowFromPoint(point);
-        let root = if hit.is_null() {
-            null_mut()
-        } else {
-            GetAncestor(hit, GA_ROOT)
-        };
-        if self.hit.accepts(hit as usize, root as usize) {
-            Ok(())
-        } else {
-            Err((hit as usize, root as usize))
-        }
-    }
-}
 impl Transport for WindowsTransport {
     fn inject(&mut self, frame: &Frame) -> Result<(), Failure> {
         if !frame.cleanup {
@@ -66,7 +48,10 @@ impl Transport for WindowsTransport {
                     x: p.point.x,
                     y: p.point.y,
                 };
-                if let Err((hit, root)) = unsafe { self.owner(point) } {
+                // Windows routes injected touch by screen hit testing. Non-cleanup
+                // DOWN and UPDATE events are only submitted where the target owns
+                // the point.
+                if let Err((hit, root)) = self.hit.hit_test(point) {
                     self.blocked += 1;
                     let target = match self.hit {
                         HitPolicy::Exact(w) | HitPolicy::SameRoot(w) => w,
@@ -174,7 +159,7 @@ impl Injector {
             log,
         })
     }
-    pub fn frame(&mut self, input: &[Contact]) -> Result<(), String> {
+    pub fn frame(&mut self, input: &[Contact]) -> Result<FrameOutcome, String> {
         let before = self.engine.successes;
         let result = self.engine.apply(input);
         if self.engine.successes != before {
@@ -193,7 +178,7 @@ impl Injector {
     pub fn blocked(&self) -> u64 {
         self.engine.transport.blocked
     }
-    pub fn keepalive(&mut self) -> Result<(), String> {
+    pub fn keepalive(&mut self) -> Result<FrameOutcome, String> {
         if self.last_sent.elapsed() >= Duration::from_millis(16) {
             let before = self.engine.successes;
             let result = self.engine.keepalive();
@@ -202,7 +187,7 @@ impl Injector {
             }
             result
         } else {
-            Ok(())
+            Ok(FrameOutcome::Accepted)
         }
     }
     pub fn has_active(&self) -> bool {

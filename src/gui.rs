@@ -274,6 +274,65 @@ pub fn run(diagnostics: bool) -> Result<(), String> {
     result
 }
 
+/// Gesture settings changed by a session that ended without verified
+/// restoration (shutdown, crash, killed processes) stay changed, and the
+/// gesture lease then blocks every later override. Offer recovery at startup.
+/// It runs in a child process, like the gesture worker, so the GUI thread's
+/// COM state is not involved.
+unsafe fn offer_gesture_recovery(hwnd: HWND) {
+    let caption = wide("Pad2Touch gesture recovery");
+    match crate::gesture_backend::recovery_needed() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            MessageBoxW(
+                hwnd,
+                wide(&error).as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    }
+    let question = "An earlier Pad2Touch session ended before its Windows gesture settings were verified as restored. Three- and four-finger gestures may still be turned off.\n\nRestore the saved settings now?";
+    if MessageBoxW(
+        hwnd,
+        wide(question).as_ptr(),
+        caption.as_ptr(),
+        MB_YESNO | MB_ICONWARNING,
+    ) != IDYES
+    {
+        return;
+    }
+    let outcome = crate::gesture_backend::command("--recover-gestures")
+        .and_then(|mut command| command.output().map_err(|e| e.to_string()))
+        .and_then(|output| {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Ok(stdout
+                    .lines()
+                    .any(|line| line == "gesture_recovery=restored"))
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            }
+        });
+    let (text, icon) = match outcome {
+        Ok(true) => (
+            "Windows gesture settings were restored.".to_owned(),
+            MB_ICONINFORMATION,
+        ),
+        Ok(false) => (
+            "No gesture settings are pending recovery.".into(),
+            MB_ICONINFORMATION,
+        ),
+        Err(error) => (
+            format!("Recovery failed:\n\n{error}\n\nRetry: Pad2Touch.exe --recover-gestures"),
+            MB_ICONERROR,
+        ),
+    };
+    MessageBoxW(hwnd, wide(&text).as_ptr(), caption.as_ptr(), MB_OK | icon);
+}
+
 fn run_window(diagnostics: bool) -> Result<(), String> {
     experiment::EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
     unsafe {
@@ -330,6 +389,7 @@ fn run_window(diagnostics: bool) -> Result<(), String> {
         }
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        offer_gesture_recovery(hwnd);
         let mut msg = MSG::default();
         let mut result = Ok(());
         loop {

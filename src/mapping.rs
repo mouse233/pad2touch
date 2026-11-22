@@ -20,6 +20,7 @@ use windows_sys::Win32::{
         PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
+        Controls::{GetComboBoxInfo, COMBOBOXINFO},
         HiDpi::{
             AreDpiAwarenessContextsEqual, GetDpiForWindow, GetThreadDpiAwarenessContext,
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -289,7 +290,7 @@ pub fn fit_pad(area: RECT, aspect: Option<f64>, fit: PadFit) -> Result<(RECT, No
 pub enum HitPolicy {
     /// Only this exact window (the embedded diagnostic receiver).
     Exact(usize),
-    /// This top-level window or any of its child windows.
+    /// This top-level window, its children, and popups associated with it.
     SameRoot(usize),
     /// Any window: a screen rectangle has no window ownership.
     Any,
@@ -302,6 +303,75 @@ impl HitPolicy {
             Self::Any => true,
         }
     }
+
+    /// Hit-test a desktop point. Separate popup windows can qualify through
+    /// ownership or their association with the target's active Win32 control.
+    /// Returns the hit window and its root when the point is rejected.
+    pub fn hit_test(self, point: POINT) -> Result<(), (usize, usize)> {
+        unsafe {
+            let hit = WindowFromPoint(point);
+            let root = if hit.is_null() {
+                std::ptr::null_mut()
+            } else {
+                GetAncestor(hit, GA_ROOT)
+            };
+            if self.accepts(hit as usize, root as usize) {
+                return Ok(());
+            }
+            if let Self::SameRoot(target) = self {
+                if !root.is_null() && belongs_to_target(target as HWND, root) {
+                    return Ok(());
+                }
+            }
+            Err((hit as usize, root as usize))
+        }
+    }
+}
+
+unsafe fn belongs_to_target(target: HWND, root: HWND) -> bool {
+    if GetAncestor(root, GA_ROOTOWNER) == target {
+        return true;
+    }
+
+    let mut class = [0u16; 16];
+    let len = GetClassNameW(root, class.as_mut_ptr(), class.len() as i32) as usize;
+    let is_menu = class[..len].iter().copied().eq("#32768".encode_utf16());
+    let is_combo_list = class[..len].iter().copied().eq("ComboLBox".encode_utf16());
+    if !is_menu && !is_combo_list {
+        return false;
+    }
+
+    let thread = GetWindowThreadProcessId(root, std::ptr::null_mut());
+    if thread == 0 || thread != GetWindowThreadProcessId(target, std::ptr::null_mut()) {
+        return false;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if GetGUIThreadInfo(thread, &mut info) == 0 {
+        return false;
+    }
+    if is_menu {
+        return info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE) != 0
+            && GetAncestor(info.hwndMenuOwner, GA_ROOTOWNER) == target;
+    }
+
+    // A combo's focus may be on its edit control. Match the actual list
+    // handle returned for that combo, not another list on the same thread.
+    let focus = info.hwndFocus;
+    if GetAncestor(focus, GA_ROOTOWNER) != target {
+        return false;
+    }
+    [focus, GetAncestor(focus, GA_PARENT)]
+        .into_iter()
+        .any(|wnd| {
+            let mut combo = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            !wnd.is_null() && GetComboBoxInfo(wnd, &mut combo) != 0 && combo.hwndList == root
+        })
 }
 
 pub const TEST_AREA_INSET: i32 = 16;
@@ -1055,6 +1125,45 @@ mod tests {
         assert!(!HitPolicy::SameRoot(9).accepts(0, 0));
         assert!(HitPolicy::Any.accepts(0, 0));
         assert!(HitPolicy::Any.accepts(3, 4));
+    }
+
+    #[test]
+    fn popup_ownership_rejects_unrelated_windows_on_the_same_thread() {
+        use std::ptr::{null, null_mut};
+
+        unsafe {
+            let class = crate::experiment::wide("STATIC");
+            let create = |owner| {
+                let hwnd = CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    null(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    100,
+                    100,
+                    owner,
+                    null_mut(),
+                    null_mut(),
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                hwnd
+            };
+            let target = create(null_mut());
+            let unrelated = create(null_mut());
+            let popup = create(target);
+            let nested = create(popup);
+            let unrelated_popup = create(unrelated);
+
+            let belongs = [popup, nested, unrelated, unrelated_popup]
+                .map(|window| belongs_to_target(target, window));
+            for window in [unrelated_popup, nested, popup, unrelated, target] {
+                DestroyWindow(window);
+            }
+            assert_eq!(belongs, [true, true, false, false]);
+        }
     }
     #[test]
     fn sample_grid_covers_corners_and_center_of_negative_rectangles() {

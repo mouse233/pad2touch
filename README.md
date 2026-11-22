@@ -48,6 +48,7 @@ cargo build --release --locked
 - Windows routes touches by screen position. A window target must be visible and unobstructed at the point of contact.
 - Elevated apps may reject input from a normally launched Pad2Touch.
 - Windows can still move the pointer, click, and scroll in response to the same touchpad activity.
+- The gesture overrides change user-wide Windows settings while capture runs. If the PC shuts down or every Pad2Touch process is killed first, the touchpad gestures can stay off. Pad2Touch offers to restore them at the next launch, or run `Pad2Touch.exe --recover-gestures`. [Gesture recovery](docs/gui.md#background-guard)
 
 ## Diagnostics
 
