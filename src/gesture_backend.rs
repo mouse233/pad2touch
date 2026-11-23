@@ -17,18 +17,21 @@ use windows_sys::{
     core::GUID,
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE, HWND, WAIT_ABANDONED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
         System::{
             Com::CoCreateGuid,
             Registry::*,
             Threading::{
-                CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenProcess, ReleaseMutex,
-                WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE,
+                CreateMutexW, GetCurrentProcess, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+                ReleaseMutex, WaitForSingleObject, CREATE_NO_WINDOW,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
             },
+        },
+        UI::WindowsAndMessaging::{
+            GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_APP,
         },
     },
 };
@@ -362,6 +365,11 @@ struct PadSnapshot {
     values: [Option<u32>; 4],
     cached: [u32; 4],
 }
+impl PadSnapshot {
+    fn needs_override(self) -> bool {
+        self.cached != [0; 4]
+    }
+}
 #[derive(Clone, Copy)]
 struct ScreenSnapshot {
     preference: Option<u32>,
@@ -426,18 +434,27 @@ impl<'a> Access<'a> {
         })
     }
 
-    fn verify_disabled(&self, snapshot: Snapshot, refresh: bool) -> Result<()> {
+    fn verify_disabled(&self, snapshot: Snapshot, starting: bool) -> Result<()> {
         if let (Some(key), Some(screen)) = (&self.screen, snapshot.screen) {
             if key.dword(SCREEN_PREF)? != screen.preference || screen_state(None)? != 0 {
                 return Err("Touchscreen settings changed during capture".into());
             }
         }
-        if let Some((key, cache)) = &self.pad {
-            if pad_values(key)? != [Some(0); 4] {
+        if let (Some((key, cache)), Some(pad)) = (&self.pad, snapshot.pad) {
+            let overridden = pad.needs_override();
+            let expected = if overridden { [Some(0); 4] } else { pad.values };
+            if pad_values(key)? != expected {
                 return Err("Touchpad preferences changed during capture".into());
             }
-            if cache.values(refresh)? != [0; 4] && (refresh || cache.values(true)? != [0; 4]) {
-                return Err("Touchpad cache is not disabled".into());
+            let refreshed = starting && overridden;
+            let mut cached = cache.values(refreshed)?;
+            if cached != [0; 4] && overridden && !refreshed {
+                cached = cache.values(true)?;
+            }
+            if cached != [0; 4] {
+                return Err(format!(
+                    "Touchpad cache is not disabled (read {cached:?}, expected [0, 0, 0, 0]). In Windows Touchpad settings, set three- and four-finger swipes and taps to Nothing, then retry."
+                ));
             }
         }
         Ok(())
@@ -544,7 +561,7 @@ impl Snapshot {
             }
             let result = key.flush().and_then(|()| {
                 let actual = pad_values(key)?;
-                let actual_cache = cache.values(true)?;
+                let actual_cache = cache.values(snapshot.needs_override())?;
                 if actual != snapshot.values || actual_cache != snapshot.cached {
                     return Err("Touchpad restoration could not be verified".into());
                 }
@@ -923,16 +940,19 @@ impl Worker {
                         return Err("Touchscreen settings changed since snapshot".into());
                     }
                 }
-                fs::create_dir_all(lease.parent().ok_or("Missing gesture lease directory")?)
-                    .map_err(io_error)?;
-                write_json(
-                    &lease,
-                    &Lease {
-                        journal: journal.clone(),
-                    },
-                )?;
-                durable(&started, "{}")?;
-                if let Some((key, _)) = &access.pad {
+                let pad_override = snapshot.pad.is_some_and(PadSnapshot::needs_override);
+                if pad_override || access.screen.is_some() {
+                    fs::create_dir_all(lease.parent().ok_or("Missing gesture lease directory")?)
+                        .map_err(io_error)?;
+                    write_json(
+                        &lease,
+                        &Lease {
+                            journal: journal.clone(),
+                        },
+                    )?;
+                    durable(&started, "{}")?;
+                }
+                if let Some((key, _)) = access.pad.as_ref().filter(|_| pad_override) {
                     for name in PAD_NAMES {
                         key.set(name, Some(0))?;
                     }
@@ -1010,7 +1030,21 @@ impl Worker {
     }
 }
 
+/// Windows clears process startup feedback on the first GetMessage call.
+/// Give the helper a thread message to consume before it starts blocking on I/O.
+fn clear_startup_feedback() {
+    unsafe {
+        let thread_messages = -1_isize as HWND;
+        let mut message = MSG::default();
+        PeekMessageW(&mut message, thread_messages, WM_APP, WM_APP, PM_NOREMOVE);
+        if PostThreadMessageW(GetCurrentThreadId(), WM_APP, 0, 0) != 0 {
+            GetMessageW(&mut message, thread_messages, WM_APP, WM_APP);
+        }
+    }
+}
+
 pub fn run(mode: &str, args: &[OsString]) -> Result<()> {
+    clear_startup_feedback();
     if mode == "--gesture-watchdog" {
         return watchdog(args);
     }
