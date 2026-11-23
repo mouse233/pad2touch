@@ -123,12 +123,7 @@ impl Guard {
             fs::canonicalize(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
         let (backend, warm) = match prewarmed.filter(Backend::running) {
             Some(backend) => (backend, true),
-            None => {
-                // Spawning from a thread without a window makes Windows show
-                // the "app starting" cursor; a hidden window prevents it.
-                gesture_backend::announce_startup();
-                (Backend::spawn(false)?, false)
-            }
+            None => (Backend::spawn(false)?, false),
         };
         let mut guard = Self {
             backend,

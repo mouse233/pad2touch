@@ -984,7 +984,7 @@ fn native_gui_fixed_size_repaints_background_and_canvas() {
 }
 
 #[test]
-#[ignore = "temporarily blocks touchpad and touchscreen gestures via the GUI, captures raw input only, and verifies restoration"]
+#[ignore = "run on an idle interactive desktop; temporarily blocks gestures and checks the startup cursor during raw capture"]
 fn native_gui_background_guard_session_restores() {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1012,11 +1012,31 @@ fn native_gui_background_guard_session_restores() {
         let mut g = Gui::new(hwnd, false).unwrap();
         g.refresh_devices();
         SendMessageW(g.item(INJECT), BM_SETCHECK, 0, 0);
+        SendMessageW(g.item(PAD_GESTURES), BM_SETCHECK, 1, 0);
+        SendMessageW(g.item(SCREEN_GESTURES), BM_SETCHECK, 1, 0);
         GUI.with(|slot| *slot.borrow_mut() = Some(g));
         GUI.with(|slot| slot.borrow_mut().as_mut().unwrap().layout());
         SetTimer(hwnd, 1, 30, None);
+        let busy_cursor = LoadCursorW(null_mut(), IDC_APPSTARTING);
+        assert!(!busy_cursor.is_null());
+        let mut cursor = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetCursorInfo(&mut cursor) != 0 && cursor.flags & CURSOR_SHOWING != 0 {
+            assert_ne!(cursor.hCursor, busy_cursor, "desktop was already busy");
+        }
         SendMessageW(hwnd, WM_COMMAND, START, 0);
-        pump_for(Duration::from_secs(4));
+        let start = Instant::now();
+        let mut visible_samples = 0;
+        let mut busy_samples = 0;
+        while start.elapsed() < Duration::from_secs(4) {
+            pump_for(Duration::from_millis(5));
+            if GetCursorInfo(&mut cursor) != 0 && cursor.flags & CURSOR_SHOWING != 0 {
+                visible_samples += 1;
+                busy_samples += usize::from(cursor.hCursor == busy_cursor);
+            }
+        }
         GUI.with(|slot| {
             let slot = slot.borrow();
             let g = slot.as_ref().unwrap();
@@ -1045,6 +1065,15 @@ fn native_gui_background_guard_session_restores() {
         GUI.with(|slot| {
             slot.borrow_mut().take();
         });
+        assert_eq!(
+            busy_samples, 0,
+            "startup cursor in {busy_samples}/{visible_samples} samples"
+        );
+        if visible_samples == 0 {
+            println!("startup_cursor=unobserved (desktop cursor was hidden)");
+        } else {
+            println!("startup_cursor_samples={busy_samples}/{visible_samples}");
+        }
     }
 }
 
