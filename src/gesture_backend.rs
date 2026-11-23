@@ -17,8 +17,8 @@ use windows_sys::{
     core::GUID,
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE, HWND, LPARAM, LRESULT,
+            WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
         },
         Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
         System::{
@@ -30,6 +30,7 @@ use windows_sys::{
                 PROCESS_SYNCHRONIZE,
             },
         },
+        UI::WindowsAndMessaging::{CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW},
     },
 };
 
@@ -1010,7 +1011,40 @@ impl Worker {
     }
 }
 
+/// Windows shows the "app starting" cursor when a thread that owns no window
+/// launches a child process. A hidden window on such a thread (or in the
+/// launched helper) keeps the pointer normal while gestures are blocked.
+pub(crate) fn announce_startup() {
+    unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        DefWindowProcW(hwnd, msg, w, l)
+    }
+    let class: Vec<u16> = "Pad2TouchGestureHelper\0".encode_utf16().collect();
+    unsafe {
+        let instance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null());
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(window_proc);
+        wc.hInstance = instance;
+        wc.lpszClassName = class.as_ptr();
+        let _ = RegisterClassW(&wc);
+        let _ = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            class.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            instance,
+            null(),
+        );
+    }
+}
+
 pub fn run(mode: &str, args: &[OsString]) -> Result<()> {
+    announce_startup();
     if mode == "--gesture-watchdog" {
         return watchdog(args);
     }
